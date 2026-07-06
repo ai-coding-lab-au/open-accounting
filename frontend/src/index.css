@@ -1,0 +1,615 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-page);
+  color: var(--slate-700);
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   Theme variable system.
+
+   Each theme defines:
+     - --color-surface: card / drawer / modal background
+     - --color-page:    body background (the main scroll area)
+     - --slate-50..950: neutral scale (light → dark)
+     - --emerald-50..900: primary accent scale
+     - --amber-50..900: warning accent scale
+     - --gray-50..900: alternate neutral scale (less used)
+     - --font-sans, --font-mono: typeface
+
+   All themes use Times New Roman for typography. Other themes
+   re-bind via [data-theme="…"] blocks. Switching themes is just a
+   className flip on <html>.
+   ──────────────────────────────────────────────────────────────────── */
+
+:root,
+[data-theme="default"] {
+  --color-page:    #f8fafc;
+  --color-surface: #ffffff;
+
+  --slate-50:  #f8fafc;
+  --slate-100: #f1f5f9;
+  --slate-200: #e2e8f0;
+  --slate-300: #cbd5e1;
+  --slate-400: #94a3b8;
+  --slate-500: #64748b;
+  --slate-600: #475569;
+  --slate-700: #334155;
+  --slate-800: #1e293b;
+  --slate-900: #0f172a;
+  --slate-950: #020617;
+
+  --emerald-50:  #ecfdf5;
+  --emerald-100: #d1fae5;
+  --emerald-200: #a7f3d0;
+  --emerald-300: #6ee7b7;
+  --emerald-400: #34d399;
+  --emerald-500: #10b981;
+  --emerald-600: #059669;
+  --emerald-700: #047857;
+  --emerald-800: #065f46;
+  --emerald-900: #064e3b;
+
+  --amber-50:  #fffbeb;
+  --amber-100: #fef3c7;
+  --amber-200: #fde68a;
+  --amber-300: #fcd34d;
+  --amber-400: #fbbf24;
+  --amber-500: #f59e0b;
+  --amber-600: #d97706;
+  --amber-700: #b45309;
+  --amber-800: #92400e;
+  --amber-900: #78350f;
+
+  --gray-50:  #f9fafb;
+  --gray-100: #f3f4f6;
+  --gray-200: #e5e7eb;
+  --gray-300: #d1d5db;
+  --gray-400: #9ca3af;
+  --gray-500: #6b7280;
+  --gray-600: #4b5563;
+  --gray-700: #374151;
+  --gray-800: #1f2937;
+  --gray-900: #111827;
+
+  --font-sans: "Times New Roman", Times, serif;
+  --font-mono: "Times New Roman", Times, serif;
+}
+
+/* ─── Light, mainstream ─── */
+
+[data-theme="github-light"] {
+  --color-page: #ffffff;
+  --color-surface: #ffffff;
+  --slate-50: #f6f8fa; --slate-100: #eaeef2; --slate-200: #d0d7de;
+  --slate-300: #afb8c1; --slate-400: #8c959f; --slate-500: #6e7781;
+  --slate-600: #57606a; --slate-700: #424a53; --slate-800: #32383f;
+  --slate-900: #24292f; --slate-950: #1f2328;
+  --emerald-50: #ddf4ff; --emerald-100: #b6e3ff; --emerald-200: #80ccff;
+  --emerald-300: #54aeff; --emerald-400: #218bff; --emerald-500: #0969da;
+  --emerald-600: #0550ae; --emerald-700: #033d8b; --emerald-800: #0a3069;
+  --emerald-900: #002155;
+  --amber-50: #fff8c5; --amber-100: #fae17d; --amber-200: #eac54f;
+  --amber-300: #d4a72c; --amber-400: #bf8700; --amber-500: #9a6700;
+  --amber-600: #7d4e00; --amber-700: #633c01; --amber-800: #4d2d00;
+  --amber-900: #3b2300;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+[data-theme="linear"] {
+  --color-page: #fafbfc;
+  --color-surface: #ffffff;
+  --slate-50: #fafbfc; --slate-100: #f4f5f8; --slate-200: #e6e8ee;
+  --slate-300: #d0d3da; --slate-400: #9ea1a8; --slate-500: #6b6e76;
+  --slate-600: #4e515a; --slate-700: #393b43; --slate-800: #25272e;
+  --slate-900: #15151c; --slate-950: #08080d;
+  --emerald-50: #f3eefd; --emerald-100: #e1d4fb; --emerald-200: #c5a8f4;
+  --emerald-300: #a781ed; --emerald-400: #8a5ce7; --emerald-500: #6e3fde;
+  --emerald-600: #5826c5; --emerald-700: #421f95; --emerald-800: #2e1467;
+  --emerald-900: #1a0a3c;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+[data-theme="stripe"] {
+  --color-page: #f6f9fc;
+  --color-surface: #ffffff;
+  --slate-50: #f6f9fc; --slate-100: #e3e8ee; --slate-200: #c1c9d2;
+  --slate-300: #8898aa; --slate-400: #697386; --slate-500: #525f7f;
+  --slate-600: #424770; --slate-700: #32325d; --slate-800: #1a1f36;
+  --slate-900: #0a2540; --slate-950: #051b32;
+  --emerald-50: #f0f4ff; --emerald-100: #d6e0ff; --emerald-200: #a6b8ff;
+  --emerald-300: #7791ff; --emerald-400: #556cd6; --emerald-500: #635bff;
+  --emerald-600: #5247cc; --emerald-700: #3d3499; --emerald-800: #2a236b;
+  --emerald-900: #1a1644;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+[data-theme="notion"] {
+  --color-page: #ffffff;
+  --color-surface: #ffffff;
+  --slate-50: #f7f6f3; --slate-100: #ebeae5; --slate-200: #dad9d4;
+  --slate-300: #b6b4ad; --slate-400: #8a8780; --slate-500: #6b6962;
+  --slate-600: #54524d; --slate-700: #3d3b37; --slate-800: #2e2d2a;
+  --slate-900: #191918; --slate-950: #0a0a0a;
+  --emerald-50: #fbf1e6; --emerald-100: #f3d9b7; --emerald-200: #e9b87a;
+  --emerald-300: #d99a47; --emerald-400: #b8772a; --emerald-500: #8f5c1f;
+  --emerald-600: #6b4517; --emerald-700: #4d3210; --emerald-800: #33210a;
+  --emerald-900: #1f1406;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+[data-theme="paper"] {
+  --color-page: #faf6ee;
+  --color-surface: #fffdf5;
+  --slate-50: #faf6ee; --slate-100: #f0e9d6; --slate-200: #ddd2b3;
+  --slate-300: #bfb088; --slate-400: #9a8d68; --slate-500: #756a4d;
+  --slate-600: #57503a; --slate-700: #3f3a2a; --slate-800: #2b2719;
+  --slate-900: #19170d; --slate-950: #0d0c07;
+  --emerald-50: #e6eef5; --emerald-100: #bccdd9; --emerald-200: #8aa3bd;
+  --emerald-300: #5b7c9f; --emerald-400: #3a5c7f; --emerald-500: #244260;
+  --emerald-600: #1a3148; --emerald-700: #112334; --emerald-800: #0a1722;
+  --emerald-900: #060e15;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+[data-theme="sepia"] {
+  --color-page: #f4ecd8;
+  --color-surface: #faf5e4;
+  --slate-50: #f4ecd8; --slate-100: #ecd9b0; --slate-200: #d4ba85;
+  --slate-300: #b39866; --slate-400: #8c764b; --slate-500: #6e5b39;
+  --slate-600: #574629; --slate-700: #3f321c; --slate-800: #2a2113;
+  --slate-900: #1a140b; --slate-950: #0d0a06;
+  --emerald-50: #e8e3d1; --emerald-100: #c8bb96; --emerald-200: #a89766;
+  --emerald-300: #876f3e; --emerald-400: #6b522a; --emerald-500: #523c1b;
+  --emerald-600: #3d2c12; --emerald-700: #2a1d0a; --emerald-800: #1b1206;
+  --emerald-900: #0e0903;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+[data-theme="newspaper"] {
+  --color-page: #fafaf7;
+  --color-surface: #ffffff;
+  --slate-50: #fafaf7; --slate-100: #ededea; --slate-200: #d5d5d0;
+  --slate-300: #b3b3ad; --slate-400: #888881; --slate-500: #5d5d56;
+  --slate-600: #38382f; --slate-700: #1d1d17; --slate-800: #0c0c08;
+  --slate-900: #000000; --slate-950: #000000;
+  --emerald-50: #fff3d6; --emerald-100: #ffe28b; --emerald-200: #ffcc40;
+  --emerald-300: #f5b400; --emerald-400: #c98e00; --emerald-500: #9c6e00;
+  --emerald-600: #735000; --emerald-700: #4d3600; --emerald-800: #2e2000;
+  --emerald-900: #170f00;
+  --font-sans: "Times New Roman", Times, serif;
+  --font-mono: "Times New Roman", Times, serif;
+}
+
+[data-theme="solarized-light"] {
+  --color-page: #fdf6e3;
+  --color-surface: #eee8d5;
+  --slate-50: #fdf6e3; --slate-100: #eee8d5; --slate-200: #ddd6c1;
+  --slate-300: #93a1a1; --slate-400: #839496; --slate-500: #657b83;
+  --slate-600: #586e75; --slate-700: #073642; --slate-800: #00212b;
+  --slate-900: #001620; --slate-950: #000d14;
+  --emerald-50: #fefce8; --emerald-100: #fdebc4; --emerald-200: #f0c674;
+  --emerald-300: #cb9b18; --emerald-400: #b58900; --emerald-500: #859900;
+  --emerald-600: #6c7c00; --emerald-700: #515e00; --emerald-800: #364000;
+  --emerald-900: #1d2400;
+  --font-sans: "Times New Roman", Times, serif;
+  --font-mono: "Times New Roman", Times, serif;
+}
+
+/* ─── Dark themes ─── */
+
+[data-theme="midnight"] {
+  --color-page: #0b1220;
+  --color-surface: #131c2e;
+  --slate-50: #131c2e; --slate-100: #1a2638; --slate-200: #243246;
+  --slate-300: #34435c; --slate-400: #5d6c84; --slate-500: #8593ab;
+  --slate-600: #a7b3c8; --slate-700: #d0d7e3; --slate-800: #0b1220;
+  --slate-900: #060a13; --slate-950: #02050a;
+  --emerald-50: #022c2c; --emerald-100: #033f3f; --emerald-200: #045353;
+  --emerald-300: #066969; --emerald-400: #06b6d4; --emerald-500: #22d3ee;
+  --emerald-600: #67e8f9; --emerald-700: #a5f3fc; --emerald-800: #cffafe;
+  --emerald-900: #ecfeff;
+}
+
+[data-theme="graphite"] {
+  --color-page: #1a1a1a;
+  --color-surface: #242424;
+  --slate-50: #242424; --slate-100: #2d2d2d; --slate-200: #3a3a3a;
+  --slate-300: #525252; --slate-400: #6b6b6b; --slate-500: #8a8a8a;
+  --slate-600: #b0b0b0; --slate-700: #d4d4d4; --slate-800: #1a1a1a;
+  --slate-900: #0d0d0d; --slate-950: #000000;
+  --emerald-50: #1a3a1a; --emerald-100: #265026; --emerald-200: #366d36;
+  --emerald-300: #4a8f4a; --emerald-400: #65b665; --emerald-500: #84db84;
+  --emerald-600: #a3e3a3; --emerald-700: #c2ecc2; --emerald-800: #d8f1d8;
+  --emerald-900: #e8f7e8;
+}
+
+[data-theme="carbon"] {
+  --color-page: #161616;
+  --color-surface: #262626;
+  --slate-50: #262626; --slate-100: #393939; --slate-200: #525252;
+  --slate-300: #6f6f6f; --slate-400: #8d8d8d; --slate-500: #a8a8a8;
+  --slate-600: #c6c6c6; --slate-700: #e0e0e0; --slate-800: #161616;
+  --slate-900: #0a0a0a; --slate-950: #000000;
+  --emerald-50: #001141; --emerald-100: #001d6c; --emerald-200: #002d9c;
+  --emerald-300: #0043ce; --emerald-400: #0f62fe; --emerald-500: #4589ff;
+  --emerald-600: #78a9ff; --emerald-700: #a6c8ff; --emerald-800: #d0e2ff;
+  --emerald-900: #edf5ff;
+  --font-sans: "Times New Roman", Times, serif;
+  --font-mono: "Times New Roman", Times, serif;
+}
+
+[data-theme="nord"] {
+  --color-page: #2e3440;
+  --color-surface: #3b4252;
+  --slate-50: #3b4252; --slate-100: #434c5e; --slate-200: #4c566a;
+  --slate-300: #677488; --slate-400: #81899a; --slate-500: #d8dee9;
+  --slate-600: #e5e9f0; --slate-700: #eceff4; --slate-800: #2e3440;
+  --slate-900: #232831; --slate-950: #1a1d24;
+  --emerald-50: #3b524d; --emerald-100: #4a685f; --emerald-200: #5e8273;
+  --emerald-300: #74a08a; --emerald-400: #8fbcbb; --emerald-500: #88c0d0;
+  --emerald-600: #a3d0dc; --emerald-700: #b9dde6; --emerald-800: #cee8f0;
+  --emerald-900: #e5f2f6;
+}
+
+[data-theme="solarized-dark"] {
+  --color-page: #002b36;
+  --color-surface: #073642;
+  --slate-50: #073642; --slate-100: #0e4856; --slate-200: #155366;
+  --slate-300: #586e75; --slate-400: #657b83; --slate-500: #839496;
+  --slate-600: #93a1a1; --slate-700: #eee8d5; --slate-800: #002b36;
+  --slate-900: #001b22; --slate-950: #00111a;
+  --emerald-50: #1d2400; --emerald-100: #364000; --emerald-200: #515e00;
+  --emerald-300: #6c7c00; --emerald-400: #859900; --emerald-500: #b58900;
+  --emerald-600: #cb9b18; --emerald-700: #d8b148; --emerald-800: #e8c878;
+  --emerald-900: #f5dba0;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+[data-theme="dracula"] {
+  --color-page: #282a36;
+  --color-surface: #343746;
+  --slate-50: #343746; --slate-100: #44475a; --slate-200: #565969;
+  --slate-300: #6272a4; --slate-400: #7a85b8; --slate-500: #aab2d4;
+  --slate-600: #c8cee5; --slate-700: #f8f8f2; --slate-800: #282a36;
+  --slate-900: #1b1d27; --slate-950: #0e0f15;
+  --emerald-50: #2d1233; --emerald-100: #3f1948; --emerald-200: #58235e;
+  --emerald-300: #7a2d80; --emerald-400: #a13a9d; --emerald-500: #ff79c6;
+  --emerald-600: #ff96d4; --emerald-700: #ffb2e2; --emerald-800: #ffcef0;
+  --emerald-900: #ffe9f7;
+}
+
+[data-theme="monokai"] {
+  --color-page: #272822;
+  --color-surface: #34352e;
+  --slate-50: #34352e; --slate-100: #3e3d32; --slate-200: #49483e;
+  --slate-300: #75715e; --slate-400: #a59f85; --slate-500: #cfc9b0;
+  --slate-600: #e6e0c8; --slate-700: #f8f8f2; --slate-800: #272822;
+  --slate-900: #1b1c17; --slate-950: #0e0f0c;
+  --emerald-50: #2c3a0a; --emerald-100: #3f5310; --emerald-200: #557118;
+  --emerald-300: #6f9220; --emerald-400: #8bb22a; --emerald-500: #a6e22e;
+  --emerald-600: #b9e95c; --emerald-700: #cdef8b; --emerald-800: #e0f5b9;
+  --emerald-900: #f0fadc;
+}
+
+[data-theme="github-dark"] {
+  --color-page: #0d1117;
+  --color-surface: #161b22;
+  --slate-50: #161b22; --slate-100: #21262d; --slate-200: #30363d;
+  --slate-300: #484f58; --slate-400: #6e7681; --slate-500: #8b949e;
+  --slate-600: #b1bac4; --slate-700: #c9d1d9; --slate-800: #0d1117;
+  --slate-900: #010409; --slate-950: #000000;
+  --emerald-50: #002155; --emerald-100: #0a3069; --emerald-200: #033d8b;
+  --emerald-300: #0550ae; --emerald-400: #1f6feb; --emerald-500: #58a6ff;
+  --emerald-600: #79b8ff; --emerald-700: #a5d0ff; --emerald-800: #cae8ff;
+  --emerald-900: #e6f3ff;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+/* ─── Retro / playful ─── */
+
+[data-theme="blueprint"] {
+  --color-page: #0a3060;
+  --color-surface: #0e3e7a;
+  --slate-50: #0e3e7a; --slate-100: #134a92; --slate-200: #1957ab;
+  --slate-300: #2167ca; --slate-400: #4a87dc; --slate-500: #7eabe7;
+  --slate-600: #abc8ee; --slate-700: #e0ecf8; --slate-800: #0a3060;
+  --slate-900: #062045; --slate-950: #03132a;
+  --emerald-50: #00404a; --emerald-100: #005763; --emerald-200: #00717e;
+  --emerald-300: #008c9a; --emerald-400: #00a8b8; --emerald-500: #00e5ff;
+  --emerald-600: #4dedff; --emerald-700: #91f4ff; --emerald-800: #c8faff;
+  --emerald-900: #e6fdff;
+  --font-sans: "Times New Roman", Times, serif;
+  --font-mono: "Times New Roman", Times, serif;
+}
+
+[data-theme="terminal"] {
+  --color-page: #1a1208;
+  --color-surface: #25190b;
+  --slate-50: #25190b; --slate-100: #322310; --slate-200: #432f17;
+  --slate-300: #5d4220; --slate-400: #7a572b; --slate-500: #c08434;
+  --slate-600: #e4a449; --slate-700: #ffb84a; --slate-800: #1a1208;
+  --slate-900: #0d0904; --slate-950: #000000;
+  --emerald-50: #2d1b00; --emerald-100: #432700; --emerald-200: #5d3600;
+  --emerald-300: #7a4700; --emerald-400: #9b5b00; --emerald-500: #ffa500;
+  --emerald-600: #ffb733; --emerald-700: #ffc966; --emerald-800: #ffdb99;
+  --emerald-900: #ffeccc;
+  --font-sans: "Times New Roman", Times, serif;
+  --font-mono: "Times New Roman", Times, serif;
+}
+
+[data-theme="matrix"] {
+  --color-page: #000000;
+  --color-surface: #0a1a0a;
+  --slate-50: #0a1a0a; --slate-100: #122412; --slate-200: #1a331a;
+  --slate-300: #244824; --slate-400: #2d5a2d; --slate-500: #66c266;
+  --slate-600: #99e699; --slate-700: #00ff41; --slate-800: #000000;
+  --slate-900: #000000; --slate-950: #000000;
+  --emerald-50: #002200; --emerald-100: #003300; --emerald-200: #004400;
+  --emerald-300: #006600; --emerald-400: #009900; --emerald-500: #00cc00;
+  --emerald-600: #00ee00; --emerald-700: #00ff41; --emerald-800: #66ff66;
+  --emerald-900: #ccffcc;
+  --font-sans: "Times New Roman", Times, serif;
+  --font-mono: "Times New Roman", Times, serif;
+}
+
+[data-theme="win95"] {
+  --color-page: #008080;
+  --color-surface: #c0c0c0;
+  --slate-50: #c0c0c0; --slate-100: #d4d0c8; --slate-200: #808080;
+  --slate-300: #707070; --slate-400: #585858; --slate-500: #404040;
+  --slate-600: #2a2a2a; --slate-700: #000000; --slate-800: #000080;
+  --slate-900: #000050; --slate-950: #000020;
+  --emerald-50: #ffe4c4; --emerald-100: #ffc880; --emerald-200: #ffa940;
+  --emerald-300: #ff8800; --emerald-400: #cc6600; --emerald-500: #000080;
+  --emerald-600: #0000a0; --emerald-700: #2020c0; --emerald-800: #4040e0;
+  --emerald-900: #8080ff;
+  --font-sans: "Times New Roman", Times, serif;
+  --font-mono: "Times New Roman", Times, serif;
+}
+
+[data-theme="macclassic"] {
+  --color-page: #cccccc;
+  --color-surface: #ffffff;
+  --slate-50: #ffffff; --slate-100: #f0f0f0; --slate-200: #d4d4d4;
+  --slate-300: #aaaaaa; --slate-400: #7a7a7a; --slate-500: #555555;
+  --slate-600: #333333; --slate-700: #1a1a1a; --slate-800: #000000;
+  --slate-900: #000000; --slate-950: #000000;
+  --emerald-50: #e0e0e0; --emerald-100: #c0c0c0; --emerald-200: #a0a0a0;
+  --emerald-300: #808080; --emerald-400: #606060; --emerald-500: #000000;
+  --emerald-600: #1a1a1a; --emerald-700: #333333; --emerald-800: #555555;
+  --emerald-900: #7a7a7a;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+/* ─── Tinted ─── */
+
+[data-theme="sunset"] {
+  --color-page: #fff5ed;
+  --color-surface: #fffaf5;
+  --slate-50: #fff5ed; --slate-100: #ffe8d6; --slate-200: #ffd0a8;
+  --slate-300: #ffaf70; --slate-400: #f08940; --slate-500: #c46a25;
+  --slate-600: #964e16; --slate-700: #6d370a; --slate-800: #4a2407;
+  --slate-900: #2c1404; --slate-950: #170902;
+  --emerald-50: #ffe9e0; --emerald-100: #ffc8b0; --emerald-200: #ff9d75;
+  --emerald-300: #ff6f3d; --emerald-400: #e8431a; --emerald-500: #c92a06;
+  --emerald-600: #a01f02; --emerald-700: #771600; --emerald-800: #4d0e00;
+  --emerald-900: #2a0700;
+}
+
+[data-theme="ocean"] {
+  --color-page: #f0f9fb;
+  --color-surface: #ffffff;
+  --slate-50: #f0f9fb; --slate-100: #d8eef3; --slate-200: #b1dde7;
+  --slate-300: #7ec3d5; --slate-400: #4ea8c0; --slate-500: #2f8aa3;
+  --slate-600: #1f6a82; --slate-700: #144d63; --slate-800: #0c3445; --slate-900: #061f2a; --slate-950: #03101a;
+  --emerald-50: #fef3e0; --emerald-100: #fcdfa8; --emerald-200: #f7c46d;
+  --emerald-300: #eda537; --emerald-400: #c98317; --emerald-500: #00838f;
+  --emerald-600: #00697a; --emerald-700: #004f5e; --emerald-800: #003744;
+  --emerald-900: #00212a;
+}
+
+[data-theme="forest"] {
+  --color-page: #f4f7f0;
+  --color-surface: #fbfdf8;
+  --slate-50: #f4f7f0; --slate-100: #e3ebd6; --slate-200: #c4d3a8;
+  --slate-300: #9eb478; --slate-400: #75934f; --slate-500: #547136;
+  --slate-600: #3d5524; --slate-700: #2a3c17; --slate-800: #1a280d;
+  --slate-900: #0d1705; --slate-950: #050a02;
+  --emerald-50: #ecf6e3; --emerald-100: #cce9b3; --emerald-200: #a3d683;
+  --emerald-300: #7ac256; --emerald-400: #5aa432; --emerald-500: #3c8c1f;
+  --emerald-600: #2a6b15; --emerald-700: #1c4d0e; --emerald-800: #103408;
+  --emerald-900: #081d04;
+}
+
+[data-theme="lavender"] {
+  --color-page: #faf6ff;
+  --color-surface: #ffffff;
+  --slate-50: #faf6ff; --slate-100: #efe6fc; --slate-200: #ddccf6;
+  --slate-300: #c2a8ec; --slate-400: #a182dc; --slate-500: #815fc4;
+  --slate-600: #6441a3; --slate-700: #4a2e7d; --slate-800: #321f55;
+  --slate-900: #1d1234; --slate-950: #0e0820;
+  --emerald-50: #ffeef6; --emerald-100: #ffcce6; --emerald-200: #ffa3d2;
+  --emerald-300: #f87bbf; --emerald-400: #ec4f9f; --emerald-500: #d12c80;
+  --emerald-600: #a52066; --emerald-700: #7a164a; --emerald-800: #500e30;
+  --emerald-900: #2b061a;
+}
+
+[data-theme="rose"] {
+  --color-page: #fff5f6;
+  --color-surface: #fffafa;
+  --slate-50: #fff5f6; --slate-100: #ffe2e6; --slate-200: #fbbfc8;
+  --slate-300: #f098a5; --slate-400: #db6f80; --slate-500: #b94a5d;
+  --slate-600: #903547; --slate-700: #682435; --slate-800: #461623;
+  --slate-900: #270b13; --slate-950: #140509;
+  --emerald-50: #ffece5; --emerald-100: #ffd0bd; --emerald-200: #ffac8d;
+  --emerald-300: #ff855c; --emerald-400: #f06030; --emerald-500: #c94013;
+  --emerald-600: #a02e08; --emerald-700: #771f03; --emerald-800: #4f1300;
+  --emerald-900: #2a0900;
+}
+
+/* ─── Mono / accessibility ─── */
+
+[data-theme="mono-light"] {
+  --color-page: #ffffff;
+  --color-surface: #ffffff;
+  --slate-50: #fafafa; --slate-100: #f0f0f0; --slate-200: #e0e0e0;
+  --slate-300: #c0c0c0; --slate-400: #909090; --slate-500: #606060;
+  --slate-600: #404040; --slate-700: #2a2a2a; --slate-800: #181818;
+  --slate-900: #0a0a0a; --slate-950: #000000;
+  --emerald-50: #f0f0f0; --emerald-100: #d0d0d0; --emerald-200: #a8a8a8;
+  --emerald-300: #808080; --emerald-400: #606060; --emerald-500: #404040;
+  --emerald-600: #2a2a2a; --emerald-700: #181818; --emerald-800: #0c0c0c;
+  --emerald-900: #000000;
+}
+
+[data-theme="mono-dark"] {
+  --color-page: #0a0a0a;
+  --color-surface: #1a1a1a;
+  --slate-50: #1a1a1a; --slate-100: #242424; --slate-200: #383838;
+  --slate-300: #555555; --slate-400: #787878; --slate-500: #9e9e9e;
+  --slate-600: #c4c4c4; --slate-700: #e8e8e8; --slate-800: #0a0a0a;
+  --slate-900: #050505; --slate-950: #000000;
+  --emerald-50: #1a1a1a; --emerald-100: #2a2a2a; --emerald-200: #404040;
+  --emerald-300: #606060; --emerald-400: #888888; --emerald-500: #b8b8b8;
+  --emerald-600: #d4d4d4; --emerald-700: #e8e8e8; --emerald-800: #f4f4f4;
+  --emerald-900: #ffffff;
+}
+
+[data-theme="highcontrast"] {
+  --color-page: #000000;
+  --color-surface: #000000;
+  --slate-50: #000000; --slate-100: #1a1a1a; --slate-200: #333333;
+  --slate-300: #666666; --slate-400: #999999; --slate-500: #cccccc;
+  --slate-600: #eeeeee; --slate-700: #ffffff; --slate-800: #000000;
+  --slate-900: #000000; --slate-950: #000000;
+  --emerald-50: #332600; --emerald-100: #664c00; --emerald-200: #997200;
+  --emerald-300: #cc9900; --emerald-400: #ffcc00; --emerald-500: #ffff00;
+  --emerald-600: #ffff66; --emerald-700: #ffff99; --emerald-800: #ffffcc;
+  --emerald-900: #ffffe6;
+  --amber-50: #1a0d00; --amber-100: #331a00; --amber-200: #663300;
+  --amber-300: #994d00; --amber-400: #cc6600; --amber-500: #ff8800;
+  --amber-600: #ffaa44; --amber-700: #ffcc88; --amber-800: #ffddaa;
+  --amber-900: #ffeecc;
+  --font-sans: "Times New Roman", Times, serif;
+}
+
+/* ─── Sidebar contrast pair ───
+
+   The sidebar needs to be visually distinct in every theme: a dark
+   "navigation panel" on light themes, kept distinct from cards in dark
+   themes. We can't reuse the slate-100 slot for sidebar text because in
+   dark themes slate-100 is repurposed as a card-inset background. So we
+   give the sidebar its own pair of vars, defaulting to the previous
+   slate-900 / slate-100 look. Themes can override.
+*/
+
+:root,
+[data-theme="default"] {
+  --sidebar-bg: var(--slate-900);
+  --sidebar-text: #e2e8f0;
+  --sidebar-text-muted: #64748b;
+}
+
+/* Dark themes keep a contrast sidebar — slightly different shade than the page so it doesn't disappear. */
+[data-theme="midnight"]      { --sidebar-bg: #04081a; --sidebar-text: #cfd8e8; --sidebar-text-muted: #6c7d99; }
+[data-theme="graphite"]      { --sidebar-bg: #050505; --sidebar-text: #d4d4d4; --sidebar-text-muted: #6b6b6b; }
+[data-theme="carbon"]        { --sidebar-bg: #000000; --sidebar-text: #e0e0e0; --sidebar-text-muted: #8d8d8d; }
+[data-theme="nord"]          { --sidebar-bg: #232831; --sidebar-text: #eceff4; --sidebar-text-muted: #81899a; }
+[data-theme="solarized-dark"]{ --sidebar-bg: #001b22; --sidebar-text: #eee8d5; --sidebar-text-muted: #93a1a1; }
+[data-theme="dracula"]       { --sidebar-bg: #1b1d27; --sidebar-text: #f8f8f2; --sidebar-text-muted: #7a85b8; }
+[data-theme="monokai"]       { --sidebar-bg: #1b1c17; --sidebar-text: #f8f8f2; --sidebar-text-muted: #a59f85; }
+[data-theme="github-dark"]   { --sidebar-bg: #010409; --sidebar-text: #c9d1d9; --sidebar-text-muted: #6e7681; }
+[data-theme="mono-dark"]     { --sidebar-bg: #000000; --sidebar-text: #e8e8e8; --sidebar-text-muted: #787878; }
+
+/* Retro themes pick distinctive sidebar colors. */
+[data-theme="blueprint"]     { --sidebar-bg: #051633; --sidebar-text: #c8faff; --sidebar-text-muted: #7eabe7; }
+[data-theme="terminal"]      { --sidebar-bg: #000000; --sidebar-text: #ffb84a; --sidebar-text-muted: #7a572b; }
+[data-theme="matrix"]        { --sidebar-bg: #000000; --sidebar-text: #00ff41; --sidebar-text-muted: #2d5a2d; }
+[data-theme="win95"]         { --sidebar-bg: #000080; --sidebar-text: #ffffff; --sidebar-text-muted: #d0d0e0; }
+[data-theme="macclassic"]    { --sidebar-bg: #000000; --sidebar-text: #ffffff; --sidebar-text-muted: #b0b0b0; }
+
+/* High-contrast = pure black sidebar with yellow accents. */
+[data-theme="highcontrast"]  { --sidebar-bg: #000000; --sidebar-text: #ffff00; --sidebar-text-muted: #cccc00; }
+
+/* Tinted themes keep a colored-but-dark sidebar. */
+[data-theme="sunset"]        { --sidebar-bg: #4a2407; --sidebar-text: #ffe8d6; --sidebar-text-muted: #c9a070; }
+[data-theme="ocean"]         { --sidebar-bg: #0c3445; --sidebar-text: #e0f6fb; --sidebar-text-muted: #7ec3d5; }
+[data-theme="forest"]        { --sidebar-bg: #1a280d; --sidebar-text: #e3ebd6; --sidebar-text-muted: #9eb478; }
+[data-theme="lavender"]      { --sidebar-bg: #321f55; --sidebar-text: #efe6fc; --sidebar-text-muted: #a182dc; }
+[data-theme="rose"]          { --sidebar-bg: #461623; --sidebar-text: #ffe2e6; --sidebar-text-muted: #db6f80; }
+
+/* ─── Component classes ─── */
+
+@layer components {
+  .input {
+    @apply w-full border border-slate-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500;
+    background-color: var(--color-page);
+    color: var(--slate-700);
+    color-scheme: light;
+    /* Pin to a fixed intrinsic height so <input>, <select> and <textarea>
+       sharing the `.input` class render at exactly the same height in a
+       grid row (the browser's default select/input metrics differ by a
+       few pixels otherwise). */
+    height: 34px;
+    line-height: 1.25rem;
+    box-sizing: border-box;
+  }
+  textarea.input {
+    /* Textareas grow with content — undo the fixed height. */
+    height: auto;
+    min-height: 34px;
+  }
+  .input::placeholder {
+    color: var(--slate-400);
+    opacity: 1;
+  }
+  .input:disabled,
+  .input[readonly] {
+    background-color: var(--slate-100);
+    color: var(--slate-500);
+  }
+  [data-theme="midnight"] .input,
+  [data-theme="graphite"] .input,
+  [data-theme="carbon"] .input,
+  [data-theme="nord"] .input,
+  [data-theme="solarized-dark"] .input,
+  [data-theme="dracula"] .input,
+  [data-theme="monokai"] .input,
+  [data-theme="github-dark"] .input,
+  [data-theme="mono-dark"] .input,
+  [data-theme="blueprint"] .input,
+  [data-theme="terminal"] .input,
+  [data-theme="matrix"] .input,
+  [data-theme="highcontrast"] .input {
+    color-scheme: dark;
+  }
+  .btn-primary {
+    @apply px-3 py-1.5 rounded bg-emerald-600 text-white text-sm hover:bg-emerald-700 disabled:opacity-50;
+  }
+  .btn-secondary {
+    @apply px-3 py-1.5 rounded border border-slate-300 text-slate-700 text-sm hover:bg-slate-100 disabled:opacity-50;
+  }
+  .btn-danger {
+    @apply px-3 py-1.5 rounded bg-rose-600 text-white text-sm hover:bg-rose-700 disabled:opacity-50;
+  }
+  .sidebar-shell {
+    background-color: var(--sidebar-bg);
+    color: var(--sidebar-text);
+  }
+  .sidebar-section-label {
+    color: var(--sidebar-text-muted);
+  }
+  .sidebar-nav-link.is-active,
+  .sidebar-nav-link:not(.is-active):hover {
+    background-color: var(--color-page);
+    color: var(--slate-900);
+  }
+}

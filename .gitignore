@@ -1,0 +1,57 @@
+# Data files (sensitive) — real books must live OUTSIDE the repo (see backend/.env.example)
+data/
+tmp/
+
+# Python
+backend/.venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+frontend/src/**/*.js
+
+# Playwright runtime artifacts
+frontend/playwright-report/
+frontend/test-results/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local agent/session dirs — never commit
+.claude/
+
+# Any SQLite database anywhere (master.db / books.db)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Any .env variant (may contain DATA_DIR pointing at real data, secrets)
+*.env
+.env.*
+!*.env.example
+!.env.example
+
+# Uploaded/generated customer artifacts if ever produced in-tree
+**/attachments/
+**/uploads/
+
+# Transient e2e / test-run artifacts
+.tmp-*
+/test-results/
+/playwright-report/
+
+# Local sample bank statements — never commit real statements
+/Sample/
