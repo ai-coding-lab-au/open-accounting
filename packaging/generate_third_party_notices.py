@@ -256,6 +256,16 @@ def main() -> None:
     parts.append("\nFRONTEND DEPENDENCIES (bundled into frontend-dist JS)\n" + "=" * 80 + "\n\n")
     parts.extend(_frontend_sections())
 
+    parts.append("\nBUNDLED FONT\n" + "=" * 80 + "\n\n")
+    ofl = REPO_ROOT / "backend" / "app" / "assets" / "fonts" / "OFL.txt"
+    parts.append(
+        "=" * 80
+        + "\nNoto Sans SC (backend/app/assets/fonts/NotoSansSC-Regular.ttf)\n"
+        + "License: SIL Open Font License 1.1\n\n"
+        + ofl.read_text(encoding="utf-8", errors="replace").strip()
+        + "\n\n"
+    )
+
     parts.append("\nRUNTIME COMPONENTS\n" + "=" * 80 + "\n\n" + STATIC_NOTICES)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -22,6 +22,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 
+from .pdf_fonts import font_for
+
 
 # Documents are English-only, so use Times — ReportLab's built-in serif face,
 # the PDF equivalent of the product-wide Times New Roman document style.
@@ -124,14 +126,15 @@ def render_document_pdf(
     # ----- Top-left: company name + address -----
     y = page_h - margin
     c.setFillColor(BRAND_BLUE)
-    c.setFont(FONT_BOLD, 20)
-    c.drawString(margin, y - 16, company.get("name", ""))
+    company_name = company.get("name", "")
+    c.setFont(font_for(company_name, FONT_BOLD), 20)
+    c.drawString(margin, y - 16, company_name)
 
     y_addr = y - 16 - 16
     addr_lines = _company_address_lines(company)
     c.setFillColor(black)
-    c.setFont(FONT_BASE, 9.5)
     for line in addr_lines:
+        c.setFont(font_for(line, FONT_BASE), 9.5)
         c.drawString(margin, y_addr, line)
         y_addr -= 12
 
@@ -157,9 +160,13 @@ def render_document_pdf(
     # box can grow to fit a long name/address instead of clipping it.
     bill_max_w = left_w - 12  # 6pt padding each side
     bill_lines = _customer_bill_to_lines(customer)
-    wrapped_bill: list[str] = []
+    # Wrap with the font each line will actually be drawn in (CJK names get
+    # the CJK face, whose glyph widths differ from Times).
+    wrapped_bill: list[tuple[str, str]] = []
     for line in bill_lines:
-        wrapped_bill.extend(_wrap_line(c, line, FONT_BASE, 10, bill_max_w))
+        line_font = font_for(line, FONT_BASE)
+        for piece in _wrap_line(c, line, line_font, 10, bill_max_w):
+            wrapped_bill.append((piece, line_font))
     # Grow the box to fit the wrapped content (min 70 keeps the original look).
     body_h_left = max(70, 10 + 12 * len(wrapped_bill))
     body_top_left = _draw_box_with_header(
@@ -167,8 +174,8 @@ def render_document_pdf(
     )
     ly = body_top_left - 6
     c.setFillColor(black)
-    c.setFont(FONT_BASE, 10)
-    for wrapped in wrapped_bill:
+    for wrapped, line_font in wrapped_bill:
+        c.setFont(line_font, 10)
         c.drawString(margin + 6, ly, wrapped)
         ly -= 12
 
@@ -244,8 +251,10 @@ def render_document_pdf(
             c.setFont(FONT_BASE, 10)
             c.drawRightString(col_right[3] - 6, row_y + 5, "-")
             continue
+        desc = str(li.get("description", ""))
+        c.setFont(font_for(desc, FONT_BASE), 10)
+        c.drawString(col_x[0] + 6, row_y + 5, desc)
         c.setFont(FONT_BASE, 10)
-        c.drawString(col_x[0] + 6, row_y + 5, str(li.get("description", "")))
         qty = li.get("quantity")
         if qty is not None:
             qty_str = _fmt_qty(qty)
@@ -331,7 +340,7 @@ def render_document_pdf(
             c.setFillColor(black)
             c.setFont(FONT_BASE, 9.5)
             c.drawString(table_x + 6, rr_y + 4, label)
-            c.setFont(FONT_BASE, 9.5)
+            c.setFont(font_for(value, FONT_BASE), 9.5)
             c.drawString(table_x + pm_label_w + 6, rr_y + 4, value or "")
         # Outer border around the pm body
         body_h = pm_row_h * len(pm_rows)
@@ -349,8 +358,8 @@ def render_document_pdf(
         c.drawString(margin, ny, "NOTES")
         ny -= 12
         c.setFillColor(black)
-        c.setFont(FONT_BASE, 9.5)
         for line in notes.splitlines():
+            c.setFont(font_for(line, FONT_BASE), 9.5)
             c.drawString(margin, ny, line)
             ny -= 11
 

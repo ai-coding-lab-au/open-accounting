@@ -12,6 +12,9 @@ FRONTEND_DIST = ROOT / "frontend" / "dist"
 datas = []
 if FRONTEND_DIST.exists():
     datas.append((str(FRONTEND_DIST), "frontend-dist"))
+# Bundled CJK font (Noto Sans SC, OFL-1.1) + its license — pdf_fonts.py
+# resolves it relative to the app package, so keep the app/assets layout.
+datas.append((str(BACKEND / "app" / "assets"), "app/assets"))
 
 hiddenimports = (
     collect_submodules("app")

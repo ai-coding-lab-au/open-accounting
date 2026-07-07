@@ -188,7 +188,7 @@ def build_html(
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>
 @page {{ size:A4; margin:0; }}
 * {{ box-sizing:border-box; }}
-body {{ font-family:'Times New Roman',Times,serif; color:#1a1a1a; font-size:10.5pt; margin:0; }}
+body {{ font-family:'Times New Roman',Times,'Noto Sans CJK SC','Microsoft YaHei','PingFang SC',serif; color:#1a1a1a; font-size:10.5pt; margin:0; }}
 .sheet {{ padding:18mm; }}
 .band {{ background:{NAVY}; height:8px; }}
 .head {{ display:flex; justify-content:space-between; align-items:flex-start; margin-top:20px; }}

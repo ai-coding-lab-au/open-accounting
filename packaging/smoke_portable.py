@@ -74,8 +74,10 @@ def main() -> None:
                              {"id": COMPANY, "name": "Smoke Test Pty Ltd"})
         _check("create company", status in (200, 201), f"status={status}")
 
+        # CJK client/line text exercises the bundled Noto Sans SC font's
+        # frozen-path resolution (app/assets inside _internal) end-to-end.
         status, body = _request("POST", "/api/v1/clients",
-                                {"display_name": "Smoke Client"}, company=COMPANY)
+                                {"display_name": "Smoke 张伟 Client"}, company=COMPANY)
         _check("create client", status in (200, 201), f"status={status}")
         client_id = json.loads(body)["id"]
 
@@ -84,7 +86,7 @@ def main() -> None:
             {
                 "issue_date": "2026-01-15",
                 "client_ref_id": client_id,
-                "lines": [{"description": "Smoke service", "quantity": "1",
+                "lines": [{"description": "Smoke 咨询服务 service", "quantity": "1",
                            "unit_price": "100.00"}],
             },
             company=COMPANY,
@@ -96,6 +98,15 @@ def main() -> None:
                                 company=COMPANY)
         _check("receipt PDF renders", status == 200 and body.startswith(b"%PDF-")
                and len(body) > 1000, f"status={status} size={len(body)}")
+
+        import io
+
+        import pdfplumber
+
+        with pdfplumber.open(io.BytesIO(body)) as doc:
+            pdf_text = doc.pages[0].extract_text() or ""
+        _check("receipt PDF renders CJK glyphs", "张伟" in pdf_text
+               and "咨询服务" in pdf_text, f"text={pdf_text[:120]!r}")
 
         status, body = _request(
             "GET",

@@ -30,6 +30,7 @@ from reportlab.platypus import (
 from ..models.master import Company
 from ..models.company import StaffMember
 from .staff import display_label as _staff_display_label
+from .pdf_fonts import FONT_CJK, font_for, needs_cjk
 from .pdf_render import FONT_BASE, FONT_BOLD
 
 
@@ -50,6 +51,16 @@ def _esc(v: object) -> str:
         return ""
     s = str(v)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _esc_font(v: object) -> str:
+    """_esc plus a CJK font tag when the text needs glyphs Times lacks
+    (Chinese company/contact names, imported statement memos). English text
+    passes through unchanged, so default reports render identically."""
+    s = _esc(v)
+    if needs_cjk(s) and font_for(s, FONT_BASE) == FONT_CJK:
+        return f'<font name="{FONT_CJK}">{s}</font>'
+    return s
 
 
 def _styles() -> dict[str, ParagraphStyle]:
@@ -116,12 +127,12 @@ def _company_header_row(company: Company, signing_agent: StaffMember | None = No
     addr = ", ".join([p for p in addr_parts if p])
 
     sty = _styles()
-    left = Paragraph(f"<b>{_esc(name)}</b>", sty["kv_value"])
+    left = Paragraph(f"<b>{_esc_font(name)}</b>", sty["kv_value"])
     sub_lines = []
     if bits:
-        sub_lines.append(_esc(" · ".join(bits)))
+        sub_lines.append(_esc_font(" · ".join(bits)))
     if addr:
-        sub_lines.append(_esc(addr))
+        sub_lines.append(_esc_font(addr))
     right = Paragraph(
         "<br/>".join(sub_lines) if sub_lines else "",
         sty["small"],
@@ -225,8 +236,8 @@ def render_bank_statement_pdf(*, company: Company, data: dict, signing_agent: St
         out_str = _money(r["amount"]) if r["direction"] == "out" else ""
         rows.append([
             r["occurred_at"].strftime("%d %b"),
-            Paragraph(_esc(desc), sty["body"]),
-            Paragraph(_esc(cat), sty["body"]),
+            Paragraph(_esc_font(desc), sty["body"]),
+            Paragraph(_esc_font(cat), sty["body"]),
             in_str,
             out_str,
             _money(r["running_balance"]),
@@ -287,7 +298,7 @@ def render_pnl_pdf(*, company: Company, data: dict, signing_agent: StaffMember |
         body: list[list[Any]] = [[Paragraph(f"<b>{_esc(label)}</b>", sty["body"]), ""]]
         for r in rows:
             body.append([
-                Paragraph(f"{_esc(r['code'])} · {_esc(r['name'])}", sty["body"]),
+                Paragraph(f"{_esc(r['code'])} · {_esc_font(r['name'])}", sty["body"]),
                 _money(r["total"]),
             ])
         body.append([
@@ -479,7 +490,13 @@ def render_trial_balance_pdf(*, company: Company, data: dict, signing_agent: Sta
     for r in data["rows"]:
         body.append([
             _esc(r.get("code") or "—"),
-            _esc(r["name"]),
+            # Raw table cells can't carry font markup; a CJK account/bank name
+            # gets promoted to a Paragraph so it can use the CJK face.
+            (
+                Paragraph(_esc_font(r["name"]), sty["body"])
+                if needs_cjk(str(r["name"]))
+                else _esc(r["name"])
+            ),
             _esc("Bank" if r["kind"] == "bank" else (r.get("account_type") or "—")),
             _money(r["debit_total"]) if Decimal(str(r["debit_total"])) > 0 else "",
             _money(r["credit_total"]) if Decimal(str(r["credit_total"])) > 0 else "",
@@ -572,7 +589,7 @@ def render_balance_sheet_pdf(*, company: Company, data: dict, signing_agent: Sta
             for l in g["lines"]:
                 name = f"{l['code']} · {l['name']}" if l.get("code") else l["name"]
                 body.append([
-                    Paragraph(_esc(name), sty["body"]),
+                    Paragraph(_esc_font(name), sty["body"]),
                     _money(l["balance"]),
                 ])
             body.append([

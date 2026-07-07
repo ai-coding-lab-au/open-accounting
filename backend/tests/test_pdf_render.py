@@ -82,3 +82,49 @@ def test_renders_receipt():
     )
     assert pdf.startswith(b"%PDF-")
     (OUTPUT_DIR / "sample_receipt.pdf").write_bytes(pdf)
+
+
+def test_renders_cjk_text_with_embedded_font():
+    """Chinese customer/company/line text must render with real glyphs, not
+    the Times placeholder boxes (audit: '咨询服务' used to come out as 'nnnn').
+    Extraction via pdfplumber proves the CJK face was embedded with a working
+    ToUnicode map."""
+    import io
+
+    import pdfplumber
+
+    pdf = render_document_pdf(
+        doc_type="receipt",
+        doc_number="RCT-2026-0002-1",
+        issue_date=date(2026, 5, 18),
+        company={**COMPANY, "name": "华人会计 Example Pty Ltd"},
+        customer={
+            "name": "张伟",
+            "address": "Unit 1, 1 Example Street\nSpringfield, NSW 2000",
+            "email": "customer@example.com",
+            "phone": "0400000000",
+        },
+        lines=[
+            {
+                "description": "咨询服务 Consulting",
+                "quantity": Decimal("1"),
+                "unit_price": Decimal("100.00"),
+                "amount": Decimal("100.00"),
+            }
+        ],
+        subtotal=Decimal("100.00"),
+        gst_amount=Decimal("10.00"),
+        total=Decimal("110.00"),
+        is_gst_registered=True,
+        paid_date=date(2026, 5, 17),
+        payment_method="银行转账 Bank transfer",
+    )
+    assert pdf.startswith(b"%PDF-")
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        text = doc.pages[0].extract_text() or ""
+    assert "张伟" in text
+    assert "咨询服务 Consulting" in text
+    assert "华人会计 Example Pty Ltd" in text
+    assert "银行转账 Bank transfer" in text
+    # English content still renders alongside.
+    assert "TOTAL (INCL. GST)" in text
