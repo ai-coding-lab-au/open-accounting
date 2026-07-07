@@ -18,6 +18,11 @@ frontend/.vite/
 *.tsbuildinfo
 frontend/src/**/*.js
 
+# Packaging outputs
+/build/
+/dist/
+/release/
+
 # Playwright runtime artifacts
 frontend/playwright-report/
 frontend/test-results/
@@ -30,6 +35,11 @@ frontend/test-results/
 
 # Local agent/session dirs — never commit
 .claude/
+NEXT_AUDIT_*.md
+CLAUDE_CODE_AUDIT_FINDINGS_*.md
+
+# Separate marketing website repository
+/website/
 
 # Any SQLite database anywhere (master.db / books.db)
 *.db

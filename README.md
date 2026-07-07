@@ -104,7 +104,8 @@ gitignored as a second line of defence. Back up your `DATA_DIR`.
   keeps showing the invoice as authorised rather than paid.
 - Chromium PDF rendering is optional. Install it with
   `pip install -e ".[pdf]"` and `playwright install chromium`; otherwise the
-  backend falls back to ReportLab rendering.
+  backend falls back to ReportLab rendering. The Windows portable build
+  ships the ReportLab renderer only.
 
 ## License
 

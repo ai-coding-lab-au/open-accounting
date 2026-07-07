@@ -19,6 +19,7 @@ from .api.v1 import (
     reports,
     staff,
 )
+from .frontend import configure_frontend
 
 
 @asynccontextmanager
@@ -116,6 +117,11 @@ def create_app() -> FastAPI:
 
     # --- Staff (document signers) ------------------------------------------
     app.include_router(staff.router, prefix="/api/v1")
+
+    # --- Packaged desktop / production static frontend ---------------------
+    # In development, Vite serves the React app. In the portable Windows build,
+    # PyInstaller bundles frontend/dist and the FastAPI process serves it.
+    configure_frontend(app)
 
     return app
 
