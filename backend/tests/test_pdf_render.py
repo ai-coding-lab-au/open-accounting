@@ -128,3 +128,67 @@ def test_renders_cjk_text_with_embedded_font():
     assert "银行转账 Bank transfer" in text
     # English content still renders alongside.
     assert "TOTAL (INCL. GST)" in text
+
+
+def test_bilingual_labels_render_when_enabled():
+    """Company.bilingual_labels=True turns fixed labels into "ENGLISH 中文";
+    off (the default, exercised by every other test) keeps them English-only."""
+    import io
+
+    import pdfplumber
+
+    pdf = render_document_pdf(
+        doc_type="receipt",
+        doc_number="RCT-2026-0003-1",
+        issue_date=date(2026, 5, 18),
+        company={**COMPANY, "bilingual_labels": True},
+        customer=CUSTOMER,
+        lines=LINES,
+        subtotal=Decimal("1000.00"),
+        gst_amount=Decimal("100.00"),
+        total=Decimal("1100.00"),
+        is_gst_registered=True,
+        paid_date=date(2026, 5, 17),
+        payment_method="Bank transfer",
+    )
+    with pdfplumber.open(io.BytesIO(pdf)) as doc:
+        text = doc.pages[0].extract_text() or ""
+    assert "收据" in text  # RECEIPT 收据
+    assert "客户" in text  # BILL TO 客户
+    assert "总计（含GST）" in text  # TOTAL (INCL. GST)
+    assert "付款方式" in text  # PAYMENT METHOD
+    assert "RECEIPT" in text  # English retained alongside
+
+    # Default (no flag) stays English-only.
+    pdf_default = _render_one(
+        "receipt", "RCT-2026-0004-1", paid_date=date(2026, 5, 17)
+    )
+    with pdfplumber.open(io.BytesIO(pdf_default)) as doc:
+        text_default = doc.pages[0].extract_text() or ""
+    assert "收据" not in text_default
+
+
+def test_bilingual_labels_in_html_template():
+    from app.services.html_render import build_html
+
+    common = dict(
+        doc_type="receipt",
+        doc_number="RCT-2026-0005-1",
+        issue_date=date(2026, 5, 18),
+        customer=CUSTOMER,
+        lines=LINES,
+        subtotal=Decimal("1000.00"),
+        gst_amount=Decimal("100.00"),
+        total=Decimal("1100.00"),
+        is_gst_registered=True,
+        paid_date=date(2026, 5, 17),
+        payment_method="Bank transfer",
+    )
+    html_on = build_html(company={**COMPANY, "bilingual_labels": True}, **common)
+    assert "RECEIPT 收据" in html_on
+    assert "BILL TO 客户" in html_on
+    assert "TOTAL 总计" in html_on
+    assert "PAYMENT METHOD 付款方式" in html_on
+
+    html_off = build_html(company=COMPANY, **common)
+    assert "收据" not in html_off

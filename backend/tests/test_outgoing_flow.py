@@ -419,3 +419,33 @@ def test_company_patch_persists_bank_details(client):
     r = client.post(f"/api/v1/outgoing/{receipt['id']}/pdf", headers=HDR)
     assert r.status_code == 200
     assert len(r.content) > 1000  # rendered something substantive
+
+
+def test_bilingual_labels_toggle_flows_through_to_rendered_pdf(client):
+    """Settings toggle (Company.bilingual_labels) → PATCH → _render_for →
+    rendered receipt shows "ENGLISH 中文" labels."""
+    import io
+
+    import pdfplumber
+
+    _make_company(client)
+
+    receipt = _create_receipt(client, "Toggle Off Co", amount="500")
+    r = client.post(f"/api/v1/outgoing/{receipt['id']}/pdf", headers=HDR)
+    assert r.status_code == 200
+    with pdfplumber.open(io.BytesIO(r.content)) as doc:
+        text = doc.pages[0].extract_text() or ""
+    assert "收据" not in text  # default: English-only labels
+
+    r = client.patch("/api/v1/companies/acme", json={"bilingual_labels": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["bilingual_labels"] is True
+
+    receipt2 = _create_receipt(client, "Toggle On Co", amount="600")
+    r = client.post(f"/api/v1/outgoing/{receipt2['id']}/pdf", headers=HDR)
+    assert r.status_code == 200
+    with pdfplumber.open(io.BytesIO(r.content)) as doc:
+        text = doc.pages[0].extract_text() or ""
+    assert "收据" in text
+    assert "付款方式" in text
+    assert "RECEIPT" in text  # English retained

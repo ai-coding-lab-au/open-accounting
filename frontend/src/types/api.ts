@@ -7,6 +7,7 @@ export interface Company {
   base_currency: string;
   fy_start_month: number;
   gst_registered: boolean;
+  bilingual_labels: boolean;
   address_line1: string | null;
   address_line2: string | null;
   suburb: string | null;

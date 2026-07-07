@@ -514,6 +514,7 @@ def _render_for(doc: OutgoingDocument, company: Company) -> bytes:
             "phone": company.phone,
             "email": company.email,
             "abn": company.abn,
+            "bilingual_labels": company.bilingual_labels,
             **bank,
         },
         customer={

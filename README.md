@@ -20,7 +20,8 @@ modules are included, the practice-specific modules are not.
 **Documents**
 - Receipts issued directly to a client (line items, GST-inclusive/exclusive, void/restore)
 - Print-quality PDFs (Chromium HTML render when Playwright is available, ReportLab fallback);
-  Chinese client/company names render correctly (bundled Noto Sans SC, OFL-1.1)
+  Chinese client/company names render correctly (bundled Noto Sans SC, OFL-1.1), with an
+  optional per-company bilingual English+Chinese label mode for receipts
 - Per-year document numbering with race-safe counters
 
 ## Quick start

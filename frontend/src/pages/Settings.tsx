@@ -199,6 +199,16 @@ function CompanyProfileCard({ companyId }: { companyId: string }) {
         GST registered (affects whether the PDF shows a GST line and the "Tax Invoice" wording)
       </label>
 
+      <label className="flex items-center gap-2 text-sm mt-2">
+        <input
+          type="checkbox"
+          checked={merged.bilingual_labels ?? false}
+          onChange={(e) => set("bilingual_labels", e.target.checked)}
+        />
+        Bilingual document labels 中英双语单据标签 (receipt PDFs show "RECEIPT 收据",
+        "TOTAL 总计" etc. — your own text is never translated)
+      </label>
+
       <div className="mt-4 flex justify-end gap-2">
         {mut.isError && (
           <p className="text-sm text-red-600 mr-auto">

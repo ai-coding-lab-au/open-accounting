@@ -22,6 +22,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 
+from .doc_labels import label as doc_label
 from .pdf_fonts import font_for
 
 
@@ -82,7 +83,7 @@ def _draw_box_with_header(c, x, y, w, header_h, label: str, body_h: float):
     """Header bar + bordered body box. Returns the inner top y for the body."""
     _draw_bar(c, x, y - header_h, w, header_h, HEADER_BG)
     c.setFillColor(white)
-    c.setFont(FONT_BOLD, 10)
+    c.setFont(font_for(label, FONT_BOLD), 10)
     c.drawString(x + 6, y - header_h + 4, label.upper())
     c.setStrokeColor(ROW_DIVIDER)
     c.setFillColor(white)
@@ -120,6 +121,13 @@ def render_document_pdf(
     c = canvas.Canvas(buf, pagesize=A4)
     page_w, page_h = A4
 
+    # Company-level opt-in: fixed labels become "ENGLISH 中文". Off by default,
+    # in which case _L is the identity and output matches the original template.
+    bilingual = bool(company.get("bilingual_labels"))
+
+    def _L(text: str) -> str:
+        return doc_label(text, bilingual)
+
     margin = 18 * mm
     content_w = page_w - 2 * margin
 
@@ -141,10 +149,10 @@ def render_document_pdf(
     # ----- Top-right: document title wordmark -----
     # Size down for longer titles so a wide one (e.g. "PAYMENT REQUEST") doesn't
     # overrun toward the left column / company name.
-    title_text = DOC_TITLE.get(doc_type, doc_type.upper())
+    title_text = _L(DOC_TITLE.get(doc_type, doc_type.upper()))
     title_size = 28 if len(title_text) <= 8 else 18
     c.setFillColor(BRAND_BLUE)
-    c.setFont(FONT_BOLD, title_size)
+    c.setFont(font_for(title_text, FONT_BOLD), title_size)
     c.drawRightString(page_w - margin, y - 16, title_text)
 
     # ----- BILL TO / document-info bands -----
@@ -170,7 +178,7 @@ def render_document_pdf(
     # Grow the box to fit the wrapped content (min 70 keeps the original look).
     body_h_left = max(70, 10 + 12 * len(wrapped_bill))
     body_top_left = _draw_box_with_header(
-        c, margin, band_top_y, left_w, header_h, "BILL TO", body_h_left
+        c, margin, band_top_y, left_w, header_h, _L("BILL TO"), body_h_left
     )
     ly = body_top_left - 6
     c.setFillColor(black)
@@ -182,6 +190,7 @@ def render_document_pdf(
     # Right: document info (number/date/expiration). Build dynamically.
     right_x = margin + left_w + half_gap
     info_rows = _doc_info_rows(doc_type, doc_number, issue_date, expiration_date, paid_date)
+    info_rows = [(_L(lbl), val) for lbl, val in info_rows]
     body_h_right = max(70, 4 + 14 * len(info_rows))
     _draw_bar(c, right_x, band_top_y - header_h, right_w, header_h, HEADER_BG)
     # Header row is a 2-col band where each label sits above its value (label in white).
@@ -197,17 +206,18 @@ def render_document_pdf(
     if info_rows:
         first_label, first_value = info_rows[0]
         c.setFillColor(white)
-        c.setFont(FONT_BOLD, 10)
+        c.setFont(font_for(first_label, FONT_BOLD), 10)
         c.drawString(label_x, band_top_y - header_h + 4, first_label.upper())
+        c.setFont(FONT_BOLD, 10)
         c.drawRightString(value_x, band_top_y - header_h + 4, first_value)
         rest = info_rows[1:]
     else:
         rest = []
     ry = band_top_y - header_h - 14
     c.setFillColor(black)
-    for label, value in rest:
-        c.setFont(FONT_BOLD, 9.5)
-        c.drawString(label_x, ry, label.upper())
+    for row_label, value in rest:
+        c.setFont(font_for(row_label, FONT_BOLD), 9.5)
+        c.drawString(label_x, ry, row_label.upper())
         c.setFont(FONT_BASE, 9.5)
         c.drawRightString(value_x, ry, value)
         ry -= 14
@@ -232,11 +242,17 @@ def render_document_pdf(
     row_h = 18
     _draw_bar(c, table_x, table_top - row_h, table_w, row_h, HEADER_BG)
     c.setFillColor(white)
-    c.setFont(FONT_BOLD, 10)
-    c.drawString(col_x[0] + 6, table_top - row_h + 5, "DESCRIPTION")
-    c.drawCentredString((col_x[1] + col_right[1]) / 2, table_top - row_h + 5, "QTY")
-    c.drawRightString(col_right[2] - 6, table_top - row_h + 5, "UNIT PRICE")
-    c.drawRightString(col_right[3] - 6, table_top - row_h + 5, "AMOUNT")
+    # Bilingual headers are wider ("UNIT PRICE 单价") — drop a size so they
+    # stay inside their columns.
+    hdr_size = 8.5 if bilingual else 10
+    for hdr, draw in (
+        (_L("DESCRIPTION"), lambda t: c.drawString(col_x[0] + 6, table_top - row_h + 5, t)),
+        (_L("QTY"), lambda t: c.drawCentredString((col_x[1] + col_right[1]) / 2, table_top - row_h + 5, t)),
+        (_L("UNIT PRICE"), lambda t: c.drawRightString(col_right[2] - 6, table_top - row_h + 5, t)),
+        (_L("AMOUNT"), lambda t: c.drawRightString(col_right[3] - 6, table_top - row_h + 5, t)),
+    ):
+        c.setFont(font_for(hdr, FONT_BOLD), hdr_size)
+        draw(hdr)
 
     # Rows — pad to at least 4 rows so the table doesn't look empty for single-line invoices
     body_lines = list(lines) + [None] * max(0, 4 - len(lines))
@@ -285,9 +301,10 @@ def render_document_pdf(
     # can distinguish it from the GST-inclusive total below.
     sub_y = row_y - row_h
     c.setFillColor(black)
-    c.setFont(FONT_BASE, 10)
-    subtotal_label = "TOTAL (EXCL. GST)" if is_gst_registered else "SUBTOTAL"
+    subtotal_label = _L("TOTAL (EXCL. GST)") if is_gst_registered else _L("SUBTOTAL")
+    c.setFont(font_for(subtotal_label, FONT_BASE), 10)
     c.drawRightString(col_right[2] - 6, sub_y + 5, subtotal_label)
+    c.setFont(FONT_BASE, 10)
     c.drawRightString(col_right[3] - 6, sub_y + 5, _fmt_money(subtotal_d, currency))
 
     next_y = sub_y - 4
@@ -295,14 +312,22 @@ def render_document_pdf(
     # GST row only if GST-registered (per user: not registered → suppress)
     if is_gst_registered:
         next_y -= row_h
-        c.drawRightString(col_right[2] - 6, next_y + 5, "GST (10%)")
+        gst_label = _L("GST (10%)")
+        c.setFont(font_for(gst_label, FONT_BASE), 10)
+        c.drawRightString(col_right[2] - 6, next_y + 5, gst_label)
+        c.setFont(FONT_BASE, 10)
         c.drawRightString(col_right[3] - 6, next_y + 5, _fmt_money(gst_display, currency))
 
     # TOTAL big blue band — labelled "TOTAL (INCL. GST)" when GST-registered.
     # The band spans more of the table width when the label is longer so
     # the text and the amount don't collide.
     total_band_h = 24
-    if is_gst_registered:
+    if bilingual and is_gst_registered:
+        # "TOTAL (INCL. GST) 总计（含GST）" needs the full table width or the
+        # label collides with the right-aligned amount.
+        total_band_w = table_w
+        total_band_x = col_x[0]
+    elif is_gst_registered:
         # Stretch the band left by one extra column-width so "TOTAL (INCL. GST)"
         # has breathing room before the right-aligned amount.
         total_band_w = col_widths[1] + col_widths[2] + col_widths[3]
@@ -313,14 +338,17 @@ def render_document_pdf(
     next_y -= total_band_h + 6
     _draw_bar(c, total_band_x, next_y, total_band_w, total_band_h, HEADER_BG)
     c.setFillColor(white)
-    c.setFont(FONT_BOLD, 14 if is_gst_registered else 16)
-    total_label = "TOTAL (INCL. GST)" if is_gst_registered else "TOTAL"
+    total_label = _L("TOTAL (INCL. GST)") if is_gst_registered else _L("TOTAL")
+    total_size = (12 if bilingual else 14) if is_gst_registered else 16
+    c.setFont(font_for(total_label, FONT_BOLD), total_size)
     c.drawString(total_band_x + 8, next_y + 6, total_label)
+    c.setFont(FONT_BOLD, total_size)
     c.drawRightString(total_band_x + total_band_w - 8, next_y + 6, _fmt_money(total_display, currency))
 
     # ----- Payment method table (bank details) -----
     pm_top = next_y - 30
     pm_rows = _payment_method_rows(doc_type, company, payment_method, paid_date)
+    pm_rows = [(_L(lbl), val) for lbl, val in pm_rows]
     if pm_rows:
         pm_label_w = table_w * 0.35
         pm_value_w = table_w * 0.65
@@ -328,8 +356,9 @@ def render_document_pdf(
         # Header
         _draw_bar(c, table_x, pm_top - pm_row_h, table_w, pm_row_h, HEADER_BG)
         c.setFillColor(white)
-        c.setFont(FONT_BOLD, 10)
-        c.drawString(table_x + 6, pm_top - pm_row_h + 4, "PAYMENT METHOD")
+        pm_header = _L("PAYMENT METHOD")
+        c.setFont(font_for(pm_header, FONT_BOLD), 10)
+        c.drawString(table_x + 6, pm_top - pm_row_h + 4, pm_header)
         # Rows
         rr_y = pm_top - pm_row_h
         c.setStrokeColor(ROW_DIVIDER)
@@ -338,7 +367,7 @@ def render_document_pdf(
             c.setStrokeColor(ROW_DIVIDER)
             c.line(table_x, rr_y, table_x + table_w, rr_y)
             c.setFillColor(black)
-            c.setFont(FONT_BASE, 9.5)
+            c.setFont(font_for(label, FONT_BASE), 9.5)
             c.drawString(table_x + 6, rr_y + 4, label)
             c.setFont(font_for(value, FONT_BASE), 9.5)
             c.drawString(table_x + pm_label_w + 6, rr_y + 4, value or "")
@@ -354,8 +383,9 @@ def render_document_pdf(
     if notes:
         ny = pm_bottom - 24
         c.setFillColor(BRAND_BLUE)
-        c.setFont(FONT_BOLD, 9.5)
-        c.drawString(margin, ny, "NOTES")
+        notes_header = _L("NOTES")
+        c.setFont(font_for(notes_header, FONT_BOLD), 9.5)
+        c.drawString(margin, ny, notes_header)
         ny -= 12
         c.setFillColor(black)
         for line in notes.splitlines():
@@ -366,8 +396,9 @@ def render_document_pdf(
     # ----- GST disclosure footer (for not-registered businesses, ATO best practice) -----
     if not is_gst_registered:
         c.setFillColor(HexColor("#808080"))
-        c.setFont(FONT_OBLIQUE, 8)
-        c.drawString(margin, margin - 2, "No GST has been charged. This is not a tax invoice.")
+        disclaimer = _L("No GST has been charged. This is not a tax invoice.")
+        c.setFont(font_for(disclaimer, FONT_OBLIQUE), 8)
+        c.drawString(margin, margin - 2, disclaimer)
 
     c.showPage()
     c.save()

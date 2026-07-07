@@ -25,6 +25,12 @@ class Company(MasterBase):
     base_currency: Mapped[str] = mapped_column(String(3), default="AUD", nullable=False)
     fy_start_month: Mapped[int] = mapped_column(default=7, nullable=False)  # AU FY = Jul-Jun
     gst_registered: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # Show Chinese label translations alongside English on outgoing-document
+    # PDFs (services/doc_labels.py). server_default so the additive schema
+    # sync can ALTER existing master DBs with a NOT NULL column.
+    bilingual_labels: Mapped[bool] = mapped_column(
+        default=False, nullable=False, server_default="0"
+    )
 
     # Contact/address block — printed on outgoing documents (Invoice / Payment Request / Receipt).
     address_line1: Mapped[str | None] = mapped_column(String(200))

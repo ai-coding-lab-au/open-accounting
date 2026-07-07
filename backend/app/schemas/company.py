@@ -35,6 +35,7 @@ class CompanyUpdate(BaseModel):
     abn: str | None = Field(default=None, max_length=20)
     fy_start_month: int | None = Field(default=None, ge=1, le=12)
     gst_registered: bool | None = None
+    bilingual_labels: bool | None = None
 
     address_line1: str | None = Field(default=None, max_length=200)
     address_line2: str | None = Field(default=None, max_length=200)
@@ -76,6 +77,7 @@ class CompanyOut(BaseModel):
     base_currency: str
     fy_start_month: int
     gst_registered: bool
+    bilingual_labels: bool = False
 
     address_line1: str | None = None
     address_line2: str | None = None

@@ -17,6 +17,8 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+from .doc_labels import label as doc_label
+
 NAVY = "#1f3a5f"
 
 DOC_TITLES = {
@@ -103,13 +105,13 @@ def _fmt_qty(q) -> str:
     return s or "0"
 
 
-def _bank_rows(company: dict) -> str:
+def _bank_rows(company: dict, L) -> str:
     pairs = [
-        ("Account Name", company.get("bank_account_name")),
-        ("Bank", company.get("bank_name")),
-        ("BSB", company.get("bank_bsb")),
-        ("Account Number", company.get("bank_account_number")),
-        ("SWIFT Code", company.get("bank_swift")),
+        (L("Account Name"), company.get("bank_account_name")),
+        (L("Bank"), company.get("bank_name")),
+        (L("BSB"), company.get("bank_bsb")),
+        (L("Account Number"), company.get("bank_account_number")),
+        (L("SWIFT Code"), company.get("bank_swift")),
     ]
     rows = [
         f"<tr><td class='k'>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
@@ -119,12 +121,12 @@ def _bank_rows(company: dict) -> str:
     return "".join(rows)
 
 
-def _receipt_rows(payment_method: str | None, paid_date: date | None) -> str:
-    rows = ["<tr><td class='k'>Payment received</td><td>Yes</td></tr>"]
+def _receipt_rows(payment_method: str | None, paid_date: date | None, L) -> str:
+    rows = [f"<tr><td class='k'>{_esc(L('Payment received'))}</td><td>Yes</td></tr>"]
     if paid_date:
-        rows.append(f"<tr><td class='k'>Paid on</td><td>{_esc(_fmt_date(paid_date))}</td></tr>")
+        rows.append(f"<tr><td class='k'>{_esc(L('Paid on'))}</td><td>{_esc(_fmt_date(paid_date))}</td></tr>")
     if payment_method:
-        rows.append(f"<tr><td class='k'>Method</td><td>{_esc(payment_method)}</td></tr>")
+        rows.append(f"<tr><td class='k'>{_esc(L('Method'))}</td><td>{_esc(payment_method)}</td></tr>")
     return "".join(rows)
 
 
@@ -146,41 +148,48 @@ def build_html(
     notes: str | None = None,
     is_gst_registered: bool = True,
 ) -> str:
-    title = DOC_TITLES.get(doc_type, doc_type.replace("_", " ").upper())
+    # Company-level opt-in: fixed labels become "ENGLISH 中文" (doc_labels.py);
+    # off by default so the template output is unchanged.
+    bilingual = bool(company.get("bilingual_labels"))
+
+    def _L(text: str) -> str:
+        return doc_label(text, bilingual)
+
+    title = _L(DOC_TITLES.get(doc_type, doc_type.replace("_", " ").upper()))
 
     # Document-info rows differ a little per type.
-    meta_rows = [f"{_esc(doc_number)}", f"Issue {_esc(_fmt_date(issue_date))}"]
+    meta_rows = [f"{_esc(doc_number)}", f"{_esc(_L('Issue'))} {_esc(_fmt_date(issue_date))}"]
     if doc_type == "receipt" and paid_date:
-        meta_rows.append(f"Paid {_esc(_fmt_date(paid_date))}")
+        meta_rows.append(f"{_esc(_L('Paid'))} {_esc(_fmt_date(paid_date))}")
     elif expiration_date:
-        meta_rows.append(f"Due {_esc(_fmt_date(expiration_date))}")
+        meta_rows.append(f"{_esc(_L('Due'))} {_esc(_fmt_date(expiration_date))}")
     meta_html = "<br>".join(meta_rows)
 
     # Payment block: receipts summarise what was paid + the account; invoices /
     # PRs show where to send money.
     if doc_type == "receipt":
-        pay_rows = _receipt_rows(payment_method, paid_date) + _bank_rows(company)
+        pay_rows = _receipt_rows(payment_method, paid_date, _L) + _bank_rows(company, _L)
     else:
-        pay_rows = _bank_rows(company)
+        pay_rows = _bank_rows(company, _L)
     pay_block = (
-        f'<div class="pay"><div class="h">PAYMENT METHOD</div>'
+        f'<div class="pay"><div class="h">{_esc(_L("PAYMENT METHOD"))}</div>'
         f"<table>{pay_rows}</table></div>"
         if pay_rows
         else ""
     )
 
     gst_row = (
-        f'<tr><td>GST (10%)</td><td class="num">{_fmt_money(gst_amount, currency)}</td></tr>'
+        f'<tr><td>{_esc(_L("GST (10%)"))}</td><td class="num">{_fmt_money(gst_amount, currency)}</td></tr>'
         if is_gst_registered
         else ""
     )
     notes_block = (
-        f'<div class="notes"><div class="h2">NOTES</div><div>{_esc(notes).replace(chr(10), "<br>")}</div></div>'
+        f'<div class="notes"><div class="h2">{_esc(_L("NOTES"))}</div><div>{_esc(notes).replace(chr(10), "<br>")}</div></div>'
         if notes
         else ""
     )
     gst_disclaimer = (
-        '<div class="disclaimer">No GST has been charged. This is not a tax invoice.</div>'
+        f'<div class="disclaimer">{_esc(_L("No GST has been charged. This is not a tax invoice."))}</div>'
         if not is_gst_registered
         else ""
     )
@@ -221,10 +230,10 @@ table.items tbody tr:nth-child(even) {{ background:#f7f9fc; }}
     <div class="ti"><h1>{_esc(title)}</h1><div class="meta">{meta_html}</div></div>
   </div>
   <div class="parties">
-    <div class="box"><div class="h">BILL TO</div><div class="b">{_bill_to(customer)}</div></div>
+    <div class="box"><div class="h">{_esc(_L("BILL TO"))}</div><div class="b">{_bill_to(customer)}</div></div>
   </div>
-  <table class="items"><thead><tr><th>DESCRIPTION</th><th class="num">QTY</th><th class="num">UNIT PRICE</th><th class="num">AMOUNT</th></tr></thead><tbody>{_line_rows(lines, currency)}</tbody></table>
-  <table class="tot"><tr><td>Subtotal</td><td class="num">{_fmt_money(subtotal, currency)}</td></tr>{gst_row}<tr class="grand"><td>TOTAL ({_esc(currency)})</td><td class="num">{_fmt_money(total, currency)}</td></tr></table>
+  <table class="items"><thead><tr><th>{_esc(_L("DESCRIPTION"))}</th><th class="num">{_esc(_L("QTY"))}</th><th class="num">{_esc(_L("UNIT PRICE"))}</th><th class="num">{_esc(_L("AMOUNT"))}</th></tr></thead><tbody>{_line_rows(lines, currency)}</tbody></table>
+  <table class="tot"><tr><td>{_esc(_L("Subtotal"))}</td><td class="num">{_fmt_money(subtotal, currency)}</td></tr>{gst_row}<tr class="grand"><td>{_esc(_L("TOTAL"))} ({_esc(currency)})</td><td class="num">{_fmt_money(total, currency)}</td></tr></table>
   {pay_block}
   {notes_block}
   {gst_disclaimer}
