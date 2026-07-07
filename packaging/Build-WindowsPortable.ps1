@@ -59,8 +59,11 @@ Copy-Item (Join-Path $root "packaging\README_PORTABLE_USER.txt") (Join-Path $sta
 python "$root\packaging\generate_third_party_notices.py" --output (Join-Path $stage "THIRD-PARTY-NOTICES.txt")
 if ($LASTEXITCODE -ne 0) { throw "Third-party notices generation failed" }
 
+# Python zipfile, not Compress-Archive: PS 5.1's archiver intermittently
+# fails mid-stream on large trees (BinaryReader exception), leaving no zip.
 $zip = "$stage.zip"
-Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+python -c "import shutil, sys; shutil.make_archive(sys.argv[1], 'zip', sys.argv[2])" ($zip -replace '\.zip$', '') $stage
+if ($LASTEXITCODE -ne 0) { throw "Zip creation failed" }
 
 Write-Host ""
 Write-Host "Portable build staged at: $stage"
