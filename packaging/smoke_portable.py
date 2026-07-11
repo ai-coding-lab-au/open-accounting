@@ -6,13 +6,14 @@ runtime (ReportLab lives in the PyInstaller archive, so a build that silently
 dropped it would pass every static check and fail only here).
 
     python packaging/smoke_portable.py dist\\OpenAccounting\\OpenAccounting.exe
+    python packaging/smoke_portable.py dist\\OpenAccounting\\OpenAccounting.exe --expected-version 0.2.0
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -21,6 +22,22 @@ import urllib.request
 PORT = 18123
 BASE = f"http://127.0.0.1:{PORT}"
 COMPANY = "smoketest"
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Smoke-test a built Open Accounting portable executable."
+    )
+    parser.add_argument("exe", help="Path to OpenAccounting.exe")
+    parser.add_argument(
+        "--expected-version",
+        metavar="SEMVER",
+        help=(
+            "Require /openapi.json info.version to match this release version. "
+            "Optional so the historical one-argument invocation remains valid."
+        ),
+    )
+    return parser.parse_args()
 
 
 def _request(method: str, path: str, body: dict | None = None,
@@ -49,7 +66,8 @@ def _check(label: str, ok: bool, detail: str = "") -> None:
 
 
 def main() -> None:
-    exe = sys.argv[1]
+    args = _parse_args()
+    exe = args.exe
     data_dir = tempfile.mkdtemp(prefix="oa-portable-smoke-")
     proc = subprocess.Popen(
         [exe, "--no-browser", "--port", str(PORT), "--data-dir", data_dir],
@@ -66,6 +84,24 @@ def main() -> None:
             except OSError:
                 time.sleep(0.5)
         _check("backend healthy", status == 200, f"last status={status}")
+
+        status, body = _request("GET", "/openapi.json")
+        try:
+            actual_version = json.loads(body).get("info", {}).get("version")
+        except (json.JSONDecodeError, AttributeError):
+            actual_version = None
+        version_matches = isinstance(actual_version, str) and bool(actual_version) and (
+            args.expected_version is None
+            or actual_version == args.expected_version
+        )
+        _check(
+            "OpenAPI release version",
+            status == 200 and version_matches,
+            (
+                f"status={status} expected={args.expected_version!r} "
+                f"actual={actual_version!r}"
+            ),
+        )
 
         status, body = _request("GET", "/")
         _check("frontend index served", status == 200 and b"<title>" in body)

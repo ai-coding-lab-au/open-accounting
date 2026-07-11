@@ -64,6 +64,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=str(ROOT / "packaging" / "windows_version_info.txt"),
 )
 
 coll = COLLECT(

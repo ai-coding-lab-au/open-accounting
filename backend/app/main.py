@@ -79,7 +79,7 @@ async def _lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Accounting (Local)",
-        version="0.1.0",
+        version="0.2.0",
         description=(
             "Local-first accounting backend for AU SMEs (AUD / GST): "
             "ledger, bank import, reports, and client-facing documents "

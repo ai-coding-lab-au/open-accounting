@@ -19,23 +19,46 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\packaging\Build-Window
 
 The script:
 
-1. Installs the backend package and PyInstaller into the active Python environment.
-2. Runs `npm ci` and `npm run build` in `frontend/`.
-3. Builds a PyInstaller onedir bundle (`dist\OpenAccounting\`).
-4. Runs `packaging\smoke_portable.py` against the built exe (health, frontend,
-   API 404, receipt + report PDF rendering) — a build that lost reportlab or
-   frontend-dist fails here.
-5. Stages the release zip under `release\OpenAccounting-portable-<stamp>\`:
-   the exe folder plus `LICENSE.txt`, `README_FIRST.txt` (from
-   `README_PORTABLE_USER.txt`) and a freshly generated
-   `THIRD-PARTY-NOTICES.txt`, then compresses it to
-   `release\OpenAccounting-portable-<stamp>.zip`.
+1. Before installing or building anything, validates one release identity
+   across the portable README, backend, FastAPI OpenAPI, frontend lockfile, and
+   Windows version resource. Official builds require a clean worktree and an
+   annotated `vMAJOR.MINOR.PATCH` tag pointing exactly at `HEAD`.
+2. Installs the backend package and PyInstaller into the active Python environment.
+3. Runs `npm ci` and `npm run build` in `frontend/`.
+4. Builds a versioned PyInstaller onedir bundle (`dist\OpenAccounting\`).
+5. Runs `packaging\smoke_portable.py` against the built exe (health, version,
+   frontend, API 404, receipt + report PDF rendering) — a build that lost
+   reportlab or frontend-dist fails here.
+6. Stages `release\OpenAccounting-portable-vX.Y.Z-windows-x64.zip`: the exe
+   folder plus `LICENSE.txt`, `README_FIRST.txt` (from
+   `README_PORTABLE_USER.txt`), `BUILD_INFO.txt`, and a freshly generated
+   `THIRD-PARTY-NOTICES.txt`, then generates a sibling `.sha256` file.
 
 Distribute the **zip**, never the bare exe (`_internal\` must stay next to it).
 
-Before building a release: tag the commit and update the `Version:` /
-`Built from:` lines at the top of `README_PORTABLE_USER.txt` to match — the
-AGPL §6 source offer in the zip must identify the exact source version.
+Before building a release, update every product version plus the `Version:` /
+`Built from:` lines at the top of `README_PORTABLE_USER.txt`, commit them, and
+create an annotated tag. The build refuses a dirty tree, a split version, a
+lightweight/missing tag, or a tag that does not point at `HEAD`; the AGPL §6
+source offer in the zip therefore identifies the exact source version.
+Official mode also rejects every `-Skip*` switch, checks each native command's
+exit code, and revalidates the clean HEAD/tag after the runtime gate and again
+after archiving.
+
+For local smoke work only, an uncommitted build can be requested explicitly:
+
+```powershell
+.\packaging\Build-WindowsPortable.ps1 -AllowUncommittedBuild
+```
+
+Its folder and ZIP contain `candidate` plus the current commit in the name and
+must not be distributed.
+
+To validate release identity without installing or building anything:
+
+```powershell
+.\packaging\Build-WindowsPortable.ps1 -PreflightOnly
+```
 
 ## PDF rendering in the portable build
 
@@ -84,9 +107,11 @@ OpenAccounting.exe --data-dir D:\OpenAccountingData
 
 AGPL-3.0-or-later obligations for distributing the binary zip:
 
-- The zip must carry `LICENSE.txt`, `THIRD-PARTY-NOTICES.txt`, and a
+- The zip must carry `LICENSE.txt`, `THIRD-PARTY-NOTICES.txt`, `BUILD_INFO.txt`, and a
   `README_FIRST.txt` that names the exact source version (tag/commit) and a
   working public link to it (AGPL §6 Corresponding Source).
+- Publish the generated `.sha256` file alongside the zip and verify it again
+  after upload.
 - The tagged source must be public **no later than** the binary, and must
   actually contain everything the binary was built from — never build a
   release zip from uncommitted changes.

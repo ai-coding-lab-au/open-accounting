@@ -1,8 +1,8 @@
 Open Accounting for Windows
 ===========================
 
-Version: v0.1.1
-Built from: https://github.com/ai-coding-lab-au/open-accounting/tree/v0.1.1
+Version: v0.2.0
+Built from: https://github.com/ai-coding-lab-au/open-accounting/tree/v0.2.0
 
 How to start
 ------------
