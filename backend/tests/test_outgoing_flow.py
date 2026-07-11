@@ -40,7 +40,9 @@ def _make_company(client) -> dict:
         json={"id": "acme", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Example Migration Services", "gst_registered": False},
     )
     assert r.status_code == 201, r.text
-    return r.json()
+    company = r.json()
+    HDR["X-Company-Generation"] = company["generation_id"]
+    return company
 
 
 HDR = {"X-Company-Id": "acme"}
@@ -152,13 +154,140 @@ def test_direct_receipt_creation(client):
     assert body["customer_name"] == "Direct Receipt Co"
 
 
+def test_receipt_create_idempotency_replays_and_rejects_key_reuse(client):
+    _make_company(client)
+    client_row = _create_client(client, "Retry Safe Co")
+    payload = {
+        "doc_type": "receipt",
+        "issue_date": "2026-05-18",
+        "client_ref_id": client_row["id"],
+        "lines": [
+            {"description": "Service", "quantity": "1", "unit_price": "100"}
+        ],
+    }
+    headers = {**HDR, "Idempotency-Key": "receipt-timeout-retry-1"}
+
+    first = client.post("/api/v1/outgoing", headers=headers, json=payload)
+    retry = client.post("/api/v1/outgoing", headers=headers, json=payload)
+    assert first.status_code == retry.status_code == 201
+    assert retry.json()["id"] == first.json()["id"]
+    assert retry.json()["doc_number"] == first.json()["doc_number"]
+    assert len(client.get("/api/v1/outgoing", headers=HDR).json()) == 1
+
+    changed = {
+        **payload,
+        "lines": [
+            {"description": "Service", "quantity": "1", "unit_price": "101"}
+        ],
+    }
+    conflict = client.post("/api/v1/outgoing", headers=headers, json=changed)
+    assert conflict.status_code == 409, conflict.text
+    assert "different receipt payload" in conflict.json()["detail"]
+    assert len(client.get("/api/v1/outgoing", headers=HDR).json()) == 1
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        [],
+        [{"description": "Zero receipt", "quantity": "1", "unit_price": "0"}],
+        [
+            {
+                "description": "Contradictory line",
+                "quantity": "2",
+                "unit_price": "10",
+                "amount": "10",
+            }
+        ],
+        [
+            {
+                "description": "Overflow",
+                "quantity": "2",
+                "unit_price": "99999999999999.99",
+            }
+        ],
+    ],
+)
+def test_receipt_rejects_empty_zero_contradictory_and_overflow_totals(client, lines):
+    _make_company(client)
+    client_row = _create_client(client, "Bounded Receipt Co")
+    response = client.post(
+        "/api/v1/outgoing",
+        headers={**HDR, "Idempotency-Key": "invalid-receipt"},
+        json={
+            "doc_type": "receipt",
+            "issue_date": "2026-05-18",
+            "client_ref_id": client_row["id"],
+            "lines": lines,
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert client.get("/api/v1/outgoing", headers=HDR).json() == []
+
+
+def test_issued_receipt_keeps_issuer_snapshot_after_company_profile_changes(
+    client, monkeypatch
+):
+    _make_company(client)
+    r = client.patch(
+        "/api/v1/companies/acme",
+        headers=HDR,
+        json={
+            "name": "Original Issuer Pty Ltd",
+            "abn": "11 222 333 444",
+            "address_line1": "1 Original Street",
+            "bank_name": "Original Bank",
+            "bank_account_number": "12345678",
+        },
+    )
+    assert r.status_code == 200, r.text
+    receipt = _create_receipt(client, "Snapshot Customer", amount="100")
+
+    # Later company settings must affect future receipts, not rewrite the legal
+    # identity, payment details, or GST status of an already-issued receipt.
+    r = client.patch(
+        "/api/v1/companies/acme",
+        headers=HDR,
+        json={
+            "name": "Replacement Issuer Pty Ltd",
+            "abn": "99 888 777 666",
+            "address_line1": "9 Replacement Avenue",
+            "bank_name": "Replacement Bank",
+            "bank_account_number": "99999999",
+            "gst_registered": True,
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    import app.api.v1.outgoing as outgoing_mod
+
+    captured = {}
+
+    def capture_render(**kwargs):
+        captured.update(kwargs)
+        return b"%PDF-1.4\nissuer snapshot\n%%EOF"
+
+    monkeypatch.setattr(outgoing_mod.html_render, "render_document_pdf", capture_render)
+    r = client.post(f"/api/v1/outgoing/{receipt['id']}/pdf", headers=HDR)
+    assert r.status_code == 200, r.text
+    assert captured["company"]["name"] == "Original Issuer Pty Ltd"
+    assert captured["company"]["abn"] == "11 222 333 444"
+    assert captured["company"]["address_line1"] == "1 Original Street"
+    assert captured["company"]["bank_name"] == "Original Bank"
+    assert captured["company"]["bank_account_number"] == "12345678"
+    assert captured["is_gst_registered"] is False
+
+
 def test_gst_registered_adds_gst_on_top(client):
     r = client.post(
         "/api/v1/companies",
         json={"id": "gstco", "marn": "1234567", "registered_agent_name": "A", "name": "GST Co", "gst_registered": True},
     )
     assert r.status_code == 201, r.text
-    hdr = {"X-Company-Id": "gstco"}
+    hdr = {
+        "X-Company-Id": "gstco",
+        "X-Company-Generation": r.json()["generation_id"],
+    }
     cl = client.post("/api/v1/clients", headers=hdr, json={"display_name": "Client A"}).json()
     r = client.post(
         "/api/v1/outgoing",
@@ -243,11 +372,14 @@ def test_issued_receipt_payee_and_currency_are_locked(client):
     r = client.patch(
         f"/api/v1/outgoing/{receipt['id']}", headers=HDR, json={"currency": "USD"},
     )
-    assert r.status_code == 409, r.text
+    # AUD-only validation now rejects this before the issued-document lock is
+    # evaluated.  Either way the persisted receipt must remain unchanged.
+    assert r.status_code == 422, r.text
 
     # The stored payee is unchanged.
     r = client.get(f"/api/v1/outgoing/{receipt['id']}", headers=HDR)
     assert r.json()["customer_name"] == "Payee Lock Co"
+    assert r.json()["currency"] == "AUD"
 
 
 def test_void_receipt_pdf_render_does_not_repersist(client):
@@ -397,6 +529,7 @@ def test_company_patch_persists_bank_details(client):
     _make_company(client)
     r = client.patch(
         "/api/v1/companies/acme",
+        headers=HDR,
         json={
             "address_line1": "Suite 1, 100 George St",
             "suburb": "Sydney",
@@ -437,7 +570,11 @@ def test_bilingual_labels_toggle_flows_through_to_rendered_pdf(client):
         text = doc.pages[0].extract_text() or ""
     assert "收据" not in text  # default: English-only labels
 
-    r = client.patch("/api/v1/companies/acme", json={"bilingual_labels": True})
+    r = client.patch(
+        "/api/v1/companies/acme",
+        headers=HDR,
+        json={"bilingual_labels": True},
+    )
     assert r.status_code == 200, r.text
     assert r.json()["bilingual_labels"] is True
 

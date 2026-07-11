@@ -23,6 +23,9 @@ class BankStatementRow(BaseModel):
     counter_party_name: str | None
     account_code: str | None
     account_name: str | None
+    unapplied_account_code: str | None = None
+    unapplied_account_name: str | None = None
+    unapplied_amount: Money = 0
     running_balance: Money
 
 
@@ -161,6 +164,7 @@ class GSTExposureOut(BaseModel):
     period_end: date
     fy_year: int | None = None
     quarter: int | None = None
+    gst_registered: bool
 
     g1_total_sales: Money
     g3_gst_free_sales: Money

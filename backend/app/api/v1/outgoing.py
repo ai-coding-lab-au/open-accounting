@@ -7,15 +7,18 @@ Request / outgoing-Invoice / Partner-document workflows were removed.
 
 from __future__ import annotations
 
+import json
+import hashlib
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import settings
+from ...db.company import begin_sqlite_immediate
 from ...deps import PathId, get_company_db, get_current_company
 from ...models.company import Client
 from ...models.outgoing import (
@@ -23,6 +26,8 @@ from ...models.outgoing import (
     DocumentStatus,
     DocumentType,
     OutgoingDocument,
+    OutgoingCreateIdempotencyKey,
+    OutgoingIssuerSnapshot,
     OutgoingDocumentLine,
 )
 from ...models.master import Company
@@ -34,6 +39,7 @@ from ...schemas.outgoing import (
     OutgoingOut,
     OutgoingUpdate,
 )
+from ...schemas._limits import SQLITE_EXACT_MONEY_MAX
 from ...services import doc_numbering, html_render, pdf_render
 from ...services.attachments import AttachmentError, _resolve_inside
 from ...hooks import register_contact_reference_check
@@ -72,6 +78,78 @@ def _discard_doc_pdf(doc: OutgoingDocument, company_id: str) -> None:
 
 
 router = APIRouter(prefix="/outgoing", tags=["outgoing"])
+
+_MONEY_MAX = SQLITE_EXACT_MONEY_MAX
+
+
+class IssuerSnapshotError(RuntimeError):
+    pass
+
+
+_ISSUER_FIELDS = (
+    "name",
+    "address_line1",
+    "address_line2",
+    "suburb",
+    "state",
+    "postcode",
+    "phone",
+    "email",
+    "abn",
+    "bank_account_name",
+    "bank_name",
+    "bank_bsb",
+    "bank_account_number",
+    "bank_swift",
+    "gst_registered",
+)
+
+
+def _current_issuer_values(company: Company) -> dict[str, object]:
+    return {field: getattr(company, field) for field in _ISSUER_FIELDS}
+
+
+def _capture_issuer_snapshot(company: Company) -> OutgoingIssuerSnapshot:
+    return OutgoingIssuerSnapshot(
+        payload_json=json.dumps(
+            _current_issuer_values(company),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def _create_payload_hash(payload: OutgoingCreate) -> str:
+    canonical = json.dumps(
+        payload.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _issuer_values_for_render(
+    doc: OutgoingDocument, company: Company
+) -> dict[str, object]:
+    snapshot = doc.issuer_snapshot
+    if snapshot is None:
+        # Backward compatibility for documents issued before snapshots existed.
+        return _current_issuer_values(company)
+    try:
+        values = json.loads(snapshot.payload_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise IssuerSnapshotError(
+            "This receipt's issuer snapshot is corrupt; restore the company "
+            "database from backup before rendering it."
+        ) from exc
+    if not isinstance(values, dict) or any(field not in values for field in _ISSUER_FIELDS):
+        raise IssuerSnapshotError(
+            "This receipt's issuer snapshot is incomplete; restore the company "
+            "database from backup before rendering it."
+        )
+    return values
 
 
 def _outgoing_documents_reference_contact(db: Session, contact_id: int) -> str | None:
@@ -160,17 +238,37 @@ def _compute_totals(lines: list[OutgoingLineIn]) -> tuple[Decimal, Decimal, list
     """
     cleaned: list[dict] = []
     subtotal = Decimal("0")
-    for li in lines:
+    for index, li in enumerate(lines, start=1):
         qty = Decimal(li.quantity)
         unit = Decimal(li.unit_price)
-        amt = li.amount if li.amount is not None else qty * unit
-        amt = Decimal(amt).quantize(Decimal("0.01"))
+        computed = _money(qty * unit)
+        if li.amount is not None and _money(li.amount) != computed:
+            raise HTTPException(
+                422,
+                f"Line {index}: amount must equal quantity × unit price "
+                f"({computed:.2f}).",
+            )
+        amt = computed
+        if amt > _MONEY_MAX:
+            raise HTTPException(
+                422,
+                f"Line {index}: computed amount exceeds the supported money limit.",
+            )
         cleaned.append(
             {"description": li.description, "quantity": qty, "unit_price": unit, "amount": amt}
         )
         subtotal += amt
-    subtotal = subtotal.quantize(Decimal("0.01"))
+        if subtotal > _MONEY_MAX:
+            raise HTTPException(422, "Receipt subtotal exceeds the supported money limit.")
+    subtotal = _money(subtotal)
+    if subtotal <= 0:
+        raise HTTPException(422, "A receipt total must be greater than zero.")
     return subtotal, subtotal, cleaned
+
+
+def _check_document_money(*values: Decimal) -> None:
+    if any(value < 0 or value > _MONEY_MAX for value in values):
+        raise HTTPException(422, "Receipt totals exceed the supported money limit.")
 
 
 def _serialize(doc: OutgoingDocument, db: Session | None = None) -> dict:
@@ -270,8 +368,35 @@ def create_document(
     payload: OutgoingCreate,
     company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=128,
+    ),
 ):
     dt = DocumentType.RECEIPT
+
+    payload_hash: str | None = None
+    if idempotency_key is not None:
+        begin_sqlite_immediate(db)
+        payload_hash = _create_payload_hash(payload)
+        receipt = db.get(OutgoingCreateIdempotencyKey, idempotency_key)
+        if receipt is not None:
+            if receipt.payload_hash != payload_hash:
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key has already been used with a different "
+                    "receipt payload.",
+                )
+            existing = db.get(OutgoingDocument, receipt.document_id)
+            if existing is None:
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key points to a receipt that no longer exists.",
+                )
+            db.commit()
+            return _serialize(existing, db)
 
     has_doc_number_override = bool(payload.doc_number_override)
     if has_doc_number_override:
@@ -309,6 +434,7 @@ def create_document(
         _money(subtotal * Decimal("0.10")) if company.gst_registered else Decimal("0.00")
     )
     total = _money(subtotal + gst_amount)
+    _check_document_money(subtotal, gst_amount, total)
     paid_date = payload.paid_date or payload.issue_date
     payment_method = payload.payment_method or "Bank transfer"
 
@@ -331,6 +457,7 @@ def create_document(
         payment_method=payment_method,
         notes=payload.notes,
     )
+    doc.issuer_snapshot = _capture_issuer_snapshot(company)
     for i, li in enumerate(line_dicts):
         doc.lines.append(OutgoingDocumentLine(order_no=i, **li))
     db.add(doc)
@@ -343,6 +470,15 @@ def create_document(
         # clean message — never leak the raw SQL / schema in the error detail.
         db.rollback()
         raise HTTPException(409, f"Document number {doc_number} already exists") from e
+
+    if idempotency_key is not None:
+        db.add(
+            OutgoingCreateIdempotencyKey(
+                key=idempotency_key,
+                payload_hash=payload_hash,
+                document_id=doc.id,
+            )
+        )
 
     db.commit()
     db.refresh(doc)
@@ -448,6 +584,7 @@ def update_document(
         doc.subtotal = subtotal
         doc.gst_amount = gst_amount
         doc.total = _money(subtotal + gst_amount)
+        _check_document_money(doc.subtotal, doc.gst_amount, doc.total)
         _discard_doc_pdf(doc, company.id)  # totals changed
 
     db.commit()
@@ -493,27 +630,28 @@ def restore_document(
 
 
 def _render_for(doc: OutgoingDocument, company: Company) -> bytes:
+    issuer = _issuer_values_for_render(doc, company)
     bank = {
-        "bank_account_name": company.bank_account_name,
-        "bank_name": company.bank_name,
-        "bank_bsb": company.bank_bsb,
-        "bank_account_number": company.bank_account_number,
-        "bank_swift": company.bank_swift,
+        "bank_account_name": issuer["bank_account_name"],
+        "bank_name": issuer["bank_name"],
+        "bank_bsb": issuer["bank_bsb"],
+        "bank_account_number": issuer["bank_account_number"],
+        "bank_swift": issuer["bank_swift"],
     }
     render_args = dict(
         doc_type=doc.doc_type.value if hasattr(doc.doc_type, "value") else doc.doc_type,
         doc_number=doc.doc_number,
         issue_date=doc.issue_date,
         company={
-            "name": company.name,
-            "address_line1": company.address_line1,
-            "address_line2": company.address_line2,
-            "suburb": company.suburb,
-            "state": company.state,
-            "postcode": company.postcode,
-            "phone": company.phone,
-            "email": company.email,
-            "abn": company.abn,
+            "name": issuer["name"],
+            "address_line1": issuer["address_line1"],
+            "address_line2": issuer["address_line2"],
+            "suburb": issuer["suburb"],
+            "state": issuer["state"],
+            "postcode": issuer["postcode"],
+            "phone": issuer["phone"],
+            "email": issuer["email"],
+            "abn": issuer["abn"],
             "bilingual_labels": company.bilingual_labels,
             **bank,
         },
@@ -540,7 +678,7 @@ def _render_for(doc: OutgoingDocument, company: Company) -> bytes:
         paid_date=doc.paid_date,
         payment_method=doc.payment_method,
         notes=doc.notes,
-        is_gst_registered=company.gst_registered,
+        is_gst_registered=bool(issuer["gst_registered"]),
     )
 
     # Prefer the HTML→PDF renderer (CSS handles layout/wrapping); fall back to
@@ -564,7 +702,10 @@ def render_pdf(
     if doc is None:
         raise HTTPException(404, "Document not found")
 
-    pdf_bytes = _render_for(doc, company)
+    try:
+        pdf_bytes = _render_for(doc, company)
+    except IssuerSnapshotError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
     # A void document's PDF must NOT be persisted: void() deletes the on-disk PDF
     # precisely because it holds client PII, and simply opening the void receipt

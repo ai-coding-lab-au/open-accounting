@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ def client(monkeypatch, request):
     test_data = PROJECT_ROOT / "tmp" / "tests" / request.node.name
     if test_data.exists():
         import shutil
+
         shutil.rmtree(test_data)
     test_data.mkdir(parents=True, exist_ok=True)
 
@@ -28,8 +30,18 @@ def client(monkeypatch, request):
         if mod.startswith("app"):
             del sys.modules[mod]
     from app.main import app
+
     with TestClient(app) as c:
-        c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        company = c.post(
+            "/api/v1/companies",
+            json={
+                "id": "tc",
+                "marn": "1234567",
+                "registered_agent_name": "Test Agent",
+                "name": "Test Pty Ltd",
+            },
+        )
+        HEAD["X-Company-Generation"] = company.json()["generation_id"]
         yield c
 
 
@@ -50,6 +62,123 @@ def test_update_contact_fields(client):
     body = r.json()
     assert body["abn"] == "12345678901"
     assert body["email"] == "billing@acme.test"
+
+
+def test_contact_names_and_compact_fields_are_normalised(client):
+    r = client.post(
+        "/api/v1/contacts",
+        headers=HEAD,
+        json={
+            "name": "  Acme Migration Services  ",
+            "kind": "supplier",
+            "abn": "12 345 678 901",
+            "phone": "+61 2 0000 0000",
+        },
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["name"] == "Acme Migration Services"
+    assert body["abn"] == "12345678901"
+    assert body["phone"] == "+61200000000"
+
+    duplicate = client.post(
+        "/api/v1/contacts",
+        headers=HEAD,
+        json={"name": "acme migration services", "kind": "supplier"},
+    )
+    assert duplicate.status_code == 409
+
+    for method, path in (
+        (client.post, "/api/v1/contacts"),
+        (client.patch, f"/api/v1/contacts/{body['id']}"),
+    ):
+        response = method(path, headers=HEAD, json={"name": "   "})
+        assert response.status_code == 422, response.text
+
+
+def test_contact_ui_patch_null_clears_and_omission_preserves(client):
+    created = client.post(
+        "/api/v1/contacts",
+        headers=HEAD,
+        json={
+            "name": "Provider One",
+            "kind": "supplier",
+            "abn": "12345678901",
+            "email": "accounts@provider.test",
+            "phone": "0400000000",
+            "address": "1 Provider Street",
+            "notes": "Initial note",
+            "active": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    contact_id = created.json()["id"]
+
+    # Providers.tsx sends this full object shape for edits, using JSON null for
+    # cleared optional inputs.
+    updated = client.patch(
+        f"/api/v1/contacts/{contact_id}",
+        headers=HEAD,
+        json={
+            "name": "  Provider One Renamed  ",
+            "kind": "both",
+            "abn": None,
+            "email": None,
+            "phone": None,
+            "address": None,
+            "notes": None,
+            "active": False,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    body = updated.json()
+    assert body["name"] == "Provider One Renamed"
+    assert body["kind"] == "both"
+    assert body["active"] is False
+    for field in ("abn", "email", "phone", "address", "notes"):
+        assert body[field] is None
+
+    omitted = client.patch(
+        f"/api/v1/contacts/{contact_id}",
+        headers=HEAD,
+        json={"email": "new@provider.test"},
+    )
+    assert omitted.status_code == 200, omitted.text
+    assert omitted.json()["name"] == "Provider One Renamed"
+    assert omitted.json()["kind"] == "both"
+    assert omitted.json()["active"] is False
+
+
+@pytest.mark.parametrize("field", ["kind", "name", "active"])
+def test_contact_patch_rejects_explicit_null_for_required_fields(client, field):
+    contact_id = _create(client, f"Required field {field}")
+    r = client.patch(
+        f"/api/v1/contacts/{contact_id}",
+        headers=HEAD,
+        json={field: None},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_concurrent_contact_name_check_is_serialised(client):
+    def create(name: str):
+        return client.post(
+            "/api/v1/contacts",
+            headers=HEAD,
+            json={"name": name, "kind": "supplier"},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(create, ("Race Provider", "race provider")))
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    rows = client.get(
+        "/api/v1/contacts",
+        headers=HEAD,
+        params={"q": "Race Provider"},
+    )
+    assert rows.status_code == 200, rows.text
+    assert len(rows.json()) == 1
 
 
 def test_update_rejects_name_clash(client):

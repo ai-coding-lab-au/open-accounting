@@ -9,6 +9,7 @@ import InvoiceForm, {
   toCreatePayload,
   type InvoiceFormValues,
 } from "./InvoiceForm";
+import { useCurrentCompany } from "../../lib/useCurrentCompany";
 
 async function createInvoice(payload: ReturnType<typeof toCreatePayload>): Promise<Invoice> {
   const { data } = await api.post<Invoice>("/invoices", payload);
@@ -17,6 +18,7 @@ async function createInvoice(payload: ReturnType<typeof toCreatePayload>): Promi
 
 export default function ManualCreateDialog({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  const companyQ = useCurrentCompany();
   const [form, setForm] = useState<InvoiceFormValues>(EMPTY_FORM);
   const mut = useMutation({
     mutationFn: createInvoice,
@@ -28,12 +30,18 @@ export default function ManualCreateDialog({ onClose }: { onClose: () => void })
   });
   const canCreate =
     !mut.isPending &&
+    !!companyQ.data &&
     !!form.contact_name &&
     !!form.invoice_number &&
     !!form.issue_date &&
     !!form.total;
   const submit = () => {
-    if (canCreate) mut.mutate(toCreatePayload(form, { source: "manual" }));
+    if (canCreate) {
+      mut.mutate(toCreatePayload(form, {
+        source: "manual",
+        gst_registered: companyQ.data!.gst_registered,
+      }));
+    }
   };
 
   useModalKeys({ open: true, onClose, onSubmit: submit });

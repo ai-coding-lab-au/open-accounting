@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from decimal import Decimal
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-from ._money import Money
 
 
 def _strip_phone_spaces(v: str | None) -> str | None:
@@ -19,6 +16,21 @@ def _strip_phone_spaces(v: str | None) -> str | None:
         return None
     cleaned = "".join(v.split())
     return cleaned or None
+
+
+def _strip_required_name(v: Any) -> Any:
+    if not isinstance(v, str):
+        return v
+    cleaned = v.strip()
+    if not cleaned:
+        raise ValueError("display_name must not be blank")
+    return cleaned
+
+
+def _strip_optional_ref(v: Any) -> Any:
+    if not isinstance(v, str):
+        return v
+    return v.strip() or None
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +46,16 @@ class ClientCreate(BaseModel):
     client_ref: str | None = Field(default=None, max_length=50)
     notes: str | None = Field(default=None, max_length=1000)
 
+    @field_validator("display_name", mode="before")
+    @classmethod
+    def _normalise_display_name(cls, v: Any) -> Any:
+        return _strip_required_name(v)
+
+    @field_validator("client_ref", mode="before")
+    @classmethod
+    def _normalise_client_ref(cls, v: Any) -> Any:
+        return _strip_optional_ref(v)
+
     @field_validator("phone", mode="before")
     @classmethod
     def _normalise_phone(cls, v):
@@ -48,6 +70,16 @@ class ClientUpdate(BaseModel):
     client_ref: str | None = Field(default=None, max_length=50)
     notes: str | None = Field(default=None, max_length=1000)
     is_active: bool | None = None
+
+    @field_validator("display_name", mode="before")
+    @classmethod
+    def _normalise_display_name(cls, v: Any) -> Any:
+        return _strip_required_name(v)
+
+    @field_validator("client_ref", mode="before")
+    @classmethod
+    def _normalise_client_ref(cls, v: Any) -> Any:
+        return _strip_optional_ref(v)
 
     @field_validator("phone", mode="before")
     @classmethod

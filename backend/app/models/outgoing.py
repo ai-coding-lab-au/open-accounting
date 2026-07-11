@@ -10,6 +10,7 @@ no document_counters / outgoing_documents / outgoing_document_lines.
 Contains:
   - DocumentType  / DocumentStatus  (enums)
   - OutgoingDocument                (Receipt — the only outgoing document type)
+  - OutgoingIssuerSnapshot          (immutable issuer identity/payment details)
   - OutgoingDocumentLine            (line items)
   - DocumentCounter                 (per-(doc_type, year) numbering counter)
 
@@ -24,18 +25,16 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 
-import sqlalchemy as sa
 from sqlalchemy import (
-    Boolean,
     Date,
     DateTime,
     ForeignKey,
     Integer,
     Numeric,
     String,
+    Text,
     UniqueConstraint,
     func,
-    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -99,6 +98,48 @@ class OutgoingDocument(CompanyBase):
     customer: Mapped[Contact | None] = relationship()
     lines: Mapped[list["OutgoingDocumentLine"]] = relationship(
         back_populates="document", cascade="all, delete-orphan", order_by="OutgoingDocumentLine.order_no"
+    )
+    issuer_snapshot: Mapped["OutgoingIssuerSnapshot | None"] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        uselist=False,
+        single_parent=True,
+    )
+
+
+class OutgoingIssuerSnapshot(CompanyBase):
+    """Immutable issuer details captured when a receipt is issued.
+
+    This is a separate table rather than a new column so ``create_all`` can
+    add it safely to existing company databases.  Legacy receipts without a
+    row retain the old current-company fallback; all newly issued receipts get
+    a snapshot and can no longer be rewritten by later profile changes.
+    """
+
+    __tablename__ = "outgoing_issuer_snapshots"
+
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("outgoing_documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+    document: Mapped[OutgoingDocument] = relationship(back_populates="issuer_snapshot")
+
+
+class OutgoingCreateIdempotencyKey(CompanyBase):
+    """Persisted ownership of one receipt-create request."""
+
+    __tablename__ = "outgoing_create_idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("outgoing_documents.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 

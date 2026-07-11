@@ -4,6 +4,14 @@ export function apiErrorMessage(err: unknown, fallback = "Request failed"): stri
   if (err instanceof AxiosError) {
     const detail = err.response?.data?.detail;
     if (typeof detail === "string") return detail;
+    if (
+      detail &&
+      typeof detail === "object" &&
+      !Array.isArray(detail) &&
+      typeof (detail as { message?: unknown }).message === "string"
+    ) {
+      return (detail as { message: string }).message;
+    }
     if (Array.isArray(detail) && detail.length > 0) {
       const first = detail[0];
       if (typeof first?.msg === "string") return first.msg;

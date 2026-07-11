@@ -1,6 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...db.company import begin_sqlite_immediate
 from ...deps import PathId, get_company_db, get_current_company
 from ...hooks import iter_contact_reference_checks
 from ...models.company import Contact, Invoice
@@ -38,16 +41,27 @@ def create_contact(
     _: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
+    begin_sqlite_immediate(db)
     existing = (
         db.query(Contact)
-        .filter(Contact.name.ilike(payload.name), Contact.kind == payload.kind)
+        .filter(
+            func.lower(Contact.name) == payload.name.lower(),
+            Contact.kind == payload.kind,
+        )
         .first()
     )
     if existing:
         raise HTTPException(status_code=409, detail=f"Contact '{payload.name}' already exists")
     contact = Contact(**payload.model_dump())
     db.add(contact)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Contact could not be saved because it conflicts with an existing record",
+        ) from None
     db.refresh(contact)
     return contact
 
@@ -59,37 +73,39 @@ def update_contact(
     _: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
+    begin_sqlite_immediate(db)
     c = db.query(Contact).filter(Contact.id == contact_id).one_or_none()
     if c is None:
         raise HTTPException(status_code=404, detail="Contact not found")
 
-    if payload.name is not None and payload.name.strip().lower() != c.name.lower():
+    data = payload.model_dump(exclude_unset=True)
+    if "name" in data and data["name"].lower() != c.name.lower():
         clash = (
             db.query(Contact)
-            .filter(Contact.name.ilike(payload.name), Contact.id != contact_id)
+            .filter(
+                func.lower(Contact.name) == data["name"].lower(),
+                Contact.id != contact_id,
+            )
             .first()
         )
         if clash:
-            raise HTTPException(
-                status_code=409, detail=f"Contact '{payload.name}' already exists"
-            )
-        c.name = payload.name
-    if payload.kind is not None:
-        c.kind = payload.kind
-    if payload.abn is not None:
-        c.abn = payload.abn or None
-    if payload.email is not None:
-        c.email = payload.email or None
-    if payload.phone is not None:
-        c.phone = payload.phone or None
-    if payload.address is not None:
-        c.address = payload.address or None
-    if payload.notes is not None:
-        c.notes = payload.notes or None
-    if payload.active is not None:
-        c.active = payload.active
+            raise HTTPException(status_code=409, detail=f"Contact '{data['name']}' already exists")
 
-    db.commit()
+    for field, value in data.items():
+        # Preserve the established empty-string-to-null behaviour for nullable
+        # text fields while allowing an explicit JSON null to clear a value.
+        if field in {"abn", "email", "phone", "address", "notes"}:
+            value = value or None
+        setattr(c, field, value)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Contact could not be saved because it conflicts with an existing record",
+        ) from None
     db.refresh(c)
     return c
 
@@ -127,11 +143,7 @@ def get_or_create_contact(*, db: Session, name: str, kind: str, abn: str | None 
     name = name.strip()
     if not name:
         raise ValueError("Contact name must not be empty")
-    existing = (
-        db.query(Contact)
-        .filter(Contact.name.ilike(name))
-        .first()
-    )
+    existing = db.query(Contact).filter(Contact.name.ilike(name)).first()
     if existing:
         # Promote to 'both' if a contact already exists in the other role
         if existing.kind != kind and existing.kind != "both":

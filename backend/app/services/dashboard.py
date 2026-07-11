@@ -13,11 +13,11 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from ..schemas._dates import current_date
 from ..models.company import (
     Account,
     BankAccount,
     BankTransaction,
-    BankTxnDirection,
     Invoice,
     InvoiceDirection,
     InvoiceStatus,
@@ -48,7 +48,7 @@ def _current_month_bounds(today: date) -> tuple[date, date]:
 
 
 def dashboard_summary(db: Session, *, today: date | None = None) -> dict:
-    today = today or date.today()
+    today = today or current_date()
     fy_start, fy_end = _fy_to_date_bounds(today)
     month_start, month_end = _current_month_bounds(today)
 
@@ -56,7 +56,7 @@ def dashboard_summary(db: Session, *, today: date | None = None) -> dict:
     bank_rows: list[dict] = []
     business_total = ZERO
     for ba in db.query(BankAccount).filter(BankAccount.is_active.is_(True)).all():
-        bal = bank_account_balance(db, ba)
+        bal = bank_account_balance(db, ba, as_of=today)
         bank_rows.append(
             {
                 "id": ba.id,
@@ -78,6 +78,7 @@ def dashboard_summary(db: Session, *, today: date | None = None) -> dict:
             Invoice.status.in_(
                 [InvoiceStatus.AUTHORISED, InvoiceStatus.UNPAID, InvoiceStatus.PARTIAL]
             ),
+            Invoice.issue_date <= today,
         )
         .order_by(Invoice.due_date.asc().nullslast(), Invoice.issue_date.asc())
         .all()
@@ -117,7 +118,10 @@ def dashboard_summary(db: Session, *, today: date | None = None) -> dict:
     if biz_account_ids:
         txns = (
             db.query(BankTransaction)
-            .filter(BankTransaction.bank_account_id.in_(biz_account_ids))
+            .filter(
+                BankTransaction.bank_account_id.in_(biz_account_ids),
+                BankTransaction.occurred_at <= today,
+            )
             .order_by(BankTransaction.occurred_at.desc(), BankTransaction.id.desc())
             .limit(8)
             .all()

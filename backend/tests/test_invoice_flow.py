@@ -11,6 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
+from _request_headers import manual_transaction_headers
+
 # Ensure imports work whether pytest runs from repo root or backend/
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -46,7 +48,9 @@ def _make_company(client):
         json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"},
     )
     assert r.status_code == 201, r.text
-    return r.json()
+    company = r.json()
+    client.headers["X-Company-Generation"] = company["generation_id"]
+    return company
 
 
 def test_company_create_seeds_coa(client):
@@ -219,12 +223,12 @@ def test_manual_invoice_create_and_status_update(client):
         json={"paid_amount": "200.00"},
     )
     assert r.status_code == 409, r.text
-    assert "bank clearing" in r.text
+    assert "bank-to-invoice allocations" in r.text
 
     bank = client.get("/api/v1/bank-accounts", headers={"X-Company-Id": "tc"}).json()[0]
     r = client.post(
         f"/api/v1/bank-accounts/{bank['id']}/transactions",
-        headers={"X-Company-Id": "tc"},
+        headers=manual_transaction_headers({"X-Company-Id": "tc"}),
         json={
             "direction": "in",
             "amount": "550.00",
@@ -244,7 +248,7 @@ def test_manual_invoice_create_and_status_update(client):
     # liability are already on the ledger via the invoice journal.
     r = client.post(
         f"/api/v1/bank-accounts/{bank['id']}/transactions",
-        headers={"X-Company-Id": "tc"},
+        headers=manual_transaction_headers({"X-Company-Id": "tc"}),
         json={
             "direction": "in",
             "amount": "550.00",
@@ -254,6 +258,7 @@ def test_manual_invoice_create_and_status_update(client):
             "account_id": accounts["1100"]["id"],
             "tax_code": "standard",
             "gst_amount": "50.00",
+            "invoice_allocations": [{"invoice_id": inv_id, "amount": "550.00"}],
         },
     )
     assert r.status_code == 201, r.text
@@ -327,7 +332,7 @@ def test_ap_settlement_guard_and_reports(client):
     # Natural-but-wrong: the payment categorised to the expense account.
     r = client.post(
         f"/api/v1/bank-accounts/{bank['id']}/transactions",
-        headers={"X-Company-Id": "tc"},
+        headers=manual_transaction_headers({"X-Company-Id": "tc"}),
         json={
             "direction": "out",
             "amount": "220.00",
@@ -345,7 +350,7 @@ def test_ap_settlement_guard_and_reports(client):
     # Correct settlement: 2000 with standard GST.
     r = client.post(
         f"/api/v1/bank-accounts/{bank['id']}/transactions",
-        headers={"X-Company-Id": "tc"},
+        headers=manual_transaction_headers({"X-Company-Id": "tc"}),
         json={
             "direction": "out",
             "amount": "220.00",
@@ -355,6 +360,7 @@ def test_ap_settlement_guard_and_reports(client):
             "account_id": accounts["2000"]["id"],
             "tax_code": "standard",
             "gst_amount": "20.00",
+            "invoice_allocations": [{"invoice_id": inv_id, "amount": "220.00"}],
         },
     )
     assert r.status_code == 201, r.text
@@ -377,6 +383,351 @@ def test_ap_settlement_guard_and_reports(client):
     assert body["is_balanced"], body
     assert Decimal(body["total_liabilities"]) == Decimal("0.00")  # AP cleared
     assert Decimal(body["total_equity"]) == Decimal("-200.00")  # expense counted once
+
+
+def test_settled_invoice_must_be_reallocated_before_void(client):
+    """A bank settlement must not survive while the invoice journal is
+    reversed. Both void routes fail closed until the control-account bank row
+    is explicitly reallocated/decategorised."""
+    _make_company(client)
+    headers = {"X-Company-Id": "tc"}
+    accounts = {
+        a["code"]: a
+        for a in client.get("/api/v1/accounts", headers=headers).json()
+    }
+    bank = client.get("/api/v1/bank-accounts", headers=headers).json()[0]
+
+    cases = (
+        {
+            "direction": "AR",
+            "contact": "Settlement Customer",
+            "number": "AR-SETTLED",
+            "line_account": "4000",
+            "bank_direction": "in",
+            "control": "1100",
+        },
+        {
+            "direction": "AP",
+            "contact": "Settlement Supplier",
+            "number": "AP-SETTLED",
+            "line_account": "6100",
+            "bank_direction": "out",
+            "control": "2000",
+        },
+    )
+
+    created: dict[str, tuple[int, int]] = {}
+    for case in cases:
+        response = client.post(
+            "/api/v1/invoices",
+            headers=headers,
+            json={
+                "direction": case["direction"],
+                "contact_name": case["contact"],
+                "invoice_number": case["number"],
+                "issue_date": "2025-08-01",
+                "subtotal": "100.00",
+                "gst_amount": "10.00",
+                "total": "110.00",
+                "lines": [
+                    {
+                        "description": "Settlement guard",
+                        "account_id": accounts[case["line_account"]]["id"],
+                        "quantity": "1",
+                        "unit_price": "100.00",
+                        "gst_rate": "0.10",
+                        "line_subtotal": "100.00",
+                        "line_gst": "10.00",
+                        "line_total": "110.00",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 201, response.text
+        invoice_id = response.json()["id"]
+        response = client.post(
+            f"/api/v1/invoices/{invoice_id}/post",
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+
+        response = client.post(
+            f"/api/v1/bank-accounts/{bank['id']}/transactions",
+            headers=manual_transaction_headers(headers),
+            json={
+                "direction": case["bank_direction"],
+                "amount": "110.00",
+                "occurred_at": "2025-08-05",
+                "counter_party_name": case["contact"],
+                "memo": f"Payment for {case['number']}",
+                "account_id": accounts[case["control"]]["id"],
+                "tax_code": "standard",
+                "gst_amount": "10.00",
+                "invoice_allocations": [
+                    {"invoice_id": invoice_id, "amount": "110.00"}
+                ],
+            },
+        )
+        assert response.status_code == 201, response.text
+        transaction_id = response.json()["id"]
+        created[case["direction"]] = (invoice_id, transaction_id)
+
+        response = client.post(
+            f"/api/v1/invoices/{invoice_id}/void",
+            headers=headers,
+        )
+        assert response.status_code == 409, response.text
+        assert "payment" in response.text
+
+        # The actual frontend uses DELETE for posted-invoice voiding; it must
+        # enforce exactly the same invariant.
+        response = client.delete(f"/api/v1/invoices/{invoice_id}", headers=headers)
+        assert response.status_code == 409, response.text
+        assert "payment" in response.text
+
+        current = client.get(
+            f"/api/v1/invoices/{invoice_id}",
+            headers=headers,
+        ).json()
+        assert current["status"] != "void"
+
+    # The operator can explicitly remove the settlement categorisation and
+    # then void. This is loud/recoverable rather than a permanent lockout.
+    ar_invoice_id, ar_transaction_id = created["AR"]
+    response = client.patch(
+        f"/api/v1/bank-accounts/transactions/{ar_transaction_id}/categorise",
+        headers=headers,
+        json={"account_id": None},
+    )
+    assert response.status_code == 200, response.text
+    response = client.post(
+        f"/api/v1/invoices/{ar_invoice_id}/void",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+
+    # The reverse race is also closed: once void wins, the old bank row (or a
+    # new matching row) cannot be put back onto AR as though the invoice still
+    # existed.
+    response = client.patch(
+        f"/api/v1/bank-accounts/transactions/{ar_transaction_id}/categorise",
+        headers=headers,
+        json={
+            "account_id": accounts["1100"]["id"],
+            "tax_code": "standard",
+            "gst_amount": "10.00",
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert "matches void invoice" in response.text
+
+
+def test_partial_blank_control_settlement_blocks_void_in_both_directions(client):
+    """Partial payments without invoice text are still settlements when the
+    invoice is the only plausible target; pre-issue control movements are not.
+    """
+    _make_company(client)
+    headers = {"X-Company-Id": "tc"}
+    accounts = {
+        account["code"]: account
+        for account in client.get("/api/v1/accounts", headers=headers).json()
+    }
+    bank = client.get("/api/v1/bank-accounts", headers=headers).json()[0]
+
+    for direction, line_code, bank_direction, control_code in (
+        ("AR", "4000", "in", "1100"),
+        ("AP", "6100", "out", "2000"),
+    ):
+        created = client.post(
+            "/api/v1/invoices",
+            headers=headers,
+            json={
+                "direction": direction,
+                "contact_name": f"{direction} partial contact",
+                "invoice_number": f"{direction}-PARTIAL-BLANK",
+                "issue_date": "2025-08-10",
+                "subtotal": "100.00",
+                "gst_amount": "10.00",
+                "total": "110.00",
+                "lines": [
+                    {
+                        "description": "Partial settlement guard",
+                        "account_id": accounts[line_code]["id"],
+                        "line_subtotal": "100.00",
+                        "line_gst": "10.00",
+                        "line_total": "110.00",
+                    }
+                ],
+            },
+        )
+        assert created.status_code == 201, created.text
+        invoice_id = created.json()["id"]
+        posted = client.post(
+            f"/api/v1/invoices/{invoice_id}/post", headers=headers
+        )
+        assert posted.status_code == 200, posted.text
+
+        # Pre-issue money is not AR/AP yet: it must use a deposit/prepayment
+        # account rather than creating negative control-account balances.
+        prepayment = client.post(
+            f"/api/v1/bank-accounts/{bank['id']}/transactions",
+            headers=manual_transaction_headers(headers),
+            json={
+                "direction": bank_direction,
+                "amount": "25.00",
+                "occurred_at": "2025-08-01",
+                "account_id": accounts[control_code]["id"],
+                "tax_code": "standard",
+                "gst_amount": "0",
+            },
+        )
+        assert prepayment.status_code == 409, prepayment.text
+        assert "invoice allocation" in prepayment.text
+
+        partial = client.post(
+            f"/api/v1/bank-accounts/{bank['id']}/transactions",
+            headers=manual_transaction_headers(headers),
+            json={
+                "direction": bank_direction,
+                "amount": "50.00",
+                "occurred_at": "2025-08-15",
+                "account_id": accounts[control_code]["id"],
+                "tax_code": "standard",
+                "gst_amount": "0",
+                "invoice_allocations": [
+                    {"invoice_id": invoice_id, "amount": "50.00"}
+                ],
+            },
+        )
+        assert partial.status_code == 201, partial.text
+        partial_id = partial.json()["id"]
+
+        blocked = client.post(
+            f"/api/v1/invoices/{invoice_id}/void", headers=headers
+        )
+        assert blocked.status_code == 409, blocked.text
+        assert "payment" in blocked.text
+
+        cleared = client.patch(
+            f"/api/v1/bank-accounts/transactions/{partial_id}/categorise",
+            headers=headers,
+            json={"account_id": None},
+        )
+        assert cleared.status_code == 200, cleared.text
+        voided = client.post(
+            f"/api/v1/invoices/{invoice_id}/void", headers=headers
+        )
+        assert voided.status_code == 200, voided.text
+
+        # Void-first ordering is guarded as well, for both recategorisation and
+        # a newly-created blank partial payment.
+        restored = client.patch(
+            f"/api/v1/bank-accounts/transactions/{partial_id}/categorise",
+            headers=headers,
+            json={"account_id": accounts[control_code]["id"]},
+        )
+        assert restored.status_code == 409, restored.text
+        after_void = client.post(
+            f"/api/v1/bank-accounts/{bank['id']}/transactions",
+            headers=manual_transaction_headers(headers),
+            json={
+                "direction": bank_direction,
+                "amount": "50.00",
+                "occurred_at": "2025-08-20",
+                "account_id": accounts[control_code]["id"],
+                "tax_code": "standard",
+                "gst_amount": "0",
+            },
+        )
+        assert after_void.status_code == 409, after_void.text
+
+
+def test_exact_blank_settlement_wins_over_larger_partial_candidate(client):
+    _make_company(client)
+    headers = {"X-Company-Id": "tc"}
+    accounts = {
+        account["code"]: account
+        for account in client.get("/api/v1/accounts", headers=headers).json()
+    }
+    bank = client.get("/api/v1/bank-accounts", headers=headers).json()[0]
+
+    invoice_ids: list[int] = []
+    for number, subtotal, gst, total in (
+        ("AR-EXACT-110", "100.00", "10.00", "110.00"),
+        ("AR-LARGER-220", "200.00", "20.00", "220.00"),
+    ):
+        response = client.post(
+            "/api/v1/invoices",
+            headers=headers,
+            json={
+                "direction": "AR",
+                "contact_name": number,
+                "invoice_number": number,
+                "issue_date": "2025-08-01",
+                "subtotal": subtotal,
+                "gst_amount": gst,
+                "total": total,
+                "lines": [
+                    {
+                        "description": number,
+                        "account_id": accounts["4000"]["id"],
+                        "line_subtotal": subtotal,
+                        "line_gst": gst,
+                        "line_total": total,
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 201, response.text
+        invoice_id = response.json()["id"]
+        assert client.post(
+            f"/api/v1/invoices/{invoice_id}/post", headers=headers
+        ).status_code == 200
+        invoice_ids.append(invoice_id)
+
+    settlement = client.post(
+        f"/api/v1/bank-accounts/{bank['id']}/transactions",
+        headers=manual_transaction_headers(headers),
+        json={
+            "direction": "in",
+            "amount": "110.00",
+            "occurred_at": "2025-08-05",
+            "memo": "Payment AR-EXACT-110",
+            "account_id": accounts["1100"]["id"],
+            "tax_code": "standard",
+            "gst_amount": "10.00",
+            "invoice_allocations": [
+                {"invoice_id": invoice_ids[0], "amount": "110.00"}
+            ],
+        },
+    )
+    assert settlement.status_code == 201, settlement.text
+
+    exact_void = client.post(
+        f"/api/v1/invoices/{invoice_ids[0]}/void", headers=headers
+    )
+    assert exact_void.status_code == 409, exact_void.text
+    larger_void = client.post(
+        f"/api/v1/invoices/{invoice_ids[1]}/void", headers=headers
+    )
+    assert larger_void.status_code == 200, larger_void.text
+
+    response = client.post(
+        f"/api/v1/bank-accounts/{bank['id']}/transactions",
+        headers=manual_transaction_headers(headers),
+        json={
+            "direction": "in",
+            "amount": "110.00",
+            "occurred_at": "2025-08-06",
+            "counter_party_name": "Settlement Customer",
+            "memo": "Payment for AR-SETTLED",
+            "account_id": accounts["1100"]["id"],
+            "tax_code": "standard",
+            "gst_amount": "10.00",
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert "matches void invoice" in response.text
 
 
 def test_duplicate_invoice_rejected(client):

@@ -35,9 +35,6 @@ from ..models.company import (
     BankTransaction,
     BankTxnDirection,
 )
-from .bank_accounts import bank_account_balance
-
-
 ZERO = Decimal("0")
 
 
@@ -146,6 +143,13 @@ def bank_statement(
                 acc = db.get(Account, txn.account_id)
                 if acc is not None:
                     account_cache[txn.account_id] = acc
+        unapplied_acc = None
+        if txn.unapplied_account_id is not None:
+            unapplied_acc = account_cache.get(txn.unapplied_account_id)
+            if unapplied_acc is None:
+                unapplied_acc = db.get(Account, txn.unapplied_account_id)
+                if unapplied_acc is not None:
+                    account_cache[txn.unapplied_account_id] = unapplied_acc
         enriched.append(
             {
                 "id": txn.id,
@@ -159,6 +163,13 @@ def bank_statement(
                 "counter_party_name": txn.counter_party_name,
                 "account_code": acc.code if acc else None,
                 "account_name": acc.name if acc else None,
+                "unapplied_account_code": (
+                    unapplied_acc.code if unapplied_acc else None
+                ),
+                "unapplied_account_name": (
+                    unapplied_acc.name if unapplied_acc else None
+                ),
+                "unapplied_amount": txn.unapplied_amount,
                 "running_balance": running,
             }
         )
@@ -383,7 +394,12 @@ def bas(db: Session, *, fy_year: int, quarter: int, gst_registered: bool = False
     # Local import: gst.py imports _au_fy_quarter_bounds from this module.
     from .gst import gst_exposure_for_quarter
 
-    g = gst_exposure_for_quarter(db, fy_year=fy_year, quarter=quarter)
+    g = gst_exposure_for_quarter(
+        db,
+        fy_year=fy_year,
+        quarter=quarter,
+        gst_registered=gst_registered,
+    )
 
     return {
         "fy_year": fy_year,

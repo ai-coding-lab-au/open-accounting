@@ -17,6 +17,8 @@ from decimal import Decimal
 import pytest
 from fastapi.testclient import TestClient
 
+from _request_headers import manual_transaction_headers
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -38,7 +40,8 @@ def client(monkeypatch, request):
             del sys.modules[mod]
     from app.main import app
     with TestClient(app) as c:
-        c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        company = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        HEAD["X-Company-Generation"] = company.json()["generation_id"]
         yield c
 
 
@@ -60,7 +63,7 @@ def _txn(client, biz_bank, **kw):
     payload.update(kw)
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json=payload,
     )
     assert r.status_code == 201, r.text

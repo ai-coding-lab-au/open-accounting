@@ -79,30 +79,25 @@ def update_rule(
     if rule is None:
         raise HTTPException(404, "Rule not found")
 
-    if payload.set_account_id is not None:
-        _check_account(db, payload.set_account_id)
-        rule.set_account_id = payload.set_account_id
+    changes = payload.model_dump(exclude_unset=True)
+
+    if "set_account_id" in changes:
+        _check_account(db, changes["set_account_id"])
 
     new_min = (
-        payload.match_amount_min if payload.match_amount_min is not None
+        changes["match_amount_min"] if "match_amount_min" in changes
         else rule.match_amount_min
     )
     new_max = (
-        payload.match_amount_max if payload.match_amount_max is not None
+        changes["match_amount_max"] if "match_amount_max" in changes
         else rule.match_amount_max
     )
     _check_amount_range(new_min, new_max)
 
-    for field in (
-        "priority", "is_active", "description",
-        "match_direction", "match_amount_min", "match_amount_max",
-        "match_memo_regex", "match_counter_party_regex",
-    ):
-        v = getattr(payload, field)
-        if v is not None:
-            setattr(rule, field, v)
-    if payload.set_tax_code is not None:
-        rule.set_tax_code = TaxCode(payload.set_tax_code)
+    if "set_tax_code" in changes:
+        changes["set_tax_code"] = TaxCode(changes["set_tax_code"])
+    for field, value in changes.items():
+        setattr(rule, field, value)
 
     db.commit()
     db.refresh(rule)

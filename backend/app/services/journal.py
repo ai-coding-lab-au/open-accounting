@@ -19,12 +19,21 @@ a `locked` flag and gate update/delete on it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import date
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from ..models.company import Account, JournalEntry, JournalEntrySource, JournalLine
+from ..db.company import begin_sqlite_immediate
+from ..models.company import (
+    Account,
+    JournalEntry,
+    JournalEntrySource,
+    JournalIdempotencyKey,
+    JournalLine,
+)
 from ..schemas.journal import JournalEntryCreate, JournalEntryUpdate, JournalLineCreate
 
 
@@ -48,6 +57,66 @@ class UnknownAccount(JournalError):
 
 class JournalLocked(JournalError):
     http_status = 409
+
+
+class IdempotencyConflict(JournalError):
+    http_status = 409
+
+
+def _canonical_money(value: Decimal) -> str:
+    """Return one stable representation for numerically equal Decimal inputs."""
+
+    if value == 0:
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def _create_payload_hash(payload: JournalEntryCreate) -> str:
+    canonical = {
+        "entry_date": payload.entry_date.isoformat(),
+        "memo": payload.memo,
+        "reference": payload.reference,
+        "lines": [
+            {
+                "account_id": line.account_id,
+                "debit_amount": _canonical_money(line.debit_amount),
+                "credit_amount": _canonical_money(line.credit_amount),
+                "description": line.description,
+            }
+            for line in payload.lines
+        ],
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def reject_gst_control_lines_for_non_registered(
+    session: Session,
+    lines: list[JournalLineCreate],
+) -> None:
+    """A non-registered company cannot manually post GST control balances."""
+
+    account_ids = {line.account_id for line in lines}
+    gst_accounts = (
+        session.query(Account.code)
+        .filter(
+            Account.id.in_(account_ids),
+            Account.code.in_(["1200", "2100"]),
+        )
+        .all()
+    )
+    if gst_accounts:
+        codes = ", ".join(sorted(row[0] for row in gst_accounts))
+        raise InvalidLine(
+            "This company is not GST-registered; manual journal entries cannot "
+            f"post to GST control account(s) {codes}. Record the full gross "
+            "amount against the underlying income, expense, asset, or liability."
+        )
 
 
 def _validate_lines(session: Session, lines: list[JournalLineCreate]) -> None:
@@ -107,7 +176,36 @@ def _validate_lines(session: Session, lines: list[JournalLineCreate]) -> None:
         )
 
 
-def create_entry(session: Session, payload: JournalEntryCreate) -> JournalEntry:
+def create_entry(
+    session: Session,
+    payload: JournalEntryCreate,
+    *,
+    gst_registered: bool = True,
+    idempotency_key: str | None = None,
+) -> JournalEntry:
+    payload_hash: str | None = None
+    if idempotency_key is not None:
+        # Lock before the receipt SELECT. Concurrent requests with the same key
+        # then serialize, and the loser observes the winner's committed row.
+        begin_sqlite_immediate(session)
+        payload_hash = _create_payload_hash(payload)
+        receipt = session.get(JournalIdempotencyKey, idempotency_key)
+        if receipt is not None:
+            if receipt.payload_hash != payload_hash:
+                raise IdempotencyConflict(
+                    "Idempotency-Key has already been used with a different "
+                    "journal entry payload."
+                )
+            entry = session.get(JournalEntry, receipt.entry_id)
+            if entry is None:
+                raise IdempotencyConflict(
+                    "Idempotency-Key points to a journal entry that no longer exists."
+                )
+            session.commit()
+            return entry
+
+    if not gst_registered:
+        reject_gst_control_lines_for_non_registered(session, payload.lines)
     _validate_lines(session, payload.lines)
 
     entry = JournalEntry(
@@ -125,6 +223,15 @@ def create_entry(session: Session, payload: JournalEntryCreate) -> JournalEntry:
             )
         )
     session.add(entry)
+    if idempotency_key is not None:
+        session.flush()
+        session.add(
+            JournalIdempotencyKey(
+                key=idempotency_key,
+                payload_hash=payload_hash,
+                entry_id=entry.id,
+            )
+        )
     session.commit()
     session.refresh(entry)
     return entry

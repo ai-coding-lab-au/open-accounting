@@ -13,7 +13,6 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 
-import sqlalchemy as sa
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -22,7 +21,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    Float,
     Numeric,
     String,
     Text,
@@ -174,6 +172,9 @@ class Invoice(CompanyBase):
         back_populates="invoice", cascade="all, delete-orphan"
     )
     attachments: Mapped[list["Attachment"]] = relationship(back_populates="invoice")
+    payment_allocations: Mapped[list["InvoicePaymentAllocation"]] = relationship(
+        back_populates="invoice"
+    )
 
 
 class InvoiceLine(CompanyBase):
@@ -191,6 +192,12 @@ class InvoiceLine(CompanyBase):
     line_subtotal: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     line_gst: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal("0"))
     line_total: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    # Stable BAS treatment for this economic line.  A zero GST amount alone
+    # cannot distinguish GST-free, input-taxed, capital, and out-of-scope
+    # supplies, so payment-time reporting must not infer the category from GST.
+    tax_code: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="gst_free", server_default="gst_free"
+    )
 
     invoice: Mapped[Invoice] = relationship(back_populates="lines")
     account: Mapped[Account | None] = relationship()
@@ -321,6 +328,15 @@ class BankTransaction(CompanyBase):
         CheckConstraint("amount > 0", name="ck_bank_txn_amount_positive"),
         CheckConstraint("gst_amount >= 0", name="ck_bank_txn_gst_nonneg"),
         CheckConstraint("gst_amount <= amount", name="ck_bank_txn_gst_within"),
+        CheckConstraint(
+            "unapplied_amount >= 0 AND unapplied_amount <= amount",
+            name="ck_bank_txn_unapplied_within",
+        ),
+        CheckConstraint(
+            "(unapplied_amount = 0 AND unapplied_account_id IS NULL) OR "
+            "(unapplied_amount > 0 AND unapplied_account_id IS NOT NULL)",
+            name="ck_bank_txn_unapplied_account",
+        ),
         Index(
             "uq_bank_txn_dedup",
             "bank_account_id",
@@ -357,6 +373,17 @@ class BankTransaction(CompanyBase):
         String(20), nullable=False, default=TaxCode.STANDARD
     )
 
+    # When a real cash movement exceeds the invoices it settles, the remainder
+    # is still part of this one bank row.  Store its explicit balance-sheet
+    # destination instead of forcing users to fabricate a second cash row or
+    # double-count income/expense.
+    unapplied_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="RESTRICT"), index=True
+    )
+    unapplied_amount: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0"), server_default="0"
+    )
+
     # Stable hash of (bank_account_id, direction, amount, occurred_at, memo)
     # used to detect duplicates when re-importing a bank statement CSV.
     # Optional because manual entries don't need it; set automatically by the
@@ -368,6 +395,145 @@ class BankTransaction(CompanyBase):
     )
 
     bank_account: Mapped[BankAccount] = relationship(back_populates="transactions")
+    invoice_allocations: Mapped[list["InvoicePaymentAllocation"]] = relationship(
+        back_populates="bank_transaction",
+        cascade="all, delete-orphan",
+    )
+    unapplied_account: Mapped[Account | None] = relationship(
+        foreign_keys=[unapplied_account_id]
+    )
+
+
+class BankTransactionIdempotencyKey(CompanyBase):
+    """Durable ownership of one manual-bank-create idempotency key."""
+
+    __tablename__ = "bank_transaction_idempotency_keys"
+    __table_args__ = (
+        UniqueConstraint(
+            "bank_transaction_id",
+            name="uq_bank_transaction_idempotency_transaction",
+        ),
+    )
+
+    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Keep a tombstone when the transaction is deleted so a delayed retry cannot
+    # silently resurrect cash that the operator intentionally removed.
+    bank_transaction_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class InvoicePaymentAllocation(CompanyBase):
+    """Explicit accounting link between one cash movement and one invoice.
+
+    Memo/contact text may suggest a match, but it is never accounting fact.
+    This row is the fact used to derive invoice paid/outstanding status.
+    """
+
+    __tablename__ = "invoice_payment_allocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "bank_transaction_id",
+            "invoice_id",
+            name="uq_invoice_payment_txn_invoice",
+        ),
+        CheckConstraint("amount > 0", name="ck_invoice_payment_amount_positive"),
+        CheckConstraint(
+            "gst_amount >= 0 AND gst_amount <= amount",
+            name="ck_invoice_payment_gst_within",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bank_transaction_id: Mapped[int] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gst_amount: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    bank_transaction: Mapped[BankTransaction] = relationship(
+        back_populates="invoice_allocations"
+    )
+    invoice: Mapped[Invoice] = relationship(back_populates="payment_allocations")
+    tax_components: Mapped[list["InvoicePaymentTaxComponent"]] = relationship(
+        back_populates="allocation",
+        cascade="all, delete-orphan",
+    )
+
+
+class InvoicePaymentTaxComponent(CompanyBase):
+    """Cash-basis tax composition captured from immutable posted invoice lines."""
+
+    __tablename__ = "invoice_payment_tax_components"
+    __table_args__ = (
+        UniqueConstraint(
+            "allocation_id",
+            "tax_code",
+            name="uq_invoice_payment_tax_component",
+        ),
+        CheckConstraint("gross_amount > 0", name="ck_invoice_payment_tax_gross_positive"),
+        CheckConstraint(
+            "gst_amount >= 0 AND gst_amount <= gross_amount",
+            name="ck_invoice_payment_tax_gst_within",
+        ),
+        CheckConstraint(
+            "tax_code IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none')",
+            name="ck_invoice_payment_tax_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    allocation_id: Mapped[int] = mapped_column(
+        ForeignKey("invoice_payment_allocations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    tax_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    gross_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gst_amount: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0")
+    )
+
+    allocation: Mapped[InvoicePaymentAllocation] = relationship(
+        back_populates="tax_components"
+    )
+
+
+class PaymentReconciliationEvent(CompanyBase):
+    """Immutable record of a fail-safe legacy payment repair at upgrade."""
+
+    __tablename__ = "payment_reconciliation_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_key: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    invoice_id: Mapped[int | None] = mapped_column(
+        ForeignKey("invoices.id", ondelete="SET NULL"), index=True
+    )
+    bank_transaction_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bank_transactions.id", ondelete="SET NULL"), index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    details_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +591,30 @@ class JournalEntry(CompanyBase):
         remote_side="JournalEntry.id",
         foreign_keys=[reverses_entry_id],
     )
+
+
+class JournalIdempotencyKey(CompanyBase):
+    """Persisted ownership of one manual-journal create request.
+
+    The opaque client key is company-local because every company has its own
+    database.  Keeping the parsed-payload hash lets a safe retry return the
+    original entry while rejecting accidental key reuse for different money.
+    """
+
+    __tablename__ = "journal_idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    entry_id: Mapped[int] = mapped_column(
+        ForeignKey("journal_entries.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    entry: Mapped[JournalEntry] = relationship()
 
 
 class BankRule(CompanyBase):

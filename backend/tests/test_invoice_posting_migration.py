@@ -87,8 +87,12 @@ def test_invoice_posting_migration_backfills_and_is_idempotent():
         journal = conn.execute(
             text("SELECT source_type, source_id, reverses_entry_id FROM journal_entries WHERE id=1")
         ).fetchone()
-    assert invoice[0] == "unpaid"
-    assert invoice[1] == "2026-05-01 09:30:00"
+    # A legacy invoice that claims to be posted but has no verifiable
+    # invoice_ar journal provenance is returned to editable draft.  Keeping it
+    # "unpaid" would let later cash allocation manufacture a paid state with no
+    # accrual GL entry.
+    assert invoice[0] == "draft"
+    assert invoice[1] is None
     assert journal == ("manual", None, None)
     second = run_company_migrations(engine)
     third_sync = sync_missing_columns(engine, CompanyBase)
@@ -100,6 +104,6 @@ def test_invoice_posting_migration_backfills_and_is_idempotent():
 
     assert "invoices.authorised_at" in added
     assert "journal_entries.source_type" in added
-    assert "backfill:invoice_authorised_at:1" in first
+    assert "reconcile:payments:stale_invoices:1" in first
     assert second == []
     assert third_sync == []

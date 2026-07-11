@@ -56,13 +56,14 @@ const TABS: { id: Tab; label: string; subtitle?: string }[] = [
   },
   {
     id: "gst",
-    label: "GST exposure",
+    label: "Tax-code analysis",
     subtitle:
-      "Per-box breakdown of taxable / GST-free / input-taxed activity. Drives BAS.",
+      "Bookkeeping analysis of taxable, GST-free, input-taxed and capital-coded bank activity.",
   },
   {
     id: "bas",
-    label: "BAS",
+    label: "GST summary",
+    subtitle: "Cash-basis bookkeeping totals for reconciliation before BAS lodgment.",
   },
 ];
 
@@ -121,7 +122,7 @@ export default function ReportsPage() {
 // ---------------------------------------------------------------------------
 
 function downloadPdf(path: string, params: Record<string, string | number>) {
-  // Use axios so the X-Company-Id header is injected via the same interceptor
+  // Use Axios so both company identity headers are injected by the interceptor
   // as the rest of the app; a plain <a download> can't set headers.
   api
     .get<Blob>(path, { params, responseType: "blob" })
@@ -610,6 +611,12 @@ function BASTab() {
       )}
       {data && (
         <>
+          <div className="text-sm bg-sky-50 border border-sky-200 text-sky-950 rounded p-3">
+            <strong>Bookkeeping aid — not a BAS or lodgment form.</strong>{" "}
+            These cash-basis totals use categorised bank transactions only. Confirm
+            your ATO reporting method, attribution, adjustments and required labels
+            before lodging.
+          </div>
           <div className="flex items-center gap-2 text-sm">
             <span className="text-slate-600">GST registered:</span>
             <span
@@ -624,15 +631,15 @@ function BASTab() {
           </div>
           {!data.gst_registered && (
             <div className="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded p-3">
-              <strong>Not GST-registered.</strong> All GST fields below are
-              shown as zero. Numbers will populate automatically once GST is
-              registered and transactions are recorded with a GST portion.
+              <strong>Not GST-registered.</strong> This company has no BAS GST
+              liability or credits, so the GST summary is zero. Record full gross
+              amounts without a GST split.
             </div>
           )}
           {data.uncategorised_count > 0 && (
             <div className="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded p-3">
               <strong>{data.uncategorised_count} uncategorised transaction{data.uncategorised_count === 1 ? "" : "s"} excluded.</strong>{" "}
-              Categorise them before relying on BAS turnover boxes.
+              Categorise them before relying on the GST summary.
             </div>
           )}
           <Card title={`${fyLabel(data.fy_year)} Q${data.quarter} · ${formatDate(data.period_start)} → ${formatDate(data.period_end)}`}>
@@ -640,7 +647,7 @@ function BASTab() {
             <table className="w-full text-sm">
               <thead className="text-xs text-slate-600 bg-slate-50">
                 <tr>
-                  <th className="text-left px-3 py-2 w-16">Box</th>
+                  <th className="text-left px-3 py-2 w-16">Metric</th>
                   <th className="text-left px-3 py-2">Label</th>
                   <th className="text-right px-3 py-2">Amount</th>
                 </tr>
@@ -658,7 +665,7 @@ function BASTab() {
                 />
                 <BasRow
                   box="Purch."
-                  label="Total purchase outflows (GST Exposure breaks out G10/G11/G14)"
+                  label="Total purchase outflows (bookkeeping total; not a BAS label)"
                   value={data.total_purchases}
                 />
                 <BasRow
@@ -1181,6 +1188,18 @@ function GSTTab() {
 
       {data && (
         <>
+          <div className="text-sm bg-sky-50 border border-sky-200 text-sky-950 rounded p-3">
+            <strong>Diagnostic only — not a BAS or lodgment worksheet.</strong>{" "}
+            Tax-code groupings do not determine ATO labels such as G10, G11 or
+            worksheet adjustments. Reconcile the GST summary to your activity
+            statement and reporting method before lodging.
+          </div>
+          {!data.gst_registered && (
+            <div className="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded p-3">
+              <strong>Not GST-registered.</strong> Tax-code analysis amounts are zero by
+              policy; record full gross amounts without a GST split.
+            </div>
+          )}
           <Card title={`${fyLabel(data.fy_year ?? fyYear)} Q${data.quarter ?? quarter} · ${formatDate(data.period_start)} → ${formatDate(data.period_end)}`}>
             <div className="flex flex-wrap gap-6 px-3 py-3 text-sm">
               <Kpi label="GST on sales (1A)" value={formatMoney(data.one_a_gst_on_sales)} />
@@ -1212,7 +1231,7 @@ function GSTTab() {
           {data.uncategorised_count > 0 && (
             <div className="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded p-3">
               <strong>{data.uncategorised_count} uncategorised transaction{data.uncategorised_count === 1 ? "" : "s"} excluded.</strong>{" "}
-              Categorise them before relying on GST exposure boxes.
+              Categorise them before relying on the tax-code analysis.
             </div>
           )}
 
@@ -1220,22 +1239,22 @@ function GSTTab() {
             <Card title="Sales">
               <table className="w-full max-w-2xl text-sm">
                 <tbody>
-                  <GstBox box="G1" label="Total sales (gross)" value={data.g1_total_sales} />
-                  <GstBox box="G3" label="GST-free sales" value={data.g3_gst_free_sales} />
+                  <GstBox box="Gross" label="Total sales activity" value={data.g1_total_sales} />
+                  <GstBox box="GST-free" label="GST-free coded sales" value={data.g3_gst_free_sales} />
                   <GstBox
-                    box="G4"
-                    label="Input-taxed sales"
+                    box="Input-taxed"
+                    label="Input-taxed coded sales"
                     value={data.g4_input_taxed_sales}
                   />
                   <GstBox
-                    box="G6"
-                    label="Sales subject to GST (G1−G3−G4)"
+                    box="Standard"
+                    label="Sales activity less GST-free/input-taxed codes"
                     value={data.g6_sales_subject_to_gst}
                     bold
                   />
                   <GstBox
-                    box="1A"
-                    label="GST collected"
+                    box="GST"
+                    label="GST on sales activity"
                     value={data.one_a_gst_on_sales}
                     bold
                   />
@@ -1247,23 +1266,23 @@ function GSTTab() {
               <table className="w-full max-w-2xl text-sm">
                 <tbody>
                   <GstBox
-                    box="G10"
-                    label="Capital purchases"
+                    box="Capital"
+                    label="Capital-coded purchase outflows"
                     value={data.g10_capital_purchases}
                   />
                   <GstBox
-                    box="G11"
-                    label="Non-capital purchases"
+                    box="Other"
+                    label="Other BAS-relevant purchase outflows"
                     value={data.g11_non_capital_purchases}
                   />
                   <GstBox
-                    box="G14"
-                    label="GST-free purchases"
+                    box="No GST"
+                    label="GST-free/input-taxed coded outflows (overlaps above)"
                     value={data.g14_gst_free_purchases}
                   />
                   <GstBox
-                    box="1B"
-                    label="GST claimable"
+                    box="GST"
+                    label="GST on purchase activity"
                     value={data.one_b_gst_on_purchases}
                     bold
                   />

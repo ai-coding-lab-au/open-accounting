@@ -9,6 +9,12 @@ import { todayLocal } from "../lib/date";
 import { ConfirmDialog } from "../components/ui/ConfirmDialog";
 import { DateInput } from "../components/ui/DateInput";
 import { blockScientificNotation } from "../lib/numericInput";
+import { useCurrentCompany } from "../lib/useCurrentCompany";
+import {
+  InvoiceAllocationEditor,
+  invoiceControlRequirement,
+  isInvoiceControlAccount,
+} from "../components/bank/InvoiceAllocationEditor";
 import type {
   Account,
   BankAccountWithBalance,
@@ -17,6 +23,7 @@ import type {
   BankImportPreviewRow,
   BankTransaction,
   BankTransactionIn,
+  InvoicePaymentAllocationIn,
   TaxCode,
 } from "../types/api";
 
@@ -42,10 +49,12 @@ async function fetchAccounts(): Promise<Account[]> {
 async function createTransaction(
   accountId: number,
   payload: BankTransactionIn,
+  idempotencyKey: string,
 ): Promise<BankTransaction> {
   const { data } = await api.post<BankTransaction>(
     `/bank-accounts/${accountId}/transactions`,
     payload,
+    { headers: { "Idempotency-Key": idempotencyKey } },
   );
   return data;
 }
@@ -299,6 +308,7 @@ export default function BankAccountPage({ title, blurb }: Props) {
             });
             qc.invalidateQueries({ queryKey: ["bank-accounts", currentId] });
             qc.invalidateQueries({ queryKey: ["dashboard"] });
+            qc.invalidateQueries({ queryKey: ["invoices", currentId] });
             setShowNew(false);
           }}
         />
@@ -453,6 +463,11 @@ function NewTransactionDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const companyQ = useCurrentCompany();
+  const gstRegistered = companyQ.data?.gst_registered === true;
+  // One key per dialog session. React Query retries and explicit resubmits reuse
+  // it, so an unknown response cannot create a second bank transaction.
+  const [idempotencyKey] = useState(() => crypto.randomUUID());
   const today = todayLocal();
   const [direction, setDirection] = useState<"in" | "out">("out");
   const [amount, setAmount] = useState("");
@@ -466,9 +481,20 @@ function NewTransactionDialog({
   const [taxCode, setTaxCode] = useState<
     "standard" | "gst_free" | "input_taxed" | "capital" | "none"
   >("standard");
+  const [invoiceAllocations, setInvoiceAllocations] = useState<
+    InvoicePaymentAllocationIn[]
+  >([]);
+  const [allocationValid, setAllocationValid] = useState(false);
+  const [unappliedAccountId, setUnappliedAccountId] = useState<number | "">("");
+
+  const selectedAccount =
+    accountId === "" ? null : accounts.find((account) => account.id === accountId) ?? null;
+  const controlRequirement = invoiceControlRequirement(selectedAccount, direction);
+  const requiresInvoiceAllocation = !!controlRequirement;
 
   const noGstCodes = new Set(["gst_free", "input_taxed", "none"]);
-  const gstBearing = !noGstCodes.has(taxCode);
+  const effectiveTaxCode: typeof taxCode = gstRegistered ? taxCode : "none";
+  const gstBearing = gstRegistered && !noGstCodes.has(effectiveTaxCode);
   // Standard / capital movements are GST-inclusive by convention: default the
   // GST portion to amount ÷ 11 (matching the reconciliation + import paths) so a
   // manually-entered sale/purchase isn't silently recorded with $0 GST — which
@@ -480,23 +506,42 @@ function NewTransactionDialog({
 
   const mut = useMutation({
     mutationFn: () =>
-      createTransaction(bankAccountId, {
-        direction,
-        amount,
-        occurred_at: occurredAt,
-        counter_party_name: counterParty || null,
-        memo: memo || null,
-        account_id: accountId === "" ? null : accountId,
-        gst_amount: effectiveGst,
-        tax_code: taxCode,
-      }),
+      createTransaction(
+        bankAccountId,
+        {
+          direction,
+          amount,
+          occurred_at: occurredAt,
+          counter_party_name: counterParty || null,
+          memo: memo || null,
+          account_id: accountId === "" ? null : accountId,
+          gst_amount: requiresInvoiceAllocation ? "0" : effectiveGst,
+          tax_code: requiresInvoiceAllocation
+            ? gstRegistered
+              ? "standard"
+              : "none"
+            : effectiveTaxCode,
+          invoice_allocations: requiresInvoiceAllocation ? invoiceAllocations : [],
+          unapplied_account_id:
+            requiresInvoiceAllocation && unappliedAccountId !== ""
+              ? unappliedAccountId
+              : null,
+        },
+        idempotencyKey,
+      ),
     onSuccess: () => onSaved(),
   });
 
   const validAmt = Number(amount) > 0;
   const validGst =
     Number(effectiveGst) >= 0 && Number(effectiveGst) <= Number(amount || 0);
-  const canSave = validAmt && validGst && occurredAt && !mut.isPending;
+  const canSave =
+    !!companyQ.data &&
+    validAmt &&
+    validGst &&
+    occurredAt &&
+    (!requiresInvoiceAllocation || allocationValid) &&
+    !mut.isPending;
   const submit = () => {
     if (canSave) mut.mutate();
   };
@@ -509,15 +554,25 @@ function NewTransactionDialog({
     const outTypes = new Set(["EXPENSE", "COST_OF_SALES"]);
     const others = ["ASSET", "LIABILITY", "EQUITY"];
     const primaryTypes = direction === "in" ? inTypes : outTypes;
-    const primary = accounts.filter((a) => a.active && primaryTypes.has(a.type));
+    const futureDated = occurredAt > today;
+    const directionCompatible = (account: Account) =>
+      (account.code !== "1100" || direction === "in") &&
+      (account.code !== "2000" || direction === "out") &&
+      (!futureDated || !isInvoiceControlAccount(account));
+    const primary = accounts.filter(
+      (a) => a.active && directionCompatible(a) && primaryTypes.has(a.type),
+    );
     const rest = accounts.filter(
       (a) =>
-        a.active && !primaryTypes.has(a.type) && others.includes(a.type),
+        a.active &&
+        directionCompatible(a) &&
+        !primaryTypes.has(a.type) &&
+        others.includes(a.type),
     );
     primary.sort((a, b) => a.code.localeCompare(b.code));
     rest.sort((a, b) => a.code.localeCompare(b.code));
     return { primary, rest };
-  }, [accounts, direction]);
+  }, [accounts, direction, occurredAt, today]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
@@ -537,7 +592,13 @@ function NewTransactionDialog({
                   ? "bg-emerald-600 text-white border-emerald-700"
                   : "bg-surface text-slate-700 border-slate-300 hover:bg-slate-50"
               }`}
-              onClick={() => setDirection("in")}
+              onClick={() => {
+                setDirection("in");
+                setAccountId("");
+                setInvoiceAllocations([]);
+                setUnappliedAccountId("");
+                setAllocationValid(false);
+              }}
             >
               Money in
             </button>
@@ -548,7 +609,13 @@ function NewTransactionDialog({
                   ? "bg-rose-600 text-white border-rose-700"
                   : "bg-surface text-slate-700 border-slate-300 hover:bg-slate-50"
               }`}
-              onClick={() => setDirection("out")}
+              onClick={() => {
+                setDirection("out");
+                setAccountId("");
+                setInvoiceAllocations([]);
+                setUnappliedAccountId("");
+                setAllocationValid(false);
+              }}
             >
               Money out
             </button>
@@ -577,8 +644,22 @@ function NewTransactionDialog({
               <DateInput
                 className="input pr-7"
                 value={occurredAt}
-                onChange={setOccurredAt}
+                onChange={(date) => {
+                  setOccurredAt(date);
+                  if (date > today && isInvoiceControlAccount(selectedAccount)) {
+                    setAccountId("");
+                    setInvoiceAllocations([]);
+                    setUnappliedAccountId("");
+                    setAllocationValid(false);
+                  }
+                }}
               />
+              {occurredAt > today && (
+                <span className="block text-xs text-amber-700 mt-1">
+                  Future transactions cannot use AR/AP invoice controls until their
+                  effective date.
+                </span>
+              )}
             </label>
           </div>
 
@@ -608,9 +689,12 @@ function NewTransactionDialog({
             <select
               className="input"
               value={accountId}
-              onChange={(e) =>
-                setAccountId(e.target.value ? Number(e.target.value) : "")
-              }
+              onChange={(e) => {
+                setAccountId(e.target.value ? Number(e.target.value) : "");
+                setInvoiceAllocations([]);
+                setUnappliedAccountId("");
+                setAllocationValid(false);
+              }}
             >
               <option value="">— Uncategorised —</option>
               {eligible.primary.length > 0 && (
@@ -649,12 +733,29 @@ function NewTransactionDialog({
             )}
           </div>
 
+          {requiresInvoiceAllocation && (
+            <InvoiceAllocationEditor
+              account={selectedAccount}
+              direction={direction}
+              transactionDate={occurredAt}
+              transactionAmount={amount}
+              accounts={accounts}
+              allocations={invoiceAllocations}
+              onChange={setInvoiceAllocations}
+              unappliedAccountId={unappliedAccountId}
+              onUnappliedAccountChange={setUnappliedAccountId}
+              onValidityChange={setAllocationValid}
+              disabled={mut.isPending}
+            />
+          )}
+
           <div className="grid grid-cols-2 gap-3">
             <label className="block text-sm">
               <span className="block text-slate-600 mb-1">GST treatment</span>
               <select
                 className="input"
-                value={taxCode}
+                value={effectiveTaxCode}
+                disabled={!gstRegistered || requiresInvoiceAllocation}
                 onChange={(e) =>
                   setTaxCode(e.target.value as typeof taxCode)
                 }
@@ -669,7 +770,7 @@ function NewTransactionDialog({
             <label className="block text-sm">
               <span className="block text-slate-600 mb-1">
                 GST portion
-                {noGstCodes.has(taxCode) && (
+                {noGstCodes.has(effectiveTaxCode) && (
                   <span className="text-xs text-slate-500"> · disabled</span>
                 )}
               </span>
@@ -679,7 +780,11 @@ function NewTransactionDialog({
                 min="0"
                 className="input disabled:bg-slate-100"
                 value={effectiveGst}
-                disabled={noGstCodes.has(taxCode)}
+                disabled={
+                  !gstRegistered ||
+                  requiresInvoiceAllocation ||
+                  noGstCodes.has(effectiveTaxCode)
+                }
                 onChange={(e) => {
                   setGstTouched(true);
                   setGstAmount(e.target.value);
@@ -689,6 +794,16 @@ function NewTransactionDialog({
               {gstBearing && !gstTouched && Number(amount) > 0 && (
                 <span className="block text-xs text-slate-500 mt-1">
                   Auto: amount ÷ 11 (GST-inclusive). Edit to override.
+                </span>
+              )}
+              {!gstRegistered && companyQ.data && (
+                <span className="block text-xs text-amber-700 mt-1">
+                  Not GST-registered; the full amount is recorded without a GST split.
+                </span>
+              )}
+              {requiresInvoiceAllocation && gstRegistered && (
+                <span className="block text-xs text-blue-700 mt-1">
+                  GST is derived from the selected invoices.
                 </span>
               )}
               {gstBearing && Number(effectiveGst) > Number(amount || 0) && (
@@ -732,7 +847,8 @@ type ImportRow = BankImportPreviewRow & {
   included: boolean;
 };
 
-function importRowGstAmount(row: ImportRow): string {
+function importRowGstAmount(row: ImportRow, gstRegistered: boolean): string {
+  if (!gstRegistered) return "0";
   if (["gst_free", "input_taxed", "none"].includes(row.override_tax_code)) return "0";
   const amount = Number(row.parsed.amount ?? 0);
   if (!Number.isFinite(amount) || amount <= 0) return "0";
@@ -752,6 +868,8 @@ function ImportStatementDialog({
   onImported: () => void;
   onCommitted: () => void;
 }) {
+  const companyQ = useCurrentCompany();
+  const gstRegistered = companyQ.data?.gst_registered === true;
   const [file, setFile] = useState<File | null>(null);
   const [bankFormat, setBankFormat] = useState("auto");
   const [preview, setPreview] = useState<BankImportPreview | null>(null);
@@ -767,6 +885,13 @@ function ImportStatementDialog({
     () => accounts.filter((a) => a.active).sort((a, b) => a.code.localeCompare(b.code)),
     [accounts],
   );
+  const activeAccountsById = useMemo(
+    () => new Map(activeAccounts.map((account) => [account.id, account])),
+    [activeAccounts],
+  );
+  const defersInvoiceAllocation = (row: ImportRow) =>
+    row.override_account_id !== null &&
+    isInvoiceControlAccount(activeAccountsById.get(row.override_account_id));
 
   const previewMut = useMutation({
     mutationFn: async (f: File) => {
@@ -785,13 +910,22 @@ function ImportStatementDialog({
     onSuccess: (p) => {
       setPreview(p);
       setRows(
-        p.rows.map((r) => ({
-          ...r,
-          override_account_id: r.suggested_account_id,
-          override_tax_code: (r.suggested_tax_code ?? "standard") as TaxCode,
-          // Default: include if ok and not duplicate.
-          included: r.ok && !r.is_duplicate,
-        })),
+        p.rows.map((r) => {
+          const suggestedAccount =
+            r.suggested_account_id === null
+              ? null
+              : activeAccountsById.get(r.suggested_account_id);
+          const deferredControl = isInvoiceControlAccount(suggestedAccount);
+          return {
+            ...r,
+            override_account_id: r.suggested_account_id,
+            override_tax_code: deferredControl
+              ? "none"
+              : ((r.suggested_tax_code ?? "standard") as TaxCode),
+            // Default: include if ok and not duplicate.
+            included: r.ok && !r.is_duplicate,
+          };
+        }),
       );
       setError(null);
     },
@@ -803,17 +937,24 @@ function ImportStatementDialog({
       const payload = {
         rows: rows
           .filter((r) => r.included && r.ok && r.parsed.occurred_at && r.parsed.amount && r.parsed.direction)
-          .map((r) => ({
-            occurred_at: r.parsed.occurred_at!,
-            direction: r.parsed.direction!,
-            amount: r.parsed.amount!,
-            dedup_key: r.dedup_key,
-            account_id: r.override_account_id,
-            tax_code: r.override_tax_code,
-            memo: r.parsed.memo,
-            counter_party_name: r.parsed.counter_party_name,
-            gst_amount: importRowGstAmount(r),
-          })),
+          .map((r) => {
+            const deferToReconciliation = defersInvoiceAllocation(r);
+            return {
+              occurred_at: r.parsed.occurred_at!,
+              direction: r.parsed.direction!,
+              amount: r.parsed.amount!,
+              dedup_key: r.dedup_key,
+              account_id: deferToReconciliation ? null : r.override_account_id,
+              tax_code:
+                deferToReconciliation || !gstRegistered ? "none" : r.override_tax_code,
+              memo: r.parsed.memo,
+              counter_party_name: r.parsed.counter_party_name,
+              gst_amount: deferToReconciliation
+                ? "0"
+                : importRowGstAmount(r, gstRegistered),
+              invoice_allocations: [],
+            };
+          }),
       };
       const { data } = await api.post<BankImportCommitResult>(
         `/bank-accounts/${bankAccountId}/import/commit`,
@@ -831,13 +972,21 @@ function ImportStatementDialog({
   const includedCount = rows.filter((r) => r.included).length;
   const duplicateCount = rows.filter((r) => r.is_duplicate).length;
   const issueCount = rows.filter((r) => !r.ok).length;
+  const deferredAllocationCount = rows.filter(
+    (r) => r.included && r.ok && defersInvoiceAllocation(r),
+  ).length;
   // Hide the Counter-party column when nothing populates it (e.g. CommBank
   // statements keep the payee in the description, so it's always empty).
   const showCounterParty = rows.some(
     (r) => (r.parsed.counter_party_name ?? "").trim() !== "",
   );
   const canPreview = !commitResult && !preview && !!file && !previewMut.isPending;
-  const canCommit = !commitResult && !!preview && includedCount > 0 && !commitMut.isPending;
+  const canCommit =
+    !!companyQ.data &&
+    !commitResult &&
+    !!preview &&
+    includedCount > 0 &&
+    !commitMut.isPending;
 
   useModalKeys({
     open: true,
@@ -871,6 +1020,13 @@ function ImportStatementDialog({
                 <>, skipped {commitResult.skipped_duplicates} duplicates</>
               )}
               .
+              {deferredAllocationCount > 0 && (
+                <span className="block mt-2 text-blue-800">
+                  {deferredAllocationCount} invoice payment row(s) were imported as
+                  uncategorised. Open Reconciliation to select the invoices and allocate
+                  each payment.
+                </span>
+              )}
             </div>
           ) : !preview ? (
             <div className="space-y-3">
@@ -937,7 +1093,21 @@ function ImportStatementDialog({
                     {issueCount} row(s) couldn't be parsed
                   </span>
                 )}
+                {deferredAllocationCount > 0 && (
+                  <span className="text-blue-700">
+                    {deferredAllocationCount} require invoice allocation in Reconciliation
+                  </span>
+                )}
               </div>
+
+              {deferredAllocationCount > 0 && (
+                <div className="rounded border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
+                  Statement import does not guess invoice settlements. Rows assigned to
+                  Accounts Receivable (1100) or Accounts Payable (2000) will be imported
+                  safely as uncategorised, with no GST split, then completed in
+                  Reconciliation using explicit invoice allocations.
+                </div>
+              )}
 
               <div className="overflow-auto border border-slate-200 rounded">
                 <table className="w-full min-w-[920px] text-xs">
@@ -1004,21 +1174,28 @@ function ImportStatementDialog({
                                 ? ""
                                 : String(r.override_account_id)
                             }
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              const nextAccountId =
+                                e.target.value === "" ? null : Number(e.target.value);
+                              const nextIsControl = isInvoiceControlAccount(
+                                nextAccountId === null
+                                  ? null
+                                  : activeAccountsById.get(nextAccountId),
+                              );
                               setRows((curr) =>
                                 curr.map((x, j) =>
                                   j === i
                                     ? {
                                         ...x,
-                                        override_account_id:
-                                          e.target.value === ""
-                                            ? null
-                                            : Number(e.target.value),
+                                        override_account_id: nextAccountId,
+                                        override_tax_code: nextIsControl
+                                          ? "none"
+                                          : x.override_tax_code,
                                       }
                                     : x,
                                 ),
-                              )
-                            }
+                              );
+                            }}
                           >
                             <option value="">— uncategorised —</option>
                             {activeAccounts.map((a) => (
@@ -1031,8 +1208,10 @@ function ImportStatementDialog({
                         <td className="px-2 py-1">
                           <select
                             className="border rounded px-1 py-0.5 w-full"
-                            disabled={!r.ok}
-                            value={r.override_tax_code}
+                            disabled={!r.ok || defersInvoiceAllocation(r)}
+                            value={
+                              defersInvoiceAllocation(r) ? "none" : r.override_tax_code
+                            }
                             onChange={(e) =>
                               setRows((curr) =>
                                 curr.map((x, j) =>
@@ -1054,7 +1233,11 @@ function ImportStatementDialog({
                           </select>
                         </td>
                         <td className="px-2 py-1 text-slate-500">
-                          {r.issue ??
+                          {defersInvoiceAllocation(r) ? (
+                            <span className="text-blue-700">
+                              import uncategorised; allocate invoices in Reconciliation
+                            </span>
+                          ) : r.issue ??
                             (r.is_duplicate ? (
                               "duplicate"
                             ) : r.suggestion_source === "rule" && r.matched_rule_description ? (

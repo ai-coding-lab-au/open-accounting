@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { formatDate, formatMoney } from "../lib/format";
@@ -30,8 +30,13 @@ async function fetchAccounts(): Promise<Account[]> {
   return data;
 }
 
-async function createEntry(payload: JournalEntryCreate): Promise<JournalEntry> {
-  const { data } = await api.post<JournalEntry>("/journal", payload);
+async function createEntry(
+  payload: JournalEntryCreate,
+  idempotencyKey: string,
+): Promise<JournalEntry> {
+  const { data } = await api.post<JournalEntry>("/journal", payload, {
+    headers: { "Idempotency-Key": idempotencyKey },
+  });
   return data;
 }
 
@@ -333,6 +338,10 @@ function JournalEntryDialog({
       : [emptyLine("debit"), emptyLine("credit")],
   );
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // Keep one operation key for the lifetime of this create editor. If the
+  // local request times out after the backend committed, pressing Save again
+  // replays the same operation instead of writing a duplicate journal entry.
+  const createIdempotencyKey = useRef(crypto.randomUUID());
 
   const activeAccounts = useMemo(
     () => accounts.filter((a) => a.active).sort((a, b) => a.code.localeCompare(b.code)),
@@ -389,7 +398,7 @@ function JournalEntryDialog({
           reference: reference.trim() || null,
           lines: payloadLines,
         };
-        return createEntry(payload);
+        return createEntry(payload, createIdempotencyKey.current);
       }
     },
     onSuccess: () => onSaved(),

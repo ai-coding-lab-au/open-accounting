@@ -24,7 +24,7 @@ PROJECT_ROOT = BACKEND_ROOT.parent
 sys.path.insert(0, str(BACKEND_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.scripts import seed_realistic
+from backend.scripts import seed_realistic  # noqa: E402
 
 
 HEAD = {"X-Company-Id": seed_realistic.COMPANY_ID}
@@ -46,6 +46,7 @@ def seeded(tmp_path_factory):
     with TestClient(app) as client:
         api = seed_realistic.Api(client)
         summary = seed_realistic.seed(api, reset=False, exercise=False)
+        HEAD["X-Company-Generation"] = summary["company_generation"]
         yield {"client": client, "summary": summary, "data_dir": test_data}
 
 

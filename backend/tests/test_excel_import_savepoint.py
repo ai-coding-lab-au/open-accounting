@@ -39,6 +39,7 @@ def client(monkeypatch, request):
     with TestClient(app) as c:
         r = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
         assert r.status_code == 201, r.text
+        HDR["X-Company-Generation"] = r.json()["generation_id"]
         yield c
 
 

@@ -27,7 +27,7 @@ async function deleteCompany(id: string): Promise<void> {
 
 export default function CompanySwitcher() {
   const qc = useQueryClient();
-  const { currentId, setCurrent } = useCompanyStore();
+  const { currentId, currentGeneration, setCurrent } = useCompanyStore();
   const [showCreate, setShowCreate] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
   const privacyOn = usePrivacyEnabled();
@@ -54,14 +54,30 @@ export default function CompanySwitcher() {
     // another session). Gate on !isFetching: a refetch / hot-reload can briefly
     // return a partial or empty list, and self-healing on that transient state
     // would wrongly reset the user's selected company to companies[0].
-    if (Array.isArray(companies) && companies.length > 0 && !isFetching) {
-      if (!currentId) {
-        setCurrent(companies[0].id);
-      } else if (!companies.some((c) => c.id === currentId)) {
-        setCurrent(companies[0].id);
+    if (Array.isArray(companies) && !isFetching) {
+      if (companies.length === 0) {
+        if (currentId !== null || currentGeneration !== null) setCurrent(null);
+      } else {
+        const selected = companies.find((company) => company.id === currentId);
+        const next = selected ?? companies[0];
+        if (
+          currentId !== next.id ||
+          currentGeneration !== next.generation_id
+        ) {
+          setCurrent(next);
+        }
       }
     }
-  }, [companies, currentId, isLoading, isFetching, setCurrent, autoPromptShown, showCreate]);
+  }, [
+    companies,
+    currentId,
+    currentGeneration,
+    isLoading,
+    isFetching,
+    setCurrent,
+    autoPromptShown,
+    showCreate,
+  ]);
 
   const createMut = useMutation({
     mutationFn: createCompany,
@@ -71,7 +87,7 @@ export default function CompanySwitcher() {
       // still lacks the new id, decides currentId is "invalid", and resets it
       // to companies[0] — so a just-created company never becomes active.
       await qc.refetchQueries({ queryKey: ["companies"] });
-      setCurrent(company.id);
+      setCurrent(company);
       setShowCreate(false);
     },
   });
@@ -87,7 +103,12 @@ export default function CompanySwitcher() {
     },
   });
 
-  const currentCompany = companies?.find((c) => c.id === currentId) ?? null;
+  const currentCompany =
+    companies?.find(
+      (company) =>
+        company.id === currentId &&
+        company.generation_id === currentGeneration,
+    ) ?? null;
 
   return (
     <div className="flex items-center gap-2">
@@ -95,13 +116,18 @@ export default function CompanySwitcher() {
         aria-label="Select company"
         className="border border-slate-300 rounded px-2 py-1 text-sm bg-surface"
         value={currentId ?? ""}
-        onChange={(e) => setCurrent(e.target.value || null)}
+        onChange={(e) => {
+          const selected = companies?.find(
+            (company) => company.id === e.target.value,
+          );
+          setCurrent(selected ?? null);
+        }}
       >
         <option value="" disabled>
           {isLoading ? "Loading…" : "Select company"}
         </option>
         {companies?.map((c) => (
-          <option key={c.id} value={c.id}>
+          <option key={`${c.id}:${c.generation_id}`} value={c.id}>
             {privacyOn ? maskName(c.name, "company") : c.name}
           </option>
         ))}

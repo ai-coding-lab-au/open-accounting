@@ -380,20 +380,28 @@ def render_bas_pdf(*, company: Company, data: dict, signing_agent: StaffMember |
     flow: list[Any] = []
     flow.append(_company_header_row(company, signing_agent))
     flow.append(Spacer(1, 6))
-    flow.append(Paragraph("Business Activity Statement", sty["title"]))
+    flow.append(Paragraph("GST Activity Summary (bookkeeping)", sty["title"]))
     flow.append(Paragraph(
         f"FY{data['fy_year']} Q{data['quarter']} · "
         f"{data['period_start'].strftime('%d %b %Y')} – "
         f"{data['period_end'].strftime('%d %b %Y')}",
         sty["subtitle"],
     ))
+    flow.append(Spacer(1, 6))
+    flow.append(Paragraph(
+        "<b>Bookkeeping aid — not a BAS or lodgment form.</b> These cash-basis "
+        "totals use categorised bank transactions only. Confirm the ATO "
+        "reporting method, attribution, adjustments and required labels before "
+        "lodging.",
+        sty["body"],
+    ))
+    flow.append(Spacer(1, 8))
 
     if not data["gst_registered"]:
         flow.append(Paragraph(
-            "<b>Not GST-registered.</b> All GST fields are zero. "
-            "This report is shown so the structure is available; once the firm "
-            "registers and you start recording GST splits on transactions, the "
-            "numbers below will populate automatically.",
+            "<b>Not GST-registered.</b> This company has no BAS GST liability "
+            "or credits, so the GST summary is zero. "
+            "Record full gross amounts without a GST split.",
             sty["body"],
         ))
         flow.append(Spacer(1, 8))
@@ -401,7 +409,7 @@ def render_bas_pdf(*, company: Company, data: dict, signing_agent: StaffMember |
     if data.get("uncategorised_count", 0):
         flow.append(Paragraph(
             f"<b>{data['uncategorised_count']} uncategorised transaction(s) excluded.</b> "
-            "Categorise them before relying on BAS turnover boxes.",
+            "Categorise them before relying on the GST summary.",
             sty["body"],
         ))
         flow.append(Spacer(1, 8))
@@ -410,7 +418,7 @@ def render_bas_pdf(*, company: Company, data: dict, signing_agent: StaffMember |
         ["Box", "Label", "Amount"],
         ["G1", "Total sales (gross IN on business accounts)", _money(data["g1_total_sales"])],
         ["1A", "GST on sales", _money(data["one_a_gst_on_sales"])],
-        ["Purch.", "Total purchase outflows (GST Exposure breaks out G10/G11/G14)", _money(data["total_purchases"])],
+        ["Purch.", "Total purchase outflows (bookkeeping total; not a BAS label)", _money(data["total_purchases"])],
         ["1B", "GST on purchases", _money(data["one_b_gst_on_purchases"])],
         ["", "Net GST payable / (refund)", _money(data["net_gst_payable"])],
     ]
@@ -586,11 +594,15 @@ def render_balance_sheet_pdf(*, company: Company, data: dict, signing_agent: Sta
             body.append([
                 Paragraph(f"<i>{_esc(g['label'])}</i>", sty["body"]), ""
             ])
-            for l in g["lines"]:
-                name = f"{l['code']} · {l['name']}" if l.get("code") else l["name"]
+            for line in g["lines"]:
+                name = (
+                    f"{line['code']} · {line['name']}"
+                    if line.get("code")
+                    else line["name"]
+                )
                 body.append([
                     Paragraph(_esc_font(name), sty["body"]),
-                    _money(l["balance"]),
+                    _money(line["balance"]),
                 ])
             body.append([
                 Paragraph(f"<i>Subtotal — {_esc(g['label'].lower())}</i>", sty["small"]),
@@ -658,7 +670,7 @@ def render_gst_exposure_pdf(*, company: Company, data: dict, signing_agent: Staf
     flow: list[Any] = []
     flow.append(_company_header_row(company, signing_agent))
     flow.append(Spacer(1, 6))
-    flow.append(Paragraph("GST Exposure (BAS preview)", sty["title"]))
+    flow.append(Paragraph("GST Tax-Code Analysis (bookkeeping)", sty["title"]))
 
     period_start = data["period_start"]
     period_end = data["period_end"]
@@ -671,6 +683,23 @@ def render_gst_exposure_pdf(*, company: Company, data: dict, signing_agent: Staf
         else f"{period_start.strftime('%d %b %Y')} – {period_end.strftime('%d %b %Y')}"
     )
     flow.append(Paragraph(period_label, sty["subtitle"]))
+    flow.append(Spacer(1, 6))
+    flow.append(Paragraph(
+        "<b>Diagnostic only — not a BAS or lodgment worksheet.</b> Tax-code "
+        "groupings do not determine ATO labels such as G10, G11 or worksheet "
+        "adjustments. Reconcile the GST activity summary to your activity "
+        "statement and reporting method before lodging.",
+        sty["body"],
+    ))
+    flow.append(Spacer(1, 8))
+
+    if not company.gst_registered:
+        flow.append(Paragraph(
+            "<b>Not GST-registered.</b> Tax-code analysis amounts are zero by policy. "
+            "Record full gross amounts without a GST split.",
+            sty["body"],
+        ))
+        flow.append(Spacer(1, 8))
 
     def section(title: str, rows: list[tuple[str, str, str]], bold_last: bool) -> Table:
         body: list[list[Any]] = [[
@@ -700,17 +729,21 @@ def render_gst_exposure_pdf(*, company: Company, data: dict, signing_agent: Staf
         return t
 
     sales = [
-        ("G1", "Total sales (gross IN)", _money(data["g1_total_sales"])),
-        ("G3", "GST-free sales", _money(data["g3_gst_free_sales"])),
-        ("G4", "Input-taxed sales", _money(data["g4_input_taxed_sales"])),
-        ("G6", "Sales subject to GST (G1−G3−G4)", _money(data["g6_sales_subject_to_gst"])),
-        ("1A", "GST collected", _money(data["one_a_gst_on_sales"])),
+        ("Gross", "Total sales activity", _money(data["g1_total_sales"])),
+        ("GST-free", "GST-free coded sales", _money(data["g3_gst_free_sales"])),
+        ("Input-taxed", "Input-taxed coded sales", _money(data["g4_input_taxed_sales"])),
+        ("Standard", "Sales less GST-free/input-taxed codes", _money(data["g6_sales_subject_to_gst"])),
+        ("GST", "GST on sales activity", _money(data["one_a_gst_on_sales"])),
     ]
     purchases = [
-        ("G10", "Capital purchases", _money(data["g10_capital_purchases"])),
-        ("G11", "Non-capital purchases", _money(data["g11_non_capital_purchases"])),
-        ("G14", "GST-free purchases", _money(data["g14_gst_free_purchases"])),
-        ("1B", "GST claimable", _money(data["one_b_gst_on_purchases"])),
+        ("Capital", "Capital-coded purchase outflows", _money(data["g10_capital_purchases"])),
+        ("Other", "Other BAS-relevant purchase outflows", _money(data["g11_non_capital_purchases"])),
+        (
+            "No GST",
+            "GST-free/input-taxed outflows (overlaps above)",
+            _money(data["g14_gst_free_purchases"]),
+        ),
+        ("GST", "GST on purchase activity", _money(data["one_b_gst_on_purchases"])),
     ]
 
     flow.append(section("Sales", sales, bold_last=True))
@@ -747,7 +780,7 @@ def render_gst_exposure_pdf(*, company: Company, data: dict, signing_agent: Staf
         flow.append(Spacer(1, 8))
         flow.append(Paragraph(
             f"{data['uncategorised_count']} uncategorised transaction(s) excluded. "
-            "Categorise them before relying on GST exposure boxes.",
+            "Categorise them before relying on the tax-code analysis.",
             sty["small"],
         ))
 

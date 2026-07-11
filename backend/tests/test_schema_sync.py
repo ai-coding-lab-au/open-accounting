@@ -8,10 +8,24 @@ and verifies the sync/detect helpers do the right thing.
 
 from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, Integer, String, create_engine, func, inspect, text
+import pytest
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    create_engine,
+    func,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase
 
-from app.db.schema_sync import detect_drift, sync_missing_columns
+from app.db.schema_sync import detect_drift, require_clean_schema, sync_missing_columns
 
 
 def _fresh_engine():
@@ -201,3 +215,84 @@ def test_sync_adds_func_now_notnull_column_to_populated_table():
             text("SELECT created_at FROM widget WHERE id = 1")
         ).scalar_one()
         assert fresh != "1970-01-01 00:00:00"
+
+
+def test_drift_detects_full_sqlite_enforcement_signature():
+    """Same columns/types cannot conceal missing or counterfeit constraints."""
+
+    class LedgerBase(DeclarativeBase):
+        pass
+
+    class Parent(LedgerBase):
+        __tablename__ = "parent"
+        id = Column(Integer, primary_key=True)
+
+    class Ledger(LedgerBase):
+        __tablename__ = "ledger"
+        __table_args__ = (
+            UniqueConstraint("code", name="uq_ledger_code"),
+            CheckConstraint("amount >= 0", name="ck_ledger_amount_nonneg"),
+            Index("ix_ledger_code", "code"),
+        )
+        id = Column(Integer, primary_key=True)
+        parent_id = Column(
+            Integer,
+            ForeignKey("parent.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+        code = Column(String(20), nullable=False)
+        amount = Column(Integer, nullable=False, server_default=text("0"))
+
+    engine = _fresh_engine()
+    LedgerBase.metadata.create_all(engine)
+    assert detect_drift(engine, LedgerBase, scope="fresh").is_clean
+
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA foreign_keys = OFF"))
+        conn.execute(text("DROP TABLE ledger"))
+        conn.execute(
+            text(
+                "CREATE TABLE ledger ("
+                "id INTEGER, parent_id INTEGER, code VARCHAR(20), amount INTEGER)"
+            )
+        )
+        # Correct name, wrong columns and uniqueness: a name-only check would
+        # incorrectly accept this index.
+        conn.execute(text("CREATE INDEX ix_ledger_code ON ledger (parent_id)"))
+
+    report = detect_drift(engine, LedgerBase, scope="counterfeit")
+    assert not report.is_clean
+    rendered = report.format()
+    assert "primary key mismatch" in rendered
+    assert "parent_id NOT NULL mismatch" in rendered
+    assert "amount default mismatch" in rendered
+    assert "foreign keys mismatch" in rendered
+    assert "CHECK constraints mismatch" in rendered
+    assert "index ix_ledger_code mismatch" in rendered
+    assert "UNIQUE columns mismatch" in rendered
+
+
+def test_master_same_name_wrong_unique_index_is_fail_closed():
+    from app.db.base import MasterBase
+    from app.models import master as _master_models  # noqa: F401
+
+    engine = _fresh_engine()
+    MasterBase.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP INDEX ix_companies_generation_id"))
+        conn.execute(
+            text(
+                "CREATE INDEX ix_companies_generation_id "
+                "ON companies (generation_id)"
+            )
+        )
+
+    report = detect_drift(engine, MasterBase, scope="master")
+    assert not report.is_clean
+    assert "index ix_companies_generation_id mismatch" in report.format()
+    # Other integration tests intentionally reload the app package.  Resolve
+    # the exception class owned by this already-imported function so the test
+    # does not confuse two equivalent class objects from different reloads.
+    recovery_error = require_clean_schema.__globals__["DataRecoveryRequiredError"]
+    with pytest.raises(recovery_error, match="Startup refused"):
+        require_clean_schema(report)

@@ -9,6 +9,7 @@ import InvoiceForm, {
   toCreatePayload,
   type InvoiceFormValues,
 } from "./InvoiceForm";
+import { useCurrentCompany } from "../../lib/useCurrentCompany";
 
 async function uploadPdf(file: File): Promise<PdfUploadResult> {
   const fd = new FormData();
@@ -30,6 +31,7 @@ interface Props {
 
 export default function ImportPdfDialog({ onClose }: Props) {
   const qc = useQueryClient();
+  const companyQ = useCurrentCompany();
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<PdfUploadResult | null>(null);
   const [form, setForm] = useState<InvoiceFormValues>(EMPTY_FORM);
@@ -54,6 +56,7 @@ export default function ImportPdfDialog({ onClose }: Props) {
   const canUpload = !preview && !!file && !uploadMut.isPending;
   const canCreate =
     !!preview &&
+    !!companyQ.data &&
     !createMut.isPending &&
     !!form.contact_name &&
     !!form.invoice_number &&
@@ -63,7 +66,11 @@ export default function ImportPdfDialog({ onClose }: Props) {
   const submit = () => {
     if (!preview) return;
     createMut.mutate(
-      toCreatePayload(form, { source: "pdf", attachment_id: preview.attachment_id })
+      toCreatePayload(form, {
+        source: "pdf",
+        attachment_id: preview.attachment_id,
+        gst_registered: companyQ.data!.gst_registered,
+      })
     );
   };
 

@@ -2,9 +2,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .config import settings
-from .db.master import init_master_db
+from .db.errors import DataRecoveryRequiredError
+from .db.master import init_master_db, validate_company_storage_registry
 from .api.v1 import (
     accounts,
     bank_accounts,
@@ -25,20 +27,25 @@ from .frontend import configure_frontend
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     # Master DB: create tables + reflect-add any new columns.
-    master_added = init_master_db()
+    master_added = init_master_db(allow_create=True)
     if master_added:
         print(
             f"[startup] master: added columns {master_added}",
             flush=True,
         )
 
+    # Reconcile the registry and physical ledgers before any path can lazily
+    # open a company engine. Missing or orphan books require recovery, never an
+    # empty SQLite replacement.
+    validate_company_storage_registry()
+
     # Per-company DBs: same reflection-based sync, then hand-rolled steps
     # for things reflection can't do (drops, rebuilds, partial indexes),
-    # then a drift check so any residual mismatch is loud at startup.
+    # then a fail-closed signature check before any company can serve writes.
     from .db.base import CompanyBase
     from .db.master import MasterSession
     from .db.company import init_company_db, company_session, get_company_engine
-    from .db.schema_sync import detect_drift
+    from .db.schema_sync import detect_drift, require_clean_schema
     from .models.master import Company
     from .services.bank_accounts import seed_default_bank_accounts
 
@@ -61,8 +68,7 @@ async def _lifespan(app: FastAPI):
                 )
             engine = get_company_engine(company.id)
             report = detect_drift(engine, CompanyBase, f"company:{company.id}")
-            if not report.is_clean:
-                print(report.format(), flush=True)
+            require_clean_schema(report)
             with company_session(company.id) as csession:
                 seed_default_bank_accounts(csession)
 
@@ -89,6 +95,18 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(DataRecoveryRequiredError)
+    async def data_recovery_required(_request, exc: DataRecoveryRequiredError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": exc.code,
+                    "message": str(exc),
+                }
+            },
+        )
 
     @app.get("/health", tags=["meta"])
     def health():

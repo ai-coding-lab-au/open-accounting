@@ -49,7 +49,8 @@ export default function InvoiceDetailDrawer({ invoice, onClose }: Props) {
   useModalKeys({ open: true, onClose });
 
   const att = invoice.attachments[0];
-  // Attachment is fetched via axios (which injects X-Company-Id) into a blob URL —
+  // Attachment is fetched via Axios (which injects the full company identity)
+  // into a blob URL —
   // an <iframe src=...> wouldn't send the header, so we use download/open-in-tab instead.
 
   return (

@@ -6,7 +6,8 @@ or transactions — those live in the per-company books.db.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
+from uuid import uuid4
 
 from sqlalchemy import String, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column
@@ -18,6 +19,12 @@ class Company(MasterBase):
     __tablename__ = "companies"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # short slug, used as folder name
+    # A slug can be re-used after deletion, but a generation id never can.  It
+    # lets the API distinguish an old browser tab for company A1 from a newly
+    # created company A2 that happens to use the same folder slug.
+    generation_id: Mapped[str] = mapped_column(
+        String(36), default=lambda: str(uuid4()), nullable=False, unique=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     legal_name: Mapped[str | None] = mapped_column(String(200))
     abn: Mapped[str | None] = mapped_column(String(20))  # Australian Business Number
@@ -59,6 +66,12 @@ class Company(MasterBase):
     operating_bank_swift: Mapped[str | None] = mapped_column(String(20))
 
     default_payment_terms_days: Mapped[int] = mapped_column(default=28, nullable=False)
+
+    # Accounting periods are closed monotonically.  Every dated write path
+    # rejects dates on or before this boundary; keeping the boundary in the
+    # master registry lets the company identity dependency provide one fresh,
+    # authoritative policy snapshot for each request.
+    books_locked_through: Mapped[date | None] = mapped_column()
 
     acn: Mapped[str | None] = mapped_column(String(20))
 

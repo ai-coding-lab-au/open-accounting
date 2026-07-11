@@ -5,6 +5,10 @@ from ...deps import PathId, get_company_db, get_current_company
 from ...models.company import Account, AccountType, BankRule, BankTransaction, InvoiceLine, JournalLine
 from ...models.master import Company
 from ...schemas.company import AccountCreate, AccountOut, AccountUpdate
+from ...services.account_invariants import (
+    financial_reference_labels,
+    protected_system_account_type,
+)
 
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -51,6 +55,11 @@ def create_account(
     _: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
+    if protected_system_account_type(payload.code) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Account code '{payload.code}' is reserved for a system account",
+        )
     if db.query(Account).filter(Account.code == payload.code).first():
         raise HTTPException(status_code=409, detail=f"Account code '{payload.code}' already exists")
     _validate_parent(db, payload.parent_id, None)
@@ -77,6 +86,47 @@ def update_account(
     db: Session = Depends(get_company_db),
 ):
     acc = _get_account_or_404(db, account_id)
+
+    protected_type = protected_system_account_type(acc.code)
+    if protected_type is not None:
+        if payload.code is not None and payload.code != acc.code:
+            raise HTTPException(
+                status_code=409,
+                detail=f"System account {acc.code} cannot change code",
+            )
+        if payload.type is not None and AccountType(payload.type) != protected_type:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"System account {acc.code} must remain type "
+                    f"{protected_type.value}"
+                ),
+            )
+        if payload.active is False:
+            raise HTTPException(
+                status_code=409,
+                detail=f"System account {acc.code} cannot be deactivated",
+            )
+
+    if payload.code is not None and payload.code != acc.code:
+        if protected_system_account_type(payload.code) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Account code '{payload.code}' is reserved for a system account",
+            )
+
+    if payload.type is not None and AccountType(payload.type) != acc.type:
+        references = financial_reference_labels(db, acc.id)
+        if references:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Account type cannot be changed after the account is referenced by "
+                    + ", ".join(references)
+                    + ". Create a new account and use explicit reclassification entries "
+                    "instead."
+                ),
+            )
 
     if payload.code is not None and payload.code != acc.code:
         if db.query(Account).filter(Account.code == payload.code, Account.id != acc.id).first():
@@ -113,9 +163,22 @@ def delete_account(
 ):
     acc = _get_account_or_404(db, account_id)
 
+    if protected_system_account_type(acc.code) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"System account {acc.code} cannot be deleted",
+        )
+
     # Refuse delete if referenced anywhere.
     refs: list[str] = []
-    if db.query(BankTransaction).filter(BankTransaction.account_id == account_id).first():
+    if (
+        db.query(BankTransaction)
+        .filter(
+            (BankTransaction.account_id == account_id)
+            | (BankTransaction.unapplied_account_id == account_id)
+        )
+        .first()
+    ):
         refs.append("bank transactions")
     if db.query(InvoiceLine).filter(InvoiceLine.account_id == account_id).first():
         refs.append("invoice lines")

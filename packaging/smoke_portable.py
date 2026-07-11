@@ -24,10 +24,13 @@ COMPANY = "smoketest"
 
 
 def _request(method: str, path: str, body: dict | None = None,
-             company: str | None = None) -> tuple[int, bytes]:
+             company: str | None = None,
+             company_generation: str | None = None) -> tuple[int, bytes]:
     req = urllib.request.Request(BASE + path, method=method)
     if company:
         req.add_header("X-Company-Id", company)
+    if company_generation:
+        req.add_header("X-Company-Generation", company_generation)
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -70,14 +73,17 @@ def main() -> None:
         status, _ = _request("GET", "/api/nope")
         _check("API 404 not swallowed by SPA fallback", status == 404)
 
-        status, _ = _request("POST", "/api/v1/companies",
-                             {"id": COMPANY, "name": "Smoke Test Pty Ltd"})
+        status, body = _request("POST", "/api/v1/companies",
+                                {"id": COMPANY, "name": "Smoke Test Pty Ltd"})
         _check("create company", status in (200, 201), f"status={status}")
+        company_generation = json.loads(body)["generation_id"]
 
         # CJK client/line text exercises the bundled Noto Sans SC font's
         # frozen-path resolution (app/assets inside _internal) end-to-end.
         status, body = _request("POST", "/api/v1/clients",
-                                {"display_name": "Smoke 张伟 Client"}, company=COMPANY)
+                                {"display_name": "Smoke 张伟 Client"},
+                                company=COMPANY,
+                                company_generation=company_generation)
         _check("create client", status in (200, 201), f"status={status}")
         client_id = json.loads(body)["id"]
 
@@ -90,12 +96,14 @@ def main() -> None:
                            "unit_price": "100.00"}],
             },
             company=COMPANY,
+            company_generation=company_generation,
         )
         _check("create receipt", status in (200, 201), f"status={status} body={body[:200]!r}")
         doc_id = json.loads(body)["id"]
 
         status, body = _request("POST", f"/api/v1/outgoing/{doc_id}/pdf",
-                                company=COMPANY)
+                                company=COMPANY,
+                                company_generation=company_generation)
         _check("receipt PDF renders", status == 200 and body.startswith(b"%PDF-")
                and len(body) > 1000, f"status={status} size={len(body)}")
 
@@ -112,6 +120,7 @@ def main() -> None:
             "GET",
             "/api/v1/reports/profit-loss/pdf?period_start=2026-01-01&period_end=2026-01-31",
             company=COMPANY,
+            company_generation=company_generation,
         )
         _check("report PDF renders", status == 200 and body.startswith(b"%PDF-"),
                f"status={status}")

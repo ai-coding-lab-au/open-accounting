@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -19,16 +20,12 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-PROJECT_ROOT = ROOT.parent
 HEAD = {"X-Company-Id": "tc"}
 
 
 @pytest.fixture()
-def client(monkeypatch, request):
-    test_data = PROJECT_ROOT / "tmp" / "tests" / request.node.name
-    if test_data.exists():
-        import shutil
-        shutil.rmtree(test_data)
+def client(monkeypatch, tmp_path):
+    test_data = tmp_path / "data"
     test_data.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setenv("DATA_DIR", str(test_data))
@@ -37,7 +34,8 @@ def client(monkeypatch, request):
             del sys.modules[mod]
     from app.main import app
     with TestClient(app) as c:
-        c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        company = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        HEAD["X-Company-Generation"] = company.json()["generation_id"]
         yield c
 
 
@@ -74,8 +72,12 @@ def test_create_balanced_entry(client, accounts):
     body = r.json()
     assert body["memo"] == "Opening balance — owner contribution"
     assert len(body["lines"]) == 2
-    debit_line = next(l for l in body["lines"] if l["account_id"] == bank["id"])
-    credit_line = next(l for l in body["lines"] if l["account_id"] == capital["id"])
+    debit_line = next(
+        line for line in body["lines"] if line["account_id"] == bank["id"]
+    )
+    credit_line = next(
+        line for line in body["lines"] if line["account_id"] == capital["id"]
+    )
     assert debit_line["debit_amount"] == "5000.00"
     assert credit_line["credit_amount"] == "5000.00"
 
@@ -202,6 +204,30 @@ def test_single_line_entry_rejected(client, accounts):
     assert r.status_code in (400, 422)
 
 
+@pytest.mark.parametrize("field", ["debit_amount", "credit_amount"])
+def test_oversized_money_rejected_before_commit(client, accounts, field):
+    bank = accounts["1000"]
+    capital = accounts["3000"]
+    debit = {"account_id": bank["id"], "debit_amount": "100.00"}
+    credit = {"account_id": capital["id"], "credit_amount": "100.00"}
+    (debit if field == "debit_amount" else credit)[field] = "1e100"
+
+    response = client.post(
+        "/api/v1/journal",
+        headers=HEAD,
+        json={
+            "entry_date": "2026-05-01",
+            "memo": "Oversized amount must never commit",
+            "lines": [debit, credit],
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    listing = client.get("/api/v1/journal", headers=HEAD)
+    assert listing.status_code == 200, listing.text
+    assert listing.json() == []
+
+
 def test_unknown_account_rejected(client, accounts):
     capital = accounts["3000"]
     r = client.post(
@@ -223,10 +249,10 @@ def test_unknown_account_rejected(client, accounts):
 def test_inactive_account_rejected(client, accounts):
     """If an account is deactivated, new entries can't reference it."""
     bank = accounts["1000"]
-    capital = accounts["3000"]
+    drawings = accounts["3100"]
     # Deactivate one account.
     r = client.patch(
-        f"/api/v1/accounts/{capital['id']}",
+        f"/api/v1/accounts/{drawings['id']}",
         headers=HEAD,
         json={"active": False},
     )
@@ -240,7 +266,7 @@ def test_inactive_account_rejected(client, accounts):
             "memo": "Tries to use inactive account",
             "lines": [
                 {"account_id": bank["id"], "debit_amount": "100.00"},
-                {"account_id": capital["id"], "credit_amount": "100.00"},
+                {"account_id": drawings["id"], "credit_amount": "100.00"},
             ],
         },
     )
@@ -268,6 +294,133 @@ def _create_entry(client, accounts, *, memo="seed entry", entry_date="2026-05-01
     r = client.post("/api/v1/journal", headers=HEAD, json=payload)
     assert r.status_code == 201, r.text
     return r.json()
+
+
+def _idempotent_payload(accounts, *, memo="idempotent entry"):
+    return {
+        "entry_date": "2026-05-01",
+        "memo": memo,
+        "reference": "IDEM-REF",
+        "lines": [
+            {"account_id": accounts["1000"]["id"], "debit_amount": "100.00"},
+            {"account_id": accounts["3000"]["id"], "credit_amount": "100.00"},
+        ],
+    }
+
+
+def test_idempotency_key_replay_returns_original_entry(client, accounts):
+    headers = {**HEAD, "Idempotency-Key": "journal-replay-1"}
+    payload = _idempotent_payload(accounts)
+
+    first = client.post("/api/v1/journal", headers=headers, json=payload)
+    replay = client.post("/api/v1/journal", headers=headers, json=payload)
+
+    assert first.status_code == 201, first.text
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    assert len(client.get("/api/v1/journal", headers=HEAD).json()) == 1
+
+
+def test_idempotency_key_normalises_equivalent_money(client, accounts):
+    headers = {**HEAD, "Idempotency-Key": "journal-replay-decimal"}
+    first_payload = _idempotent_payload(accounts)
+    replay_payload = _idempotent_payload(accounts)
+    replay_payload["lines"][0]["debit_amount"] = "100.0"
+    replay_payload["lines"][1]["credit_amount"] = "100.000"
+
+    first = client.post("/api/v1/journal", headers=headers, json=first_payload)
+    replay = client.post("/api/v1/journal", headers=headers, json=replay_payload)
+
+    assert first.status_code == 201, first.text
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+
+
+def test_idempotency_key_reuse_with_different_payload_returns_409(client, accounts):
+    headers = {**HEAD, "Idempotency-Key": "journal-conflict-1"}
+    first = client.post(
+        "/api/v1/journal",
+        headers=headers,
+        json=_idempotent_payload(accounts, memo="first payload"),
+    )
+    conflict = client.post(
+        "/api/v1/journal",
+        headers=headers,
+        json=_idempotent_payload(accounts, memo="different payload"),
+    )
+
+    assert first.status_code == 201, first.text
+    assert conflict.status_code == 409, conflict.text
+    assert "different" in conflict.json()["detail"].lower()
+    assert len(client.get("/api/v1/journal", headers=HEAD).json()) == 1
+
+
+def test_concurrent_same_idempotency_key_creates_one_entry(client, accounts):
+    headers = {**HEAD, "Idempotency-Key": "journal-concurrent-1"}
+    payload = _idempotent_payload(accounts)
+
+    def create():
+        return client.post("/api/v1/journal", headers=headers, json=payload)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: create(), range(2)))
+
+    assert [response.status_code for response in responses] == [201, 201]
+    assert len({response.json()["id"] for response in responses}) == 1
+    assert len(client.get("/api/v1/journal", headers=HEAD).json()) == 1
+
+
+def test_service_concurrent_same_key_serialises_across_sessions(client, accounts):
+    """Exercise BEGIN IMMEDIATE without the API's in-process lifecycle lock."""
+
+    from app.db.company import company_session
+    from app.schemas.journal import JournalEntryCreate
+    from app.services import journal as journal_service
+
+    payload = JournalEntryCreate.model_validate(_idempotent_payload(accounts))
+
+    def create():
+        with company_session("tc") as session:
+            entry = journal_service.create_entry(
+                session,
+                payload,
+                idempotency_key="journal-service-concurrent-1",
+            )
+            return entry.id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        entry_ids = list(pool.map(lambda _: create(), range(2)))
+
+    assert len(set(entry_ids)) == 1
+    assert len(client.get("/api/v1/journal", headers=HEAD).json()) == 1
+
+
+def test_concurrent_same_key_different_payload_has_one_winner(client, accounts):
+    headers = {**HEAD, "Idempotency-Key": "journal-concurrent-conflict"}
+    payloads = [
+        _idempotent_payload(accounts, memo="concurrent A"),
+        _idempotent_payload(accounts, memo="concurrent B"),
+    ]
+
+    def create(payload):
+        return client.post("/api/v1/journal", headers=headers, json=payload)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(create, payloads))
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    assert len(client.get("/api/v1/journal", headers=HEAD).json()) == 1
+
+
+def test_idempotency_key_length_is_bounded(client, accounts):
+    response = client.post(
+        "/api/v1/journal",
+        headers={**HEAD, "Idempotency-Key": "x" * 129},
+        json=_idempotent_payload(accounts),
+    )
+
+    assert response.status_code == 422, response.text
+    assert client.get("/api/v1/journal", headers=HEAD).json() == []
 
 
 def test_get_and_list(client, accounts):
@@ -327,7 +480,7 @@ def test_list_filters_by_query_and_date_range(client, accounts):
 
 def test_update_memo_only_keeps_lines(client, accounts):
     e = _create_entry(client, accounts)
-    original_line_ids = {l["id"] for l in e["lines"]}
+    original_line_ids = {line["id"] for line in e["lines"]}
 
     r = client.patch(
         f"/api/v1/journal/{e['id']}",
@@ -337,7 +490,7 @@ def test_update_memo_only_keeps_lines(client, accounts):
     assert r.status_code == 200
     body = r.json()
     assert body["memo"] == "renamed"
-    assert {l["id"] for l in body["lines"]} == original_line_ids
+    assert {line["id"] for line in body["lines"]} == original_line_ids
 
 
 def test_update_replaces_lines_when_provided(client, accounts):
@@ -358,7 +511,7 @@ def test_update_replaces_lines_when_provided(client, accounts):
     assert r.status_code == 200
     body = r.json()
     assert len(body["lines"]) == 2
-    assert sum(float(l["debit_amount"]) for l in body["lines"]) == 2500.0
+    assert sum(float(line["debit_amount"]) for line in body["lines"]) == 2500.0
 
 
 def test_update_with_unbalanced_lines_rejected(client, accounts):

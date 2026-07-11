@@ -10,11 +10,18 @@ import { usePrivacyEnabled } from "../../lib/usePrivacy";
 import type { OutgoingDocument } from "../../types/api";
 import { displayDocNumber, displayName, formatDate, formatMoney, statusBadgeClass, statusLabel } from "../../lib/format";
 
-async function fetchPdfBlob(id: number, companyId: string): Promise<Blob> {
+async function fetchPdfBlob(
+  id: number,
+  companyId: string,
+  companyGeneration: string,
+): Promise<Blob> {
   const res = await api.post(`/outgoing/${id}/pdf`, null, {
     params: { inline: true },
     responseType: "blob",
-    headers: { "X-Company-Id": companyId },
+    headers: {
+      "X-Company-Id": companyId,
+      "X-Company-Generation": companyGeneration,
+    },
   });
   return res.data as Blob;
 }
@@ -42,6 +49,7 @@ export default function OutgoingDetailDrawer({
 }) {
   const qc = useQueryClient();
   const companyId = useCompanyStore((s) => s.currentId);
+  const companyGeneration = useCompanyStore((s) => s.currentGeneration);
   const privacyOn = usePrivacyEnabled();
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -49,22 +57,23 @@ export default function OutgoingDetailDrawer({
   const [showEdit, setShowEdit] = useState(false);
   const [confirmVoid, setConfirmVoid] = useState(false);
   const detailQuery = useQuery({
-    // Keyed by company id too (like the list queries) so a company switch
-    // never flashes another company's cached document PII.
-    queryKey: ["outgoing-detail", companyId, doc.id],
+    // Keyed by the full company identity so a switch or same-id recreation
+    // never flashes another database generation's cached document PII.
+    queryKey: ["outgoing-detail", companyId, companyGeneration, doc.id],
     queryFn: () => fetchOutgoingDoc(doc.id),
     retry: false,
+    enabled: !!companyId && !!companyGeneration,
   });
   const currentDoc = detailQuery.data ?? doc;
   const actionLoading = detailQuery.isFetching;
 
   useEffect(() => {
-    if (!companyId) return;
+    if (!companyId || !companyGeneration) return;
     let cancelled = false;
     let url: string | null = null;
     setLoading(true);
     setError(null);
-    fetchPdfBlob(doc.id, companyId)
+    fetchPdfBlob(doc.id, companyId, companyGeneration)
       .then((blob) => {
         if (cancelled) return;
         url = URL.createObjectURL(blob);
@@ -81,13 +90,15 @@ export default function OutgoingDetailDrawer({
       cancelled = true;
       if (url) URL.revokeObjectURL(url);
     };
-  }, [doc.id, companyId, currentDoc.updated_at]);
+  }, [doc.id, companyId, companyGeneration, currentDoc.updated_at]);
 
   const restoreMut = useMutation({
     mutationFn: () => restoreDoc(doc.id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["outgoing"] });
-      qc.invalidateQueries({ queryKey: ["outgoing-detail", companyId, doc.id] });
+      qc.invalidateQueries({
+        queryKey: ["outgoing-detail", companyId, companyGeneration, doc.id],
+      });
       qc.invalidateQueries({ queryKey: ["dashboard"] });
       onClose();
     },
@@ -97,7 +108,9 @@ export default function OutgoingDetailDrawer({
     mutationFn: () => voidDoc(doc.id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["outgoing"] });
-      qc.invalidateQueries({ queryKey: ["outgoing-detail", companyId, doc.id] });
+      qc.invalidateQueries({
+        queryKey: ["outgoing-detail", companyId, companyGeneration, doc.id],
+      });
       qc.invalidateQueries({ queryKey: ["dashboard"] });
       onClose();
     },
@@ -236,7 +249,10 @@ export default function OutgoingDetailDrawer({
           doc={currentDoc}
           onClose={() => setShowEdit(false)}
           onSaved={(updated) => {
-            qc.setQueryData(["outgoing-detail", companyId, updated.id], updated);
+            qc.setQueryData(
+              ["outgoing-detail", companyId, companyGeneration, updated.id],
+              updated,
+            );
             setShowEdit(false);
           }}
         />

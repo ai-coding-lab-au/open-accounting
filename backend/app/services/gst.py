@@ -13,8 +13,9 @@ quarterly boxes:
 
   Purchases (OUT):
     G10  = Capital purchases      (OUT with tax_code=capital)
-    G11  = Non-capital purchases  (OUT with tax_code=standard)
-    G14  = GST-free purchases     (OUT with tax_code=gst_free)
+    G11  = Non-capital purchases  (all other BAS-relevant OUT tax codes)
+    G14  = Purchases without GST in the price (GST-free / input-taxed,
+           plus capital rows carrying no GST)
     1B   = GST on purchases       = Σ gst_amount on OUT with tax_code in (standard, capital)
 
   Net:
@@ -31,17 +32,19 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from ..models.company import (
     Account,
-    AccountType,
     BankAccount,
     BankTransaction,
     BankTxnDirection,
+    InvoiceDirection,
+    InvoicePaymentAllocation,
     TaxCode,
 )
 from .reports import _au_fy_quarter_bounds
+from .transaction_classification import bank_event_is_sale
 
 
 ZERO = Decimal("0")
@@ -52,6 +55,7 @@ def gst_exposure(
     *,
     period_start: date,
     period_end: date,
+    gst_registered: bool = True,
 ) -> dict:
     """GST exposure for a period, computed on a CASH BASIS.
 
@@ -73,6 +77,11 @@ def gst_exposure(
     """
     if period_start > period_end:
         raise ValueError("period_start must be <= period_end")
+    if not gst_registered:
+        # A non-registered entity has no BAS GST boxes. Write paths reject new
+        # GST splits; returning the policy-zero view here also prevents legacy
+        # inconsistent rows from being presented as a lodgable BAS.
+        return _empty(period_start, period_end)
 
     biz_ids = [b.id for b in db.query(BankAccount).all()]
     if not biz_ids:
@@ -80,6 +89,14 @@ def gst_exposure(
 
     txns = (
         db.query(BankTransaction)
+        .options(
+            selectinload(BankTransaction.invoice_allocations).selectinload(
+                InvoicePaymentAllocation.tax_components
+            ),
+            selectinload(BankTransaction.invoice_allocations).selectinload(
+                InvoicePaymentAllocation.invoice
+            ),
+        )
         .filter(
             BankTransaction.bank_account_id.in_(biz_ids),
             BankTransaction.occurred_at >= period_start,
@@ -94,9 +111,9 @@ def gst_exposure(
     G4 = ZERO   # IN input_taxed
     one_A = ZERO  # GST on standard IN
 
-    G10 = ZERO  # OUT capital
-    G11 = ZERO  # OUT standard non-capital
-    G14 = ZERO  # OUT gst_free
+    G10 = ZERO  # capital purchases (TaxCode.CAPITAL)
+    G11 = ZERO  # every other BAS-relevant purchase
+    G14 = ZERO  # purchases without GST in the price; overlaps G10/G11
     one_B = ZERO  # GST on standard + capital OUT
     total_purchases = ZERO  # all OUT gross (excl. tax_code=none); consumed by reports.bas()
 
@@ -115,6 +132,60 @@ def gst_exposure(
         return account_cache[aid]
 
     for t in txns:
+        if t.invoice_allocations:
+            allocated_gross = ZERO
+            component_gross = ZERO
+            for allocation in t.invoice_allocations:
+                allocated_gross += Decimal(allocation.amount)
+                invoice_direction = (
+                    allocation.invoice.direction.value
+                    if hasattr(allocation.invoice.direction, "value")
+                    else str(allocation.invoice.direction)
+                )
+                treat_as_sale = invoice_direction == InvoiceDirection.AR.value
+                for component in allocation.tax_components:
+                    try:
+                        tc = TaxCode(component.tax_code)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            f"Payment allocation {allocation.id} has invalid tax "
+                            f"component {component.tax_code!r}."
+                        ) from exc
+                    amt = Decimal(component.gross_amount)
+                    gst = Decimal(component.gst_amount)
+                    component_gross += amt
+                    if tc == TaxCode.NONE:
+                        excluded_count += 1
+                        continue
+                    if treat_as_sale:
+                        G1 += amt
+                        if tc == TaxCode.GST_FREE:
+                            G3 += amt
+                        elif tc == TaxCode.INPUT_TAXED:
+                            G4 += amt
+                        elif tc == TaxCode.STANDARD:
+                            one_A += gst
+                    else:
+                        total_purchases += amt
+                        if tc == TaxCode.CAPITAL:
+                            G10 += amt
+                        else:
+                            G11 += amt
+                        if tc in (TaxCode.STANDARD, TaxCode.CAPITAL):
+                            one_B += gst
+                        if tc in (TaxCode.GST_FREE, TaxCode.INPUT_TAXED) or (
+                            tc == TaxCode.CAPITAL and gst == 0
+                        ):
+                            G14 += amt
+            if component_gross != allocated_gross:
+                raise RuntimeError(
+                    f"Bank transaction {t.id} has incomplete invoice-payment tax "
+                    "composition; remove and re-allocate it before reporting GST."
+                )
+            # Any unapplied overpayment/prepayment remainder is deliberately
+            # outside BAS until the operator applies or otherwise classifies it.
+            continue
+
         try:
             tc = TaxCode(t.tax_code) if isinstance(t.tax_code, str) else t.tax_code
         except ValueError:
@@ -136,12 +207,12 @@ def gst_exposure(
         # mirroring the contra logic reports.py uses for the P&L so BAS and P&L
         # agree on cross-type rows. Rows without a resolved account are skipped
         # above and counted separately.
-        if acc.type in (AccountType.EXPENSE, AccountType.COST_OF_SALES):
-            treat_as_sale = False
-        elif acc.type == AccountType.INCOME:
-            treat_as_sale = True
-        else:
-            treat_as_sale = t.direction == BankTxnDirection.IN
+        treat_as_sale = bank_event_is_sale(
+            account_code=acc.code,
+            account_type=acc.type,
+            tax_code=tc,
+            direction=t.direction,
+        )
 
         # +1 when the txn's direction agrees with its category (a true sale on an
         # IN, or a purchase on an OUT); -1 for the cross-type refund leg.
@@ -161,21 +232,26 @@ def gst_exposure(
                 G4 += amt
             elif tc == TaxCode.STANDARD:
                 one_A += gst
-            # CAPITAL on the sale side is unusual (asset sale) — count its GST too.
-            elif tc == TaxCode.CAPITAL:
-                one_A += gst
         else:
             total_purchases += amt
-            if tc == TaxCode.CAPITAL:
+            # ATO worksheet membership overlaps: every purchase belongs in
+            # G10 (capital) or G11 (non-capital), while purchases without GST
+            # in the price ALSO belong in G14. The sign already handles
+            # cross-type refunds/decreasing adjustments.
+            # Capital is an explicit, stable tax dimension. Account types and
+            # user-defined account codes are not reliable capital classifiers
+            # (for example, inventory is commonly an ASSET but belongs at G11).
+            is_capital_purchase = tc == TaxCode.CAPITAL
+            if is_capital_purchase:
                 G10 += amt
-                one_B += gst
-            elif tc == TaxCode.STANDARD:
+            else:
                 G11 += amt
+            if tc in (TaxCode.STANDARD, TaxCode.CAPITAL):
                 one_B += gst
-            elif tc == TaxCode.GST_FREE:
+            if tc in (TaxCode.GST_FREE, TaxCode.INPUT_TAXED) or (
+                tc == TaxCode.CAPITAL and gst == 0
+            ):
                 G14 += amt
-            # INPUT_TAXED on a purchase: not separately broken out in this
-            # simplified view; the gross still doesn't contribute to G11/G10.
 
     G6 = G1 - G3 - G4
     net_gst = one_A - one_B
@@ -199,9 +275,20 @@ def gst_exposure(
     }
 
 
-def gst_exposure_for_quarter(db: Session, *, fy_year: int, quarter: int) -> dict:
+def gst_exposure_for_quarter(
+    db: Session,
+    *,
+    fy_year: int,
+    quarter: int,
+    gst_registered: bool = True,
+) -> dict:
     start, end = _au_fy_quarter_bounds(fy_year, quarter)
-    out = gst_exposure(db, period_start=start, period_end=end)
+    out = gst_exposure(
+        db,
+        period_start=start,
+        period_end=end,
+        gst_registered=gst_registered,
+    )
     out["fy_year"] = fy_year
     out["quarter"] = quarter
     return out

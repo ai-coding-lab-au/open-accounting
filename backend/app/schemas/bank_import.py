@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .bank import InvoicePaymentAllocationIn, check_txn_date
+from ._limits import SQLITE_EXACT_MONEY_MAX, SQLITE_INT_MAX
 from ._money import Money
 
 
@@ -20,7 +23,7 @@ _TAX_CODE_PATTERN = r"^(standard|gst_free|input_taxed|capital|none)$"
 _DIRECTION_PATTERN = r"^(in|out)$"
 
 # Money column shape: NUMERIC(16, 2) — matches the posted-money fields elsewhere.
-_MONEY_MAX = Decimal("99999999999999.99")
+_MONEY_MAX = SQLITE_EXACT_MONEY_MAX
 
 
 # Catastrophic-backtracking (ReDoS) signature: a quantifier applied to a group
@@ -125,7 +128,7 @@ def _validate_regex(v: str | None) -> str | None:
 
 
 class BankRuleBase(BaseModel):
-    priority: int = Field(default=100, ge=0)
+    priority: int = Field(default=100, ge=0, le=SQLITE_INT_MAX)
     is_active: bool = True
     description: str = Field(min_length=1, max_length=200)
 
@@ -135,7 +138,7 @@ class BankRuleBase(BaseModel):
     match_memo_regex: str | None = Field(default=None, max_length=500)
     match_counter_party_regex: str | None = Field(default=None, max_length=500)
 
-    set_account_id: int
+    set_account_id: int = Field(ge=1, le=SQLITE_INT_MAX)
     set_tax_code: str = Field(default="standard", pattern=_TAX_CODE_PATTERN)
 
     _check_regex = field_validator(
@@ -148,7 +151,7 @@ class BankRuleCreate(BankRuleBase):
 
 
 class BankRuleUpdate(BaseModel):
-    priority: int | None = Field(default=None, ge=0)
+    priority: int | None = Field(default=None, ge=0, le=SQLITE_INT_MAX)
     is_active: bool | None = None
     description: str | None = Field(default=None, min_length=1, max_length=200)
     match_direction: str | None = Field(default=None, pattern=_DIRECTION_PATTERN)
@@ -156,12 +159,33 @@ class BankRuleUpdate(BaseModel):
     match_amount_max: Decimal | None = Field(default=None, ge=0, le=_MONEY_MAX, decimal_places=2)
     match_memo_regex: str | None = Field(default=None, max_length=500)
     match_counter_party_regex: str | None = Field(default=None, max_length=500)
-    set_account_id: int | None = None
+    set_account_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     set_tax_code: str | None = Field(default=None, pattern=_TAX_CODE_PATTERN)
 
     _check_regex = field_validator(
         "match_memo_regex", "match_counter_party_regex"
     )(_validate_regex)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_null_for_required_columns(cls, data: Any) -> Any:
+        """Optional means "may be omitted" for required database columns.
+
+        Match predicates are genuinely nullable and an explicit null clears
+        them.  The remaining fields map to NOT NULL columns, so reject an
+        explicit null as validation instead of letting it fail at commit time.
+        """
+        if isinstance(data, dict):
+            for field in (
+                "priority",
+                "is_active",
+                "description",
+                "set_account_id",
+                "set_tax_code",
+            ):
+                if field in data and data[field] is None:
+                    raise ValueError(f"{field} cannot be null")
+        return data
 
 
 class BankRuleOut(BaseModel):
@@ -219,18 +243,48 @@ class BankImportPreviewOut(BaseModel):
 
 
 class BankImportCommitRow(BaseModel):
-    occurred_at: str
+    """One accepted preview row at the untrusted commit API boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    occurred_at: date
     direction: str = Field(pattern=_DIRECTION_PATTERN)
-    amount: str
-    dedup_key: str | None = None
-    account_id: int | None = None
+    amount: Decimal = Field(
+        gt=0,
+        le=_MONEY_MAX,
+        max_digits=16,
+        decimal_places=2,
+    )
+    # Retained for wire compatibility with preview clients.  Commit never
+    # trusts this value; the service recomputes its own canonical key.
+    dedup_key: str | None = Field(default=None, max_length=64)
+    account_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     tax_code: str = Field(default="standard", pattern=_TAX_CODE_PATTERN)
-    memo: str | None = None
-    counter_party_name: str | None = None
-    gst_amount: str = "0"
+    memo: str | None = Field(default=None, max_length=500)
+    counter_party_name: str | None = Field(default=None, max_length=200)
+    gst_amount: Decimal = Field(
+        default=Decimal("0"),
+        ge=0,
+        le=_MONEY_MAX,
+        max_digits=16,
+        decimal_places=2,
+    )
+    invoice_allocations: list[InvoicePaymentAllocationIn] = Field(
+        default_factory=list, max_length=500
+    )
+    unapplied_account_id: int | None = Field(
+        default=None, ge=1, le=SQLITE_INT_MAX
+    )
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _reportable_date(cls, value: date) -> date:
+        return check_txn_date(value)
 
 
 class BankImportCommitIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     rows: list[BankImportCommitRow]
 
 

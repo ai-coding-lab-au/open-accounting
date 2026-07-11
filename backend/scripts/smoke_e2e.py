@@ -48,16 +48,18 @@ def wait_healthy(c: httpx.Client, deadline: float = 30.0) -> None:
 
 
 def run_flow(c: httpx.Client) -> None:
-    H = {"X-Company-Id": "smoke"}
-
-    ok("create company", c.post(f"{BASE}/companies", json={
+    company = ok("create company", c.post(f"{BASE}/companies", json={
         "id": "smoke", "name": "Smoke Test Pty Ltd", "gst_registered": True}), 201)
+    H = {
+        "X-Company-Id": "smoke",
+        "X-Company-Generation": company["generation_id"],
+    }
     accounts = ok("CoA seeded", c.get(f"{BASE}/accounts", headers=H))
     assert any(a["code"] == "4000" for a in accounts)
     banks = ok("bank account seeded", c.get(f"{BASE}/bank-accounts", headers=H))
     assert len(banks) == 1
 
-    staff = ok("create staff (LPN)", c.post(f"{BASE}/staff", headers=H, json={
+    ok("create staff (LPN)", c.post(f"{BASE}/staff", headers=H, json={
         "full_name": "Jane Doe", "registration_type": "lpn",
         "registration_number": "12345"}), 201)
     client_row = ok("create client", c.post(f"{BASE}/clients", headers=H, json={
@@ -75,7 +77,7 @@ def run_flow(c: httpx.Client) -> None:
     print("  ok receipt PDF renders")
 
     ok("manual bank txn", c.post(f"{BASE}/bank-accounts/{banks[0]['id']}/transactions",
-        headers=H, json={
+        headers={**H, "Idempotency-Key": "smoke-bank-1"}, json={
             "direction": "in", "amount": "3000.00", "occurred_at": "2026-07-01",
             "memo": "Receipt payment",
             "account_id": next(a["id"] for a in accounts if a["code"] == "4000")}), 201)
@@ -94,7 +96,7 @@ def run_flow(c: httpx.Client) -> None:
         "direction": "AP", "contact_id": contact["id"], "invoice_number": "INV-1",
         "issue_date": "2026-07-01", "gst_inclusive": True,
         "subtotal": "100.00", "gst_amount": "10.00", "total": "110.00",
-        "lines": [{"description": "Stationery", "quantity": "1", "unit_price": "110.00",
+        "lines": [{"description": "Stationery", "quantity": "1", "unit_price": "100.00",
                    "line_subtotal": "100.00", "line_gst": "10.00", "line_total": "110.00",
                    "account_id": next(a["id"] for a in accounts if a["type"] == "EXPENSE")}],
     }), 201)

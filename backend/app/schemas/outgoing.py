@@ -7,12 +7,13 @@ from decimal import Decimal
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ._currency import normalise_aud
+from ._limits import SQLITE_EXACT_MONEY_MAX, SQLITE_INT_MAX
 from ._money import Money
 
-_MONEY_MAX = Decimal("99999999999999.99")
-_MONEY_MIN = Decimal("-99999999999999.99")
+_MONEY_MAX = SQLITE_EXACT_MONEY_MAX
 
 
 class OutgoingLineIn(BaseModel):
@@ -49,15 +50,15 @@ class OutgoingCreate(BaseModel):
     doc_type: str = Field(default="receipt", pattern="^receipt$")
     issue_date: date
 
-    customer_id: int | None = None
-    client_ref_id: int | None = None
+    customer_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
+    client_ref_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     customer_name: str | None = Field(default=None, min_length=1, max_length=200)
     customer_address: str | None = Field(default=None, max_length=500)
     customer_email: str | None = Field(default=None, max_length=200)
     customer_phone: str | None = Field(default=None, max_length=50)
 
     currency: str = Field(default="AUD", min_length=3, max_length=3)
-    lines: list[OutgoingLineIn] = Field(default_factory=list)
+    lines: list[OutgoingLineIn] = Field(min_length=1, max_length=500)
     notes: str | None = Field(default=None, max_length=1000)
     payment_method: str | None = Field(default=None, max_length=100)
     paid_date: date | None = None
@@ -68,6 +69,11 @@ class OutgoingCreate(BaseModel):
         default=None, max_length=40, pattern=r"^[A-Za-z0-9._-]+$"
     )
 
+    @field_validator("currency", mode="before")
+    @classmethod
+    def _aud_only(cls, v):
+        return normalise_aud(v)
+
 
 class OutgoingUpdate(BaseModel):
     # Reject unknown fields (e.g. an attempt to PATCH `doc_number`, which is
@@ -75,8 +81,8 @@ class OutgoingUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     issue_date: date | None = None
-    customer_id: int | None = None
-    client_ref_id: int | None = None
+    customer_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
+    client_ref_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     customer_name: str | None = Field(default=None, min_length=1, max_length=200)
     customer_address: str | None = Field(default=None, max_length=500)
     customer_email: str | None = Field(default=None, max_length=200)
@@ -87,6 +93,13 @@ class OutgoingUpdate(BaseModel):
     status: str | None = Field(default=None, pattern="^(draft|issued|void)$")
     payment_method: str | None = Field(default=None, max_length=100)
     paid_date: date | None = None
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def _aud_only(cls, v):
+        if v is None:
+            raise ValueError("currency cannot be null")
+        return normalise_aud(v)
 
     # issue_date / customer_name / currency map to NOT-NULL columns; they're
     # Optional only to allow omission (= no change). An explicit JSON null would
@@ -138,4 +151,4 @@ class CounterOut(BaseModel):
 class CounterSet(BaseModel):
     doc_type: str = Field(default="receipt", pattern="^receipt$")
     year: int = Field(ge=2000, le=3000)
-    last_number: int = Field(ge=0)
+    last_number: int = Field(ge=0, le=SQLITE_INT_MAX)

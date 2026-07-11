@@ -7,9 +7,11 @@ account plus a grand total.
 Sources combined here:
 
   1. JournalLine — explicit Dr/Cr on an account_id.
-  2. BankTransaction (categorised) — implicitly a Dr/Cr pair:
-       Bank IN  + account_id of any type        → Dr Bank,    Cr <other>
-       Bank OUT + account_id of any type        → Dr <other>, Cr Bank
+  2. BankTransaction (categorised) — implicitly a balanced posting:
+       Bank IN  → Dr Bank gross, Cr <other> net, Cr GST control (when GST > 0)
+       Bank OUT → Dr <other> net, Dr GST control, Cr Bank gross
+     AR/AP invoice settlements remain gross on the control account because the
+     invoice journal already carries their GST control leg.
      The "Bank" side is the BankAccount's own row in the trial balance
      (one BankAccount maps to one CoA account by id when categorised;
      since BankAccount isn't an Account itself, we model the bank side
@@ -60,7 +62,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models.company import (
@@ -75,41 +77,31 @@ from ..models.company import (
     JournalEntry,
     JournalEntrySource,
     JournalLine,
+    TaxCode,
 )
+from .account_invariants import require_opening_balance_equity_account
 from .reports import profit_and_loss
+from .transaction_classification import bank_event_is_sale
 
 # AR / AP invoice control accounts (same codes invoice_posting._control_account
 # resolves). Bank txns categorised here are invoice settlements, not primary
 # income/expense events — their GST is carried by the invoice journal.
 INVOICE_CONTROL_ACCOUNT_CODES = ("1100", "2000")
+GST_PAID_ACCOUNT_CODE = "1200"
+GST_COLLECTED_ACCOUNT_CODE = "2100"
 
 
 ZERO = Decimal("0")
 
 
-def _opening_balance_equity_account(db: Session) -> Account | None:
+def _opening_balance_equity_account(db: Session) -> Account:
     """Equity account that carries the contra leg for bank opening balances.
 
-    The default CoA has no dedicated "Opening Balance Equity" account, so we
-    use 3000 Owner's Capital — an opening bank balance is capital the owner
-    brought onto the books at system start. 3900 Retained Earnings is
-    deliberately avoided: the balance sheet computes retained earnings live
-    from the P&L and treats manual 3900 balances as additive on top.
-    Falls back to the lowest-coded EQUITY account if 3000 is missing.
+    The default CoA has no dedicated "Opening Balance Equity" account, so 3000
+    Owner's Capital is the canonical contra account. It must remain active and
+    EQUITY; silently falling back to another account would rewrite history.
     """
-    acc = (
-        db.query(Account)
-        .filter(Account.code == "3000", Account.type == AccountType.EQUITY)
-        .first()
-    )
-    if acc is None:
-        acc = (
-            db.query(Account)
-            .filter(Account.type == AccountType.EQUITY)
-            .order_by(Account.code)
-            .first()
-        )
-    return acc
+    return require_opening_balance_equity_account(db)
 
 
 def trial_balance(db: Session, *, as_of: date | None = None) -> dict:
@@ -147,10 +139,12 @@ def trial_balance(db: Session, *, as_of: date | None = None) -> dict:
     # equity (Dr Bank / Cr Owner's Capital) so the trial balance — and the
     # balance sheet derived from it — stays balanced. Negative openings
     # reverse the legs (Cr Bank / Dr equity).
-    opening_equity = _opening_balance_equity_account(db)
+    opening_equity: Account | None = None
     for ba in db.query(BankAccount).all():
         if ba.opening_balance and ba.opening_balance != ZERO:
             ob = ba.opening_balance
+            if opening_equity is None:
+                opening_equity = _opening_balance_equity_account(db)
             contra = opening_equity
             if ob > 0:
                 bank_debit[ba.id] = bank_debit.get(ba.id, ZERO) + ob
@@ -163,6 +157,34 @@ def trial_balance(db: Session, *, as_of: date | None = None) -> dict:
     if as_of is not None:
         txn_q = txn_q.filter(BankTransaction.occurred_at <= as_of)
     txns = txn_q.all()
+
+    txn_account_ids = {
+        account_id
+        for t in txns
+        for account_id in (t.account_id, t.unapplied_account_id)
+        if account_id is not None
+    }
+    txn_accounts_by_id: dict[int, Account] = {}
+    if txn_account_ids:
+        txn_accounts_by_id = {
+            a.id: a
+            for a in db.query(Account).filter(Account.id.in_(txn_account_ids)).all()
+        }
+
+    invoice_control_ids = {
+        a.id
+        for a in txn_accounts_by_id.values()
+        if a.code in INVOICE_CONTROL_ACCOUNT_CODES
+    }
+    gst_controls = {
+        a.code: a
+        for a in db.query(Account)
+        .filter(
+            Account.code.in_((GST_PAID_ACCOUNT_CODE, GST_COLLECTED_ACCOUNT_CODE)),
+            Account.active.is_(True),
+        )
+        .all()
+    }
 
     uncategorised_in = ZERO
     uncategorised_out = ZERO
@@ -182,12 +204,83 @@ def trial_balance(db: Session, *, as_of: date | None = None) -> dict:
                 uncategorised_out += t.amount
             continue
 
+        # Invoice settlements deliberately remain gross on AR/AP. Their GST
+        # control leg was posted by the invoice journal; the bank row carries
+        # gst_amount only so cash-basis BAS recognises it at settlement date.
+        gst_amount = Decimal(t.gst_amount or ZERO)
+        unapplied_amount = Decimal(t.unapplied_amount or ZERO)
+        primary_amount = Decimal(t.amount) - unapplied_amount
+        split_gst = gst_amount > ZERO and t.account_id not in invoice_control_ids
+        contra_amount = primary_amount - gst_amount if split_gst else primary_amount
+
         if t.direction == BankTxnDirection.IN:
             # Money coming in → credit the contra account (typical: income).
-            account_credit[t.account_id] = account_credit.get(t.account_id, ZERO) + t.amount
+            account_credit[t.account_id] = (
+                account_credit.get(t.account_id, ZERO) + contra_amount
+            )
         else:
             # Money going out → debit the contra account (typical: expense / asset purchase).
-            account_debit[t.account_id] = account_debit.get(t.account_id, ZERO) + t.amount
+            account_debit[t.account_id] = (
+                account_debit.get(t.account_id, ZERO) + contra_amount
+            )
+
+        if unapplied_amount > ZERO:
+            if t.unapplied_account_id is None:
+                raise RuntimeError(
+                    f"Bank transaction {t.id} has an unapplied amount without "
+                    "a destination account."
+                )
+            if t.direction == BankTxnDirection.IN:
+                account_credit[t.unapplied_account_id] = (
+                    account_credit.get(t.unapplied_account_id, ZERO)
+                    + unapplied_amount
+                )
+            else:
+                account_debit[t.unapplied_account_id] = (
+                    account_debit.get(t.unapplied_account_id, ZERO)
+                    + unapplied_amount
+                )
+
+        if not split_gst:
+            continue
+
+        acc = txn_accounts_by_id.get(t.account_id)
+        account_type = (
+            acc.type.value if acc and hasattr(acc.type, "value") else (acc.type if acc else None)
+        )
+        try:
+            tax_code = (
+                TaxCode(t.tax_code) if isinstance(t.tax_code, str) else t.tax_code
+            )
+        except ValueError:
+            tax_code = TaxCode.STANDARD
+
+        treat_as_sale = bank_event_is_sale(
+            account_code=acc.code if acc else None,
+            account_type=account_type,
+            tax_code=tax_code,
+            direction=t.direction,
+        )
+        gst_control_code = (
+            GST_COLLECTED_ACCOUNT_CODE
+            if treat_as_sale
+            else GST_PAID_ACCOUNT_CODE
+        )
+
+        gst_control = gst_controls.get(gst_control_code)
+        if gst_control is None:
+            raise RuntimeError(
+                f"Missing active GST control account {gst_control_code}; "
+                "cannot build a semantically correct Trial Balance."
+            )
+        if t.direction == BankTxnDirection.IN:
+            account_credit[gst_control.id] = (
+                account_credit.get(gst_control.id, ZERO) + gst_amount
+            )
+        else:
+            account_debit[gst_control.id] = (
+                account_debit.get(gst_control.id, ZERO) + gst_amount
+            )
 
     # ------------------------------------------------------------------
     # Phase 3: assemble rows. Fetch all accounts and banks we touched.
@@ -294,57 +387,6 @@ def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
     groups_liabs: dict[str, list[dict]] = {"Liabilities": [], "Payables": [], "GST payable": []}
     groups_equity: dict[str, list[dict]] = {"Equity": [], "Retained earnings": []}
 
-    income_total = ZERO
-    expense_total = ZERO
-
-    # GST embedded in a bank txn categorised to a BALANCE-SHEET account
-    # (asset/liability/equity) must be stripped from that account's balance and
-    # left to live solely in the net-GST line below. The contra leg is posted at
-    # GROSS (t.amount incl. GST); the net-GST line separately adds Σ gst. Without
-    # stripping, the GST is counted twice and the balance sheet won't balance.
-    # P&L-categorised txns are already handled by the Profit & Loss net-of-GST
-    # calc, so they must NOT be stripped here. OUT posts to the account debit and
-    # IN to the credit, so the net-debit adjustment is (Σ IN gst − Σ OUT gst).
-    # (This generalises the old CAPITAL-only, OUT-only stripping to every
-    # claimable tax code and both directions — a STANDARD-rated purchase booked
-    # to an asset account used to leave the sheet unbalanced.)
-    # EXCEPTION to the stripping: bank txns categorised to the AR/AP invoice
-    # CONTROL accounts (1100 / 2000) are invoice settlements. Their GST already
-    # lives in the invoice journal (2100 GST Collected / 1200 GST Paid), and the
-    # gross contra leg exactly nets the journal's gross control-account balance.
-    # Stripping here would resurrect a phantom control-account balance, and
-    # counting their gst_amount in the net-GST line below would double the
-    # journal GST accounts. The txn-level gst_amount still exists so the
-    # cash-basis BAS recognises the GST at payment date (services/gst.py).
-    invoice_control_ids = [
-        row[0]
-        for row in db.query(Account.id)
-        .filter(Account.code.in_(INVOICE_CONTROL_ACCOUNT_CODES))
-        .all()
-    ]
-    gst_net_debit_adj: dict[int, Decimal] = {}
-    gst_adj_rows = (
-        db.query(
-            BankTransaction.account_id,
-            BankTransaction.direction,
-            func.sum(BankTransaction.gst_amount),
-        )
-        .filter(
-            BankTransaction.occurred_at <= as_of,
-            BankTransaction.account_id.isnot(None),
-            BankTransaction.account_id.notin_(invoice_control_ids),
-            BankTransaction.gst_amount > 0,
-        )
-        .group_by(BankTransaction.account_id, BankTransaction.direction)
-        .all()
-    )
-    for account_id, direction, total in gst_adj_rows:
-        g = Decimal(total or 0)
-        signed = g if direction == BankTxnDirection.IN else -g
-        gst_net_debit_adj[account_id] = (
-            gst_net_debit_adj.get(account_id, ZERO) + signed
-        )
-
     for row in tb["rows"]:
         if row["kind"] == "bank":
             # Bank lines always sit under assets (we don't model overdrafts
@@ -358,9 +400,10 @@ def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
             continue
 
         atype = row["account_type"]
-        # Ex-GST net debit: strip the embedded GST (0 when GST-free / not
-        # registered) so it isn't double-counted against the net-GST line.
-        net_debit = row["net_debit"] + gst_net_debit_adj.get(row["ref_id"], ZERO)
+        # Bank GST is already posted explicitly to 1200/2100 by trial_balance;
+        # every account row is therefore its true ledger balance with no
+        # balance-sheet-only stripping or synthetic repair.
+        net_debit = row["net_debit"]
         if atype == AccountType.ASSET.value:
             groups_assets["Assets"].append({
                 "account_id": row["ref_id"],
@@ -406,50 +449,6 @@ def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
             "balance": supp["ap_open_total"],
         })
 
-    # Net-GST line: only CATEGORISED txns outside the AR/AP control accounts.
-    # Uncategorised rows may carry a provisional standard-rate gst_amount from
-    # import, but their economic nature is unknown (BAS skips them too);
-    # control-account settlements' GST is already on the sheet via the invoice
-    # journal's 2100/1200 balances (see the stripping exception above).
-    invoice_control_ids = [
-        row[0]
-        for row in db.query(Account.id)
-        .filter(Account.code.in_(INVOICE_CONTROL_ACCOUNT_CODES))
-        .all()
-    ]
-    gst_rows = (
-        db.query(BankTransaction.direction, func.sum(BankTransaction.gst_amount))
-        .filter(
-            BankTransaction.occurred_at <= as_of,
-            BankTransaction.account_id.isnot(None),
-            BankTransaction.account_id.notin_(invoice_control_ids),
-        )
-        .group_by(BankTransaction.direction)
-        .all()
-    )
-    gst_collected = ZERO
-    gst_paid = ZERO
-    for direction, total in gst_rows:
-        if direction == BankTxnDirection.IN:
-            gst_collected += Decimal(total or 0)
-        else:
-            gst_paid += Decimal(total or 0)
-    net_gst = gst_collected - gst_paid
-    if net_gst > ZERO:
-        groups_liabs["GST payable"].append({
-            "account_id": None,
-            "code": None,
-            "name": "Net GST payable",
-            "balance": net_gst,
-        })
-    elif net_gst < ZERO:
-        groups_assets["GST credits"].append({
-            "account_id": None,
-            "code": None,
-            "name": "Net GST refundable",
-            "balance": -net_gst,
-        })
-
     pnl_to_date = profit_and_loss(db, period_start=date.min, period_end=as_of)
     retained = pnl_to_date["net_profit"]
     if retained != ZERO:
@@ -465,7 +464,7 @@ def balance_sheet(db: Session, *, as_of: date | None = None) -> dict:
         for label, lines in groups.items():
             if not lines:
                 continue
-            subtotal = sum((Decimal(l["balance"]) for l in lines), ZERO)
+            subtotal = sum((Decimal(line["balance"]) for line in lines), ZERO)
             out.append({"label": label, "lines": lines, "subtotal": subtotal})
         return out
 

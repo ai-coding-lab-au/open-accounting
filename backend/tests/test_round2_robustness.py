@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from _request_headers import manual_transaction_headers
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 PROJECT_ROOT = ROOT.parent
@@ -33,6 +35,7 @@ def client(monkeypatch, request):
     with TestClient(app) as c:
         r = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
         assert r.status_code == 201, r.text
+        HEAD["X-Company-Generation"] = r.json()["generation_id"]
         yield c
 
 
@@ -84,6 +87,57 @@ def test_oversized_path_id_does_not_500(client):
     # A valid-range but absent id still 404s (not blocked by the bound).
     r2 = client.get(f"/api/v1/invoices/{2**63 - 1}", headers=HEAD)
     assert r2.status_code == 404, r2.text
+
+
+def test_oversized_query_and_body_integers_do_not_500(client, accounts):
+    huge = 2**63
+    response = client.get(
+        "/api/v1/reports/bank-statement",
+        headers=HEAD,
+        params={"bank_account_id": huge, "year": 2026, "month": 5},
+    )
+    assert response.status_code == 422, response.text
+
+    response = client.get(
+        "/api/v1/journal", headers=HEAD, params={"offset": huge}
+    )
+    assert response.status_code == 422, response.text
+
+    base = {
+        "description": "integer bound",
+        "set_account_id": accounts["6100"]["id"],
+    }
+    for field in ("priority", "set_account_id"):
+        response = client.post(
+            "/api/v1/bank-rules",
+            headers=HEAD,
+            json={**base, field: huge},
+        )
+        assert response.status_code == 422, (field, response.text)
+
+
+def test_sqlite_exact_cent_money_limit_round_trips_and_larger_value_is_rejected(client):
+    bank = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0]
+    endpoint = f"/api/v1/bank-accounts/{bank['id']}/transactions"
+    payload = {
+        "direction": "in",
+        "amount": "9999999999999.99",
+        "occurred_at": "2026-05-31",
+        "tax_code": "none",
+        "gst_amount": "0",
+    }
+    response = client.post(
+        endpoint, headers=manual_transaction_headers(HEAD), json=payload
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["amount"] == payload["amount"]
+
+    response = client.post(
+        endpoint,
+        headers=manual_transaction_headers(HEAD),
+        json={**payload, "amount": "99999999999999.99"},
+    )
+    assert response.status_code == 422, response.text
 
 
 # ---------------------------------------------------------------------------

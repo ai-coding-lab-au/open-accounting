@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../lib/api";
 import { apiErrorMessage } from "../../lib/errors";
@@ -15,8 +15,13 @@ export const DOC_TYPE_LABEL: Record<OutgoingDocType, string> = {
   receipt: "Receipt",
 };
 
-async function createOutgoing(payload: ReturnType<typeof toCreatePayload>) {
-  const { data } = await api.post<OutgoingDocument>("/outgoing", payload);
+async function createOutgoing(
+  payload: ReturnType<typeof toCreatePayload>,
+  idempotencyKey: string,
+) {
+  const { data } = await api.post<OutgoingDocument>("/outgoing", payload, {
+    headers: { "Idempotency-Key": idempotencyKey },
+  });
   return data;
 }
 
@@ -42,10 +47,12 @@ export default function OutgoingCreateDialog({
     enabled: !!currentId,
   });
   const [values, setValues] = useState<EditorValues>(() => emptyEditorValues(docType, 28));
+  const idempotencyKey = useRef(crypto.randomUUID());
   const defaultPaymentTermsDays = company?.default_payment_terms_days ?? 28;
 
   const mut = useMutation({
-    mutationFn: createOutgoing,
+    mutationFn: (payload: ReturnType<typeof toCreatePayload>) =>
+      createOutgoing(payload, idempotencyKey.current),
     onSuccess: (doc) => {
       qc.invalidateQueries({ queryKey: ["outgoing"] });
       qc.invalidateQueries({ queryKey: ["counters"] });

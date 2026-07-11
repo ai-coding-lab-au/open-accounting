@@ -4,7 +4,7 @@ Covers:
   - P0-E: invoice status not settable via PATCH; draft delete blocked when
     journal entries exist
   - P1-8: paid_amount/paid_date rejected on never-posted draft invoices
-  - P1-9: header-total drift surfaces as 422 at post time, never 500
+  - P1-9: header-total drift is rejected before persistence with 422
   - P1-5: generic /outgoing PATCH cannot set status or rewrite issued
     receipt/invoice lines; SAs are rejected outright
   - P1-6: deleting a PR cascades the void to its receipts + invoices
@@ -40,13 +40,14 @@ def client(monkeypatch, request):
     from app.main import app
 
     with TestClient(app) as c:
-        # Not GST-registered: SA/PR totals equal the entered fees, which keeps
-        # the trust recognise math trivial.
+        # These state-machine tests create GST-bearing invoices. Non-registered
+        # behavior has dedicated invariant coverage in test_non_gst_invariant.
         r = c.post(
             "/api/v1/companies",
-            json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd", "gst_registered": False},
+            json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd", "gst_registered": True},
         )
         assert r.status_code == 201, r.text
+        HDR["X-Company-Generation"] = r.json()["generation_id"]
         r = c.post(
             "/api/v1/staff",
             headers=HDR,
@@ -174,32 +175,29 @@ def test_invoice_rejects_direct_paid_amount_until_bank_clearing_exists(client, a
     assert body["status"] == "draft"
     assert float(body["paid_amount"]) == 0.0
 
-    # After posting, direct payment status is still blocked until bank clearing
-    # creates the Bank <-> AR/AP posting.
+    # After posting, direct payment status is still blocked: explicit bank
+    # allocations are now the only source of settlement truth.
     r = client.post(f"/api/v1/invoices/{inv['id']}/post", headers=HDR)
     assert r.status_code == 200, r.text
     r = client.patch(
         f"/api/v1/invoices/{inv['id']}", headers=HDR, json={"paid_amount": "110.00"}
     )
     assert r.status_code == 409, r.text
-    assert "bank clearing" in r.json()["detail"]
+    assert "bank-to-invoice allocations" in r.json()["detail"]
     r = client.get(f"/api/v1/invoices/{inv['id']}", headers=HDR)
     assert r.json()["status"] == "authorised"
     assert float(r.json()["paid_amount"]) == 0.0
 
 
-def test_post_with_drifted_total_returns_422_not_500(client, accounts):
-    """P1-9: total within GST tolerance at create, but != lines + GST → the
-    post endpoint must 422 with a clear message (was a 500 UnbalancedEntry)."""
-    inv = _create_invoice(client, accounts, number="INV-AUD-DRIFT", total="110.01")
+def test_header_total_drift_rejected_before_persistence(client, accounts):
+    """P1-9: a header that disagrees with its lines is rejected immediately."""
+    inv = _create_invoice(client, accounts, number="INV-AUD-DRIFT")
 
-    r = client.post(f"/api/v1/invoices/{inv['id']}/post", headers=HDR)
+    r = client.patch(f"/api/v1/invoices/{inv['id']}", headers=HDR, json={"total": "110.01"})
     assert r.status_code == 422, r.text
-    assert "Correct the invoice" in r.json()["detail"]
+    assert "doesn't balance" in r.json()["detail"].lower()
 
-    # Still a postable draft after correcting the total.
-    r = client.patch(f"/api/v1/invoices/{inv['id']}", headers=HDR, json={"total": "110.00"})
-    assert r.status_code == 200, r.text
+    # The rejected update did not corrupt the valid draft.
     r = client.post(f"/api/v1/invoices/{inv['id']}/post", headers=HDR)
     assert r.status_code == 200, r.text
 
@@ -250,6 +248,7 @@ def test_issued_receipt_lines_locked_via_generic_patch(client):
     cid = _make_client_row(client)
     receipt = _make_receipt(client, cid)
     assert receipt["status"] == "issued"
+    original_total = receipt["total"]
 
     r = client.patch(
         f"/api/v1/outgoing/{receipt['id']}",
@@ -258,7 +257,7 @@ def test_issued_receipt_lines_locked_via_generic_patch(client):
     )
     assert r.status_code == 409, r.text
     r = client.get(f"/api/v1/outgoing/{receipt['id']}", headers=HDR)
-    assert float(r.json()["total"]) == 100.0
+    assert r.json()["total"] == original_total
 
     # Notes-only edits keep working.
     r = client.patch(

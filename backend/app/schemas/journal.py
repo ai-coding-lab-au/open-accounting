@@ -6,12 +6,28 @@ from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ._money import Money
+from ._limits import SQLITE_EXACT_MONEY_MAX, SQLITE_INT_MAX
+
+
+_MONEY_MAX = SQLITE_EXACT_MONEY_MAX
 
 
 class JournalLineCreate(BaseModel):
-    account_id: int
-    debit_amount: Decimal = Field(default=Decimal("0"), ge=0, decimal_places=2)
-    credit_amount: Decimal = Field(default=Decimal("0"), ge=0, decimal_places=2)
+    account_id: int = Field(ge=1, le=SQLITE_INT_MAX)
+    debit_amount: Decimal = Field(
+        default=Decimal("0"),
+        ge=0,
+        le=_MONEY_MAX,
+        max_digits=16,
+        decimal_places=2,
+    )
+    credit_amount: Decimal = Field(
+        default=Decimal("0"),
+        ge=0,
+        le=_MONEY_MAX,
+        max_digits=16,
+        decimal_places=2,
+    )
     description: str | None = Field(default=None, max_length=500)
 
 

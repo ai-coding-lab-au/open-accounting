@@ -39,7 +39,7 @@ def company(monkeypatch, request):
     from app.db.company import company_session, init_company_db  # noqa: WPS433
 
     company_id = "tc"
-    init_company_db(company_id)
+    init_company_db(company_id, allow_create=True)
     with company_session(company_id) as session:
         yield company_id, session
 

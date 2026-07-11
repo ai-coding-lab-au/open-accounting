@@ -106,6 +106,7 @@ class Api:
     client: Any
     base_url: str = ""
     company_id: str | None = None
+    company_generation: str | None = None
 
     @classmethod
     def from_url(cls, base_url: str) -> "Api":
@@ -113,7 +114,12 @@ class Api:
 
     @property
     def headers(self) -> dict[str, str]:
-        return {"X-Company-Id": self.company_id} if self.company_id else {}
+        if not self.company_id:
+            return {}
+        headers = {"X-Company-Id": self.company_id}
+        if self.company_generation:
+            headers["X-Company-Generation"] = self.company_generation
+        return headers
 
     def close(self) -> None:
         close = getattr(self.client, "close", None)
@@ -154,8 +160,9 @@ def create_company(api: Api) -> None:
         "registered_agent_name": "Mina Patel",
         "marn": "2312345",
     }
-    api.post("/api/v1/companies", json=payload)
+    company = api.post("/api/v1/companies", json=payload).json()
     api.company_id = COMPANY_ID
+    api.company_generation = company["generation_id"]
     api.patch(
         f"/api/v1/companies/{COMPANY_ID}",
         json={
@@ -289,7 +296,15 @@ SUPPLIERS = [
 ]
 
 
-def invoice_payload(direction: str, number: str, name: str, issue: date, total: Decimal, tax_code: str = "standard") -> dict[str, Any]:
+def invoice_payload(
+    direction: str,
+    number: str,
+    name: str,
+    issue: date,
+    total: Decimal,
+    account_id: int,
+    tax_code: str = "standard",
+) -> dict[str, Any]:
     gst = gst_from_gross(total, tax_code)
     subtotal = money(total - gst)
     return {
@@ -307,7 +322,7 @@ def invoice_payload(direction: str, number: str, name: str, issue: date, total: 
         "lines": [
             {
                 "description": "Professional services" if direction == "AR" else "Supplier services",
-                "account_id": None,
+                "account_id": account_id,
                 "quantity": "1",
                 "unit_price": str(subtotal),
                 "gst_rate": "0.10" if tax_code == "standard" else "0",
@@ -323,6 +338,7 @@ def create_invoices_and_docs(
     api: Api,
     rng: random.Random,
     clients: list[dict[str, Any]],
+    accounts: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     payments: list[dict[str, Any]] = []
     seq = 1
@@ -342,11 +358,18 @@ def create_invoices_and_docs(
                 pay_date = FY_END
             inv = api.post(
                 "/api/v1/invoices",
-                json=invoice_payload("AR", f"AR-{seq:05d}", customer, issue, total),
+                json=invoice_payload(
+                    "AR",
+                    f"AR-{seq:05d}",
+                    customer,
+                    issue,
+                    total,
+                    accounts["4000"]["id"],
+                ),
             ).json()
-            # Invoices stay draft: paid status now requires posting first
-            # (lifecycle guard), and these seed lines have no account_id.
-            # The cash movement is seeded through the bank rows below.
+            # Invoices stay draft: cash movement is seeded through the bank
+            # rows below, while valid line coding keeps the demo compatible
+            # with the same AR/AP account invariant as production input.
             payments.append(
                 {
                     "occurred_at": pay_date,
@@ -366,7 +389,14 @@ def create_invoices_and_docs(
             supplier = rng.choice(SUPPLIERS)
             api.post(
                 "/api/v1/invoices",
-                json=invoice_payload("AP", f"AP-{ap_seq:05d}", supplier, issue, total),
+                json=invoice_payload(
+                    "AP",
+                    f"AP-{ap_seq:05d}",
+                    supplier,
+                    issue,
+                    total,
+                    accounts["6400"]["id"],
+                ),
             )
             ap_seq += 1
 
@@ -642,7 +672,7 @@ def seed(api: Api, *, reset: bool = False, exercise: bool = True) -> dict[str, A
     create_bank_rules(api, accounts)
     seed_journals(api, accounts)
     clients = create_clients(api)
-    payments = create_invoices_and_docs(api, rng, clients["clients"])
+    payments = create_invoices_and_docs(api, rng, clients["clients"], accounts)
     bank = seed_bank(api, accounts, payments, rng)
     checks = exercise_reports_and_routes(api) if exercise else {}
     counts = table_counts(COMPANY_ID)
@@ -654,6 +684,7 @@ def seed(api: Api, *, reset: bool = False, exercise: bool = True) -> dict[str, A
     }
     return {
         "company_id": COMPANY_ID,
+        "company_generation": api.company_generation,
         "company_name": COMPANY_NAME,
         "random_seed": RANDOM_SEED,
         "period_start": iso(FY_START),

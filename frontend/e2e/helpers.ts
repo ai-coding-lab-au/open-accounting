@@ -12,31 +12,71 @@ import type { APIRequestContext } from "@playwright/test";
 export const COMPANY_ID = "e2eco";
 export const COMPANY_NAME = "E2E Test Pty Ltd";
 
-const BACKEND_URL = process.env.E2E_BACKEND_URL ?? "http://127.0.0.1:8765";
+export const BACKEND_URL = process.env.E2E_BACKEND_URL ?? "http://127.0.0.1:8765";
+
+export interface CompanyIdentity {
+  id: string;
+  generation_id: string;
+}
+
+const companyGenerations = new Map<string, string>();
+
+export function companyHeaders(companyId: string): Record<string, string> {
+  const generation = companyGenerations.get(companyId);
+  if (!generation) {
+    throw new Error(
+      `No generation cached for company ${companyId}; call getCompanyById or ensureCompanyById first`,
+    );
+  }
+  return {
+    "X-Company-Id": companyId,
+    "X-Company-Generation": generation,
+  };
+}
+
+export async function getCompanyById(
+  request: APIRequestContext,
+  id: string,
+): Promise<CompanyIdentity | null> {
+  const list = await request.get(`${BACKEND_URL}/api/v1/companies`);
+  if (!list.ok()) throw new Error(`GET /companies failed: ${list.status()}`);
+  const companies = (await list.json()) as CompanyIdentity[];
+  const company = companies.find((candidate) => candidate.id === id) ?? null;
+  if (company) companyGenerations.set(company.id, company.generation_id);
+  else companyGenerations.delete(id);
+  return company;
+}
+
+export async function ensureCompanyById(
+  request: APIRequestContext,
+  id: string,
+  name: string,
+): Promise<CompanyIdentity> {
+  const existing = await getCompanyById(request, id);
+  if (existing) return existing;
+
+  const created = await request.post(`${BACKEND_URL}/api/v1/companies`, {
+    data: {
+      id,
+      name,
+      abn: null,
+      gst_registered: true,
+    },
+  });
+  if (!created.ok()) {
+    throw new Error(
+      `POST /companies failed: ${created.status()} ${await created.text()}`,
+    );
+  }
+  const company = (await created.json()) as CompanyIdentity;
+  companyGenerations.set(company.id, company.generation_id);
+  return company;
+}
 
 export async function ensureCompany(
   request: APIRequestContext,
 ): Promise<void> {
-  const list = await request.get(`${BACKEND_URL}/api/v1/companies`);
-  if (!list.ok()) throw new Error(`GET /companies failed: ${list.status()}`);
-  const companies = (await list.json()) as Array<{ id: string }>;
-  const exists = companies.some((c) => c.id === COMPANY_ID);
-
-  if (!exists) {
-    const created = await request.post(`${BACKEND_URL}/api/v1/companies`, {
-      data: {
-        id: COMPANY_ID,
-        name: COMPANY_NAME,
-        abn: null,
-        gst_registered: true,
-      },
-    });
-    if (!created.ok()) {
-      throw new Error(
-        `POST /companies failed: ${created.status()} ${await created.text()}`,
-      );
-    }
-  }
+  await ensureCompanyById(request, COMPANY_ID, COMPANY_NAME);
 
   // Keep legacy company signer fields populated for older templates.
   // Current SA creation is gated on an active registered staff member;
@@ -44,6 +84,7 @@ export async function ensureCompany(
   const patched = await request.patch(
     `${BACKEND_URL}/api/v1/companies/${COMPANY_ID}`,
     {
+      headers: companyHeaders(COMPANY_ID),
       data: {
         marn: "1234567",
         registered_agent_name: "Test Agent",
@@ -63,7 +104,7 @@ export async function ensureClient(
 ): Promise<number> {
   // List existing first (idempotent across runs).
   const list = await request.get(`${BACKEND_URL}/api/v1/clients`, {
-    headers: { "X-Company-Id": COMPANY_ID },
+    headers: companyHeaders(COMPANY_ID),
   });
   if (list.ok()) {
     const clients = (await list.json()) as Array<{ id: number; display_name: string }>;
@@ -72,7 +113,7 @@ export async function ensureClient(
   }
 
   const created = await request.post(`${BACKEND_URL}/api/v1/clients`, {
-    headers: { "X-Company-Id": COMPANY_ID },
+    headers: companyHeaders(COMPANY_ID),
     data: { display_name },
   });
   if (!created.ok()) {
@@ -87,7 +128,7 @@ export async function ensureClient(
 export async function ensureSignerStaff(
   request: APIRequestContext,
 ): Promise<number> {
-  const headers = { "X-Company-Id": COMPANY_ID };
+  const headers = companyHeaders(COMPANY_ID);
   const list = await request.get(
     `${BACKEND_URL}/api/v1/staff?include_inactive=true`,
     { headers },

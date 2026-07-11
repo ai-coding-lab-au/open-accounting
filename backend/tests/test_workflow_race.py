@@ -42,6 +42,7 @@ def company_headers(client):
         json={"id": "acme", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Example Migration Services", "gst_registered": False},
     )
     assert r.status_code == 201, r.text
+    HDR["X-Company-Generation"] = r.json()["generation_id"]
     return HDR
 
 

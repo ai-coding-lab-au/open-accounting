@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from _request_headers import manual_transaction_headers
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -29,7 +31,8 @@ def client(monkeypatch, request):
             del sys.modules[mod]
     from app.main import app
     with TestClient(app) as c:
-        c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        company = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        HEAD["X-Company-Generation"] = company.json()["generation_id"]
         yield c
 
 
@@ -99,7 +102,7 @@ def test_delete_account_in_use_is_blocked(client):
 
     r = client.post(
         f"/api/v1/bank-accounts/{biz['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "out",
             "amount": "500.00",
@@ -146,7 +149,7 @@ def test_parent_must_match_validation(client):
 def test_delete_account_used_by_journal_is_blocked(client):
     accounts = {a["code"]: a for a in client.get("/api/v1/accounts", headers=HEAD).json()}
     bank = accounts["1000"]
-    capital = accounts["3000"]
+    equity = accounts["3100"]
 
     r = client.post(
         "/api/v1/journal",
@@ -156,13 +159,13 @@ def test_delete_account_used_by_journal_is_blocked(client):
             "memo": "Opening contribution",
             "lines": [
                 {"account_id": bank["id"], "debit_amount": "100.00"},
-                {"account_id": capital["id"], "credit_amount": "100.00"},
+                {"account_id": equity["id"], "credit_amount": "100.00"},
             ],
         },
     )
     assert r.status_code == 201, r.text
 
-    r = client.delete(f"/api/v1/accounts/{capital['id']}", headers=HEAD)
+    r = client.delete(f"/api/v1/accounts/{equity['id']}", headers=HEAD)
     assert r.status_code == 409
     assert "journal entries" in r.json()["detail"]
 
@@ -192,3 +195,161 @@ def test_delete_account_used_by_bank_rule_is_blocked(client):
     r = client.delete(f"/api/v1/accounts/{aid}", headers=HEAD)
     assert r.status_code == 409
     assert "bank rules" in r.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("reference_source", "account_code", "new_type"),
+    [
+        ("bank_transaction", "6100", "INCOME"),
+        ("invoice_line", "4010", "EXPENSE"),
+        ("journal_line", "6500", "INCOME"),
+    ],
+)
+def test_referenced_account_type_is_immutable_but_metadata_remains_editable(
+    client, reference_source, account_code, new_type
+):
+    accounts = {
+        account["code"]: account
+        for account in client.get("/api/v1/accounts", headers=HEAD).json()
+    }
+    target = accounts[account_code]
+
+    if reference_source == "bank_transaction":
+        bank = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0]
+        response = client.post(
+            f"/api/v1/bank-accounts/{bank['id']}/transactions",
+            headers=manual_transaction_headers(HEAD),
+            json={
+                "direction": "out",
+                "amount": "100.00",
+                "occurred_at": "2026-05-10",
+                "memo": "Historic rent",
+                "account_id": target["id"],
+                "tax_code": "none",
+                "gst_amount": "0.00",
+            },
+        )
+    elif reference_source == "invoice_line":
+        response = client.post(
+            "/api/v1/invoices",
+            headers=HEAD,
+            json={
+                "direction": "AR",
+                "contact_name": "Historic Customer",
+                "invoice_number": "TYPE-LOCK-1",
+                "issue_date": "2026-05-10",
+                "subtotal": "100.00",
+                "gst_amount": "0.00",
+                "total": "100.00",
+                "lines": [
+                    {
+                        "description": "Historic service",
+                        "account_id": target["id"],
+                        "quantity": "1",
+                        "unit_price": "100.00",
+                        "gst_rate": "0.00",
+                        "line_subtotal": "100.00",
+                        "line_gst": "0.00",
+                        "line_total": "100.00",
+                    }
+                ],
+            },
+        )
+    else:
+        response = client.post(
+            "/api/v1/journal",
+            headers=HEAD,
+            json={
+                "entry_date": "2026-05-10",
+                "memo": "Historic bank fee",
+                "lines": [
+                    {"account_id": target["id"], "debit_amount": "100.00"},
+                    {
+                        "account_id": accounts["3000"]["id"],
+                        "credit_amount": "100.00",
+                    },
+                ],
+            },
+        )
+    assert response.status_code in (200, 201), response.text
+
+    response = client.patch(
+        f"/api/v1/accounts/{target['id']}",
+        headers=HEAD,
+        json={"type": new_type},
+    )
+    assert response.status_code == 409, response.text
+    assert "referenced by" in response.json()["detail"]
+
+    response = client.patch(
+        f"/api/v1/accounts/{target['id']}",
+        headers=HEAD,
+        json={
+            "name": f"{target['name']} (renamed)",
+            "description": "Updated display metadata",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["type"] == target["type"]
+    assert response.json()["description"] == "Updated display metadata"
+
+
+def test_opening_balance_equity_identity_is_protected(client):
+    accounts = {
+        account["code"]: account
+        for account in client.get("/api/v1/accounts", headers=HEAD).json()
+    }
+    capital = accounts["3000"]
+
+    for payload in ({"code": "3001"}, {"type": "ASSET"}, {"active": False}):
+        response = client.patch(
+            f"/api/v1/accounts/{capital['id']}", headers=HEAD, json=payload
+        )
+        assert response.status_code == 409, (payload, response.text)
+
+    response = client.delete(f"/api/v1/accounts/{capital['id']}", headers=HEAD)
+    assert response.status_code == 409, response.text
+
+    response = client.patch(
+        f"/api/v1/accounts/{capital['id']}",
+        headers=HEAD,
+        json={"name": "Opening Capital", "description": "Display text is editable"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["code"] == "3000"
+    assert response.json()["type"] == "EQUITY"
+    assert response.json()["active"] is True
+    assert response.json()["name"] == "Opening Capital"
+
+
+def test_missing_legacy_opening_equity_fails_closed_with_operator_error(client):
+    response = client.post(
+        "/api/v1/bank-accounts",
+        headers=HEAD,
+        json={"name": "Legacy opening bank", "opening_balance": "100.00"},
+    )
+    assert response.status_code == 201, response.text
+
+    # Simulate a database damaged before the runtime protection existed.
+    from app.db.company import company_session
+    from app.models.company import Account
+
+    with company_session("tc") as db:
+        capital = db.query(Account).filter(Account.code == "3000").one()
+        db.delete(capital)
+        db.commit()
+
+    response = client.post(
+        "/api/v1/bank-accounts",
+        headers=HEAD,
+        json={"name": "Another opening bank", "opening_balance": "50.00"},
+    )
+    assert response.status_code == 409, response.text
+    assert "opening-balance equity account 3000 is missing" in response.json()[
+        "detail"
+    ]
+
+    for report_path in ("trial-balance", "balance-sheet"):
+        response = client.get(f"/api/v1/reports/{report_path}", headers=HEAD)
+        assert response.status_code == 409, (report_path, response.text)
+        assert "Restore account 3000" in response.json()["detail"]

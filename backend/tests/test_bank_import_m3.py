@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import io
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
+
+from _request_headers import manual_transaction_headers
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -41,7 +44,8 @@ def client(monkeypatch, request):
             del sys.modules[mod]
     from app.main import app
     with TestClient(app) as c:
-        c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        company = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        HEAD["X-Company-Generation"] = company.json()["generation_id"]
         yield c
 
 
@@ -229,7 +233,7 @@ def test_dedup_flags_row_matching_manual_transaction(client, biz_bank):
     # Manually-entered transaction (no dedup_key), memo "Acme Client Payment".
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "in",
             "amount": "5000.00",
@@ -274,14 +278,14 @@ def test_far_future_date_rejected_on_manual_entry(client, biz_bank):
     no BAS quarter."""
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={"direction": "in", "amount": "100.00", "occurred_at": "9999-12-31"},
     )
     assert r.status_code == 422, r.text
     # A normal date still works.
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={"direction": "in", "amount": "100.00", "occurred_at": "2026-07-01"},
     )
     assert r.status_code == 201, r.text
@@ -321,7 +325,7 @@ def test_commit_skips_row_duplicating_existing_manual_transaction(client, biz_ba
     unchecking is bypassed."""
     m = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "in",
             "amount": "5000.00",
@@ -500,6 +504,178 @@ def test_dedup_unique_index_exists_and_reimport_skips(client, biz_bank):
     assert r.json() == {"created": 0, "skipped_duplicates": 1}
 
 
+def test_commit_ignores_empty_and_forged_client_dedup_keys(client, biz_bank):
+    base = {
+        "occurred_at": "2026-05-20",
+        "direction": "in",
+        "amount": "321.00",
+        "memo": "Server owned dedup marker",
+        "counter_party_name": "Canonical Client",
+    }
+    response = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json={
+            "rows": [
+                {**base, "dedup_key": ""},
+                {**base, "dedup_key": "f" * 64},
+            ]
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"created": 1, "skipped_duplicates": 1}
+
+    from app.db.company import company_session
+    from app.models.company import BankTransaction
+
+    with company_session("tc") as db:
+        stored = (
+            db.query(BankTransaction)
+            .filter(BankTransaction.memo == base["memo"])
+            .one()
+        )
+        assert stored.dedup_key
+        assert len(stored.dedup_key) == 64
+        assert stored.dedup_key != "f" * 64
+
+    retry = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json={"rows": [{**base, "dedup_key": "retry-forgery"}]},
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json() == {"created": 0, "skipped_duplicates": 1}
+
+
+def test_commit_canonical_key_includes_counterparty(client, biz_bank):
+    common = {
+        "occurred_at": "2026-05-21",
+        "direction": "in",
+        "amount": "87.00",
+        "memo": "Settlement",
+        # Deliberately identical forged values: server identity must win.
+        "dedup_key": "same-client-key",
+    }
+    payload = {
+        "rows": [
+            {**common, "counter_party_name": "Customer Alpha"},
+            {**common, "counter_party_name": "Customer Beta"},
+        ]
+    }
+    first = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json() == {"created": 2, "skipped_duplicates": 0}
+
+    retry = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json=payload,
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json() == {"created": 0, "skipped_duplicates": 2}
+
+
+def test_concurrent_commit_of_same_canonical_row_writes_once(client, biz_bank):
+    base = {
+        "occurred_at": "2026-05-22",
+        "direction": "out",
+        "amount": "42.50",
+        "memo": "Concurrent canonical marker",
+        "counter_party_name": "One Supplier",
+    }
+
+    def submit(dedup_key: str):
+        return client.post(
+            f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+            headers=HEAD,
+            json={"rows": [{**base, "dedup_key": dedup_key}]},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(submit, ("", "forged-concurrent-key")))
+
+    assert [response.status_code for response in responses] == [200, 200], [
+        response.text for response in responses
+    ]
+    assert sorted(response.json()["created"] for response in responses) == [0, 1]
+    assert sorted(
+        response.json()["skipped_duplicates"] for response in responses
+    ) == [0, 1]
+
+    listed = client.get(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
+        headers=HEAD,
+    ).json()
+    assert sum(txn["memo"] == base["memo"] for txn in listed) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("amount", "not-a-number"),
+        ("amount", "0"),
+        ("amount", "-1.00"),
+        ("amount", "1.001"),
+        ("amount", "100000000000000.00"),
+        ("gst_amount", "-0.01"),
+        ("gst_amount", "1.001"),
+        ("occurred_at", "not-a-date"),
+        ("occurred_at", "1999-06-30"),
+    ],
+)
+def test_commit_schema_rejects_bad_money_and_dates_without_500_or_row_echo(
+    client, biz_bank, field, value,
+):
+    row = {
+        "occurred_at": "2026-05-23",
+        "direction": "in",
+        "amount": "10.00",
+        "gst_amount": "0.00",
+        "memo": "SECRET-MEMO-MUST-NOT-ECHO",
+        "counter_party_name": "SECRET-COUNTERPARTY-MUST-NOT-ECHO",
+        field: value,
+    }
+    response = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json={"rows": [row]},
+    )
+    assert response.status_code == 422, response.text
+    assert "SECRET-MEMO-MUST-NOT-ECHO" not in response.text
+    assert "SECRET-COUNTERPARTY-MUST-NOT-ECHO" not in response.text
+
+
+def test_commit_business_error_contains_only_row_index_and_field_reason(
+    client, biz_bank,
+):
+    response = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json={
+            "rows": [
+                {
+                    "occurred_at": "2026-05-24",
+                    "direction": "in",
+                    "amount": "10.00",
+                    "gst_amount": "11.00",
+                    "memo": "SECRET-BUSINESS-ERROR-MEMO",
+                    "counter_party_name": "SECRET-BUSINESS-ERROR-PARTY",
+                }
+            ]
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == (
+        "Row 1: gst_amount must not exceed amount"
+    )
+    assert "SECRET-BUSINESS-ERROR-MEMO" not in response.text
+    assert "SECRET-BUSINESS-ERROR-PARTY" not in response.text
+
+
 # ---------------------------------------------------------------------------
 # Rules CRUD + matching
 # ---------------------------------------------------------------------------
@@ -528,6 +704,57 @@ def test_rule_crud_round_trip(client, accounts):
     r = client.delete(f"/api/v1/bank-rules/{rid}", headers=HEAD)
     assert r.status_code == 204
     assert client.get("/api/v1/bank-rules", headers=HEAD).json() == []
+
+
+def test_rule_patch_can_clear_nullable_match_predicates(client, accounts):
+    rent = accounts["6100"]
+    r = client.post("/api/v1/bank-rules", headers=HEAD, json={
+        "description": "Clearable predicates",
+        "match_direction": "out",
+        "match_amount_min": "100",
+        "match_amount_max": "200",
+        "match_memo_regex": "(?i)rent",
+        "match_counter_party_regex": "Landlord",
+        "set_account_id": rent["id"],
+    })
+    assert r.status_code == 201, r.text
+    rid = r.json()["id"]
+
+    # Explicit null clears nullable predicates.  Clearing min in the same
+    # request means max=50 is a valid range; omitted fields remain unchanged.
+    r = client.patch(f"/api/v1/bank-rules/{rid}", headers=HEAD, json={
+        "match_direction": None,
+        "match_amount_min": None,
+        "match_amount_max": "50",
+        "match_memo_regex": None,
+        "match_counter_party_regex": None,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["match_direction"] is None
+    assert body["match_amount_min"] is None
+    assert body["match_amount_max"] == "50.00"
+    assert body["match_memo_regex"] is None
+    assert body["match_counter_party_regex"] is None
+    assert body["description"] == "Clearable predicates"
+
+
+def test_rule_patch_rejects_null_for_required_columns(client, accounts):
+    rent = accounts["6100"]
+    r = client.post("/api/v1/bank-rules", headers=HEAD, json={
+        "description": "Required fields",
+        "set_account_id": rent["id"],
+    })
+    assert r.status_code == 201, r.text
+    rid = r.json()["id"]
+
+    for field in (
+        "priority", "is_active", "description", "set_account_id", "set_tax_code"
+    ):
+        r = client.patch(
+            f"/api/v1/bank-rules/{rid}", headers=HEAD, json={field: None}
+        )
+        assert r.status_code == 422, (field, r.text)
 
 
 def test_rule_bad_amount_range_rejected(client, accounts):
@@ -886,7 +1113,10 @@ def test_commit_rejects_missing_or_inactive_account(client, accounts, biz_bank):
         json={"rows": [payload_row]},
     )
     assert r.status_code == 400
-    assert "not found" in r.json()["detail"]
+    assert r.json()["detail"] == (
+        "Row 1: account_id does not reference an existing account"
+    )
+    assert payload_row["memo"] not in r.json()["detail"]
 
     client.patch(
         f"/api/v1/accounts/{rent['id']}",
@@ -900,7 +1130,10 @@ def test_commit_rejects_missing_or_inactive_account(client, accounts, biz_bank):
         json={"rows": [payload_row]},
     )
     assert r.status_code == 400
-    assert "inactive" in r.json()["detail"]
+    assert r.json()["detail"] == (
+        "Row 1: account_id references an inactive account"
+    )
+    assert payload_row["memo"] not in r.json()["detail"]
 
 
 def test_commit_skips_duplicate_rows_inside_same_payload(client, biz_bank):
@@ -933,7 +1166,7 @@ def test_inactive_bank_account_rejects_manual_entry_and_import(client, biz_bank)
 
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "in",
             "amount": "100.00",

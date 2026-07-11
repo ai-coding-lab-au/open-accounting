@@ -13,9 +13,10 @@ modules are included, the practice-specific modules are not.
 - Multi-company: each company is its own SQLite file (`books.db`), plus a master registry
 - Chart of accounts (AU SME default seeded), manual journal entries with balanced-lines validation
 - Bank account with statement import (CSV/XLSX/PDF, UTF-8 English or simple Chinese column headers), dedupe, categorisation rules
-- Reconciliation view for uncategorised transactions
-- Reports as JSON + PDF: P&L, trial balance, balance sheet, BAS/GST, bank statement
-- Supplier (AP) / customer (AR) invoices with GL posting on authorise
+- Reconciliation view for uncategorised transactions, including explicit bank-to-invoice payment allocation
+- Reports as JSON + PDF: P&L, trial balance, balance sheet, GST activity summary/tax-code analysis, bank statement
+- Supplier (AP) / customer (AR) invoices with GL posting on authorise, allocation-derived paid status, and mixed-tax cash reporting
+- Monotonic accounting-period lock: dated writes in a closed period fail server-side
 
 **Documents**
 - Receipts issued directly to a client (line items, GST-inclusive/exclusive, void/restore)
@@ -86,8 +87,12 @@ frontend/
   src/types/       API types (single file)
 ```
 
-Multi-tenancy is a single HTTP header: the frontend sends `X-Company-Id`,
-the backend opens that company's SQLite file.
+Company database selection uses two HTTP headers: `X-Company-Id` identifies
+the company slug and `X-Company-Generation` identifies that specific database
+generation. The backend validates both before opening the company's SQLite
+file, so a stale tab cannot act on a same-slug company recreated after deletion.
+Manual bank-transaction creates additionally require an `Idempotency-Key`
+header; retry the same logical request with the same key.
 
 ## Data safety
 
@@ -98,12 +103,13 @@ gitignored as a second line of defence. Back up your `DATA_DIR`.
 ## Known heritage & roadmap
 
 - Bank feed: statement file import only; no live bank feeds.
-- Reconciliation is category-based; statement-vs-ledger matching is planned.
-- Invoice payments: bank clearing (linking a bank transaction to an invoice)
-  is planned. Until then, settle a posted invoice by categorising the bank
-  payment to Accounts Receivable (1100) / Accounts Payable (2000) with the
-  standard tax code — all reports stay correct, but the invoice register
-  keeps showing the invoice as authorised rather than paid.
+- Settle posted invoices through Reconciliation by selecting Accounts
+  Receivable (1100) / Accounts Payable (2000) and allocating the cash to the
+  exact invoice(s). Overpayment remainders stay on the same bank row and must
+  go to Customer Deposits (2050) or Supplier Prepayments (1500). Applying such
+  a remainder to a later invoice is an explicit adjustment workflow, not an
+  automatic memo match.
+- The GST screens and PDFs are internal summaries/diagnostics, not a lodged BAS.
 - Chromium PDF rendering is optional. Install it with
   `pip install -e ".[pdf]"` and `playwright install chromium`; otherwise the
   backend falls back to ReportLab rendering. The Windows portable build

@@ -4,9 +4,17 @@ import { api } from "../lib/api";
 import { useCompanyStore } from "../store/company";
 import { formatDate, formatMoney } from "../lib/format";
 import { apiErrorMessage } from "../lib/errors";
+import { todayLocal } from "../lib/date";
+import { useCurrentCompany } from "../lib/useCurrentCompany";
+import {
+  InvoiceAllocationEditor,
+  invoiceControlRequirement,
+  isInvoiceControlAccount,
+} from "../components/bank/InvoiceAllocationEditor";
 import type {
   Account,
   BankTransaction,
+  InvoicePaymentAllocationIn,
   TaxCode,
 } from "../types/api";
 
@@ -50,13 +58,20 @@ export default function ReconciliationPage() {
 // Section: uncategorised bank transactions (M3)
 // ---------------------------------------------------------------------------
 
-function gstForTax(amount: string, taxCode: TaxCode): string {
+function gstForTax(
+  amount: string,
+  taxCode: TaxCode,
+  gstRegistered: boolean,
+): string {
+  if (!gstRegistered) return "0";
   if (["gst_free", "input_taxed", "none"].includes(taxCode)) return "0";
   return (Number(amount || 0) / 11).toFixed(2);
 }
 
 function UncategorisedSection() {
   const currentId = useCompanyStore((s) => s.currentId);
+  const companyQ = useCurrentCompany();
+  const gstRegistered = companyQ.data?.gst_registered === true;
   const qc = useQueryClient();
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [batchAccountId, setBatchAccountId] = useState<number | "">("");
@@ -94,7 +109,8 @@ function UncategorisedSection() {
   const batchOther = useMemo(
     () =>
       activeAccounts.filter((a) =>
-        ["ASSET", "LIABILITY", "EQUITY"].includes(a.type),
+        ["ASSET", "LIABILITY", "EQUITY"].includes(a.type) &&
+        !isInvoiceControlAccount(a),
       ),
     [activeAccounts],
   );
@@ -110,6 +126,7 @@ function UncategorisedSection() {
     qc.invalidateQueries({ queryKey: ["dashboard"] });
     qc.invalidateQueries({ queryKey: ["trial-balance"] });
     qc.invalidateQueries({ queryKey: ["balance-sheet"] });
+    qc.invalidateQueries({ queryKey: ["invoices", currentId] });
   };
 
   const batchMut = useMutation({
@@ -120,8 +137,8 @@ function UncategorisedSection() {
         selectedTxns.map((txn) =>
           api.patch<BankTransaction>(`/bank-accounts/transactions/${txn.id}/categorise`, {
             account_id: batchAccountId,
-            tax_code: batchTaxCode,
-            gst_amount: gstForTax(txn.amount, batchTaxCode),
+            tax_code: gstRegistered ? batchTaxCode : "none",
+            gst_amount: gstForTax(txn.amount, batchTaxCode, gstRegistered),
           }),
         ),
       );
@@ -144,6 +161,12 @@ function UncategorisedSection() {
           Balance and Balance Sheet will be out of balance. Assign each one to
           make your books balance.
         </p>
+        {!gstRegistered && companyQ.data && (
+          <p className="text-xs text-amber-700 mt-1">
+            This company is not GST-registered; reconciliation records the full
+            amount with a zero GST split.
+          </p>
+        )}
       </div>
 
       <div className="bg-surface rounded-lg border border-slate-200 overflow-hidden">
@@ -201,13 +224,16 @@ function UncategorisedSection() {
                   balance-sheet accounts
                 </label>
               )}
+              <span className="block mt-0.5 text-[10px] text-slate-400">
+                AR/AP invoice control accounts must be allocated one row at a time.
+              </span>
             </label>
             <label className="block min-w-36">
               <span className="block text-xs text-slate-600 mb-1">Apply tax</span>
               <select
-                value={batchTaxCode}
+                value={gstRegistered ? batchTaxCode : "none"}
                 onChange={(e) => setBatchTaxCode(e.target.value as TaxCode)}
-                disabled={selectedCount === 0}
+                disabled={!gstRegistered || selectedCount === 0}
                 className="border rounded px-2 py-1 w-full text-xs bg-surface"
               >
                 <option value="standard">standard</option>
@@ -219,7 +245,12 @@ function UncategorisedSection() {
             </label>
             <button
               className="btn-primary text-xs"
-              disabled={selectedCount === 0 || batchAccountId === "" || batchMut.isPending}
+              disabled={
+                !companyQ.data ||
+                selectedCount === 0 ||
+                batchAccountId === "" ||
+                batchMut.isPending
+              }
               onClick={() => {
                 setBatchError(null);
                 batchMut.mutate();
@@ -281,6 +312,7 @@ function UncategorisedSection() {
                     })
                   }
                   onSaved={invalidate}
+                  gstRegistered={gstRegistered}
                 />
               ))}
             </tbody>
@@ -298,17 +330,31 @@ function UncategorisedRow({
   selected,
   onToggle,
   onSaved,
+  gstRegistered,
 }: {
   txn: BankTransaction;
   accounts: Account[];
   selected: boolean;
   onToggle: (checked: boolean) => void;
   onSaved: () => void;
+  gstRegistered: boolean;
 }) {
   const [accountId, setAccountId] = useState<number | "">(txn.account_id ?? "");
   const [taxCode, setTaxCode] = useState<TaxCode>(txn.tax_code);
   const [err, setErr] = useState<string | null>(null);
   const [showOther, setShowOther] = useState(false);
+  const [invoiceAllocations, setInvoiceAllocations] = useState<
+    InvoicePaymentAllocationIn[]
+  >([]);
+  const [allocationValid, setAllocationValid] = useState(false);
+  const [unappliedAccountId, setUnappliedAccountId] = useState<number | "">(
+    txn.unapplied_account_id ?? "",
+  );
+
+  const selectedAccount =
+    accountId === "" ? null : accounts.find((account) => account.id === accountId) ?? null;
+  const controlRequirement = invoiceControlRequirement(selectedAccount, txn.direction);
+  const requiresInvoiceAllocation = !!controlRequirement;
 
   // Filter by direction so a deposit can't be mis-posted to an expense (and
   // vice-versa); balance-sheet accounts are hidden behind an opt-in toggle.
@@ -319,20 +365,46 @@ function UncategorisedRow({
         ? new Set(["INCOME"])
         : new Set(["EXPENSE", "COST_OF_SALES"]);
     const others = new Set(["ASSET", "LIABILITY", "EQUITY"]);
+    const futureDated = txn.occurred_at > todayLocal();
+    const directionCompatible = (account: Account) =>
+      (account.code !== "1100" || txn.direction === "in") &&
+      (account.code !== "2000" || txn.direction === "out") &&
+      (!futureDated || !isInvoiceControlAccount(account));
     return {
-      primary: accounts.filter((a) => primaryTypes.has(a.type)),
-      rest: accounts.filter((a) => others.has(a.type)),
+      primary: accounts.filter(
+        (a) => directionCompatible(a) && primaryTypes.has(a.type),
+      ),
+      rest: accounts.filter((a) => directionCompatible(a) && others.has(a.type)),
     };
   }, [accounts, txn.direction]);
 
   const save = useMutation({
-    mutationFn: async (vars: { account_id: number; tax_code: TaxCode }) => {
+    mutationFn: async (vars: {
+      account_id: number;
+      tax_code: TaxCode;
+      invoice_allocations: InvoicePaymentAllocationIn[];
+      unapplied_account_id: number | null;
+    }) => {
+      const account = accounts.find((candidate) => candidate.id === vars.account_id);
+      const requiresAllocation = !!invoiceControlRequirement(account, txn.direction);
       const { data } = await api.patch<BankTransaction>(
         `/bank-accounts/transactions/${txn.id}/categorise`,
         {
           account_id: vars.account_id,
-          tax_code: vars.tax_code,
-          gst_amount: gstForTax(txn.amount, vars.tax_code),
+          tax_code: requiresAllocation
+            ? gstRegistered
+              ? "standard"
+              : "none"
+            : gstRegistered
+              ? vars.tax_code
+              : "none",
+          gst_amount: requiresAllocation
+            ? "0"
+            : gstForTax(txn.amount, vars.tax_code, gstRegistered),
+          invoice_allocations: requiresAllocation ? vars.invoice_allocations : [],
+          unapplied_account_id: requiresAllocation
+            ? vars.unapplied_account_id
+            : null,
         },
       );
       return data;
@@ -344,12 +416,25 @@ function UncategorisedRow({
   // Selecting an account (or changing the tax code once an account is set) saves
   // the row immediately — the inline dropdown IS the save, no extra click. Once
   // saved the row is categorised and drops out of this list.
-  const saveWith = (account: number | "", tax: TaxCode) => {
+  const saveWith = (
+    account: number | "",
+    tax: TaxCode,
+    allocations: InvoicePaymentAllocationIn[] = [],
+    unapplied: number | null = null,
+  ) => {
     setErr(null);
-    if (account !== "") save.mutate({ account_id: account, tax_code: tax });
+    if (account !== "") {
+      save.mutate({
+        account_id: account,
+        tax_code: tax,
+        invoice_allocations: allocations,
+        unapplied_account_id: unapplied,
+      });
+    }
   };
 
   return (
+    <>
     <tr className="border-b last:border-b-0">
       <td className="py-1.5 px-3">
         <input type="checkbox" checked={selected} onChange={(e) => onToggle(e.target.checked)} />
@@ -365,6 +450,11 @@ function UncategorisedRow({
           <span className="text-xs text-slate-500"> · {txn.counter_party_name}</span>
         )}
         {err && <span className="text-xs text-rose-600 block">{err}</span>}
+        {txn.occurred_at > todayLocal() && (
+          <span className="text-xs text-amber-700 block">
+            Scheduled: invoice controls unlock on the effective date.
+          </span>
+        )}
       </td>
       <td className="py-1.5 px-3">
         <select
@@ -372,7 +462,14 @@ function UncategorisedRow({
           onChange={(e) => {
             const v = e.target.value === "" ? "" : Number(e.target.value);
             setAccountId(v);
-            saveWith(v, taxCode);
+            setInvoiceAllocations([]);
+            setUnappliedAccountId("");
+            setAllocationValid(false);
+            const nextAccount =
+              v === "" ? null : accounts.find((account) => account.id === v) ?? null;
+            if (!invoiceControlRequirement(nextAccount, txn.direction)) {
+              saveWith(v, taxCode);
+            }
           }}
           disabled={save.isPending}
           className="border rounded px-1 py-0.5 w-full text-xs"
@@ -410,13 +507,21 @@ function UncategorisedRow({
       </td>
       <td className="py-1.5 px-3">
         <select
-          value={taxCode}
+          value={
+            requiresInvoiceAllocation
+              ? gstRegistered
+                ? "standard"
+                : "none"
+              : gstRegistered
+                ? taxCode
+                : "none"
+          }
           onChange={(e) => {
             const tc = e.target.value as TaxCode;
             setTaxCode(tc);
-            saveWith(accountId, tc);
+            if (!requiresInvoiceAllocation) saveWith(accountId, tc);
           }}
-          disabled={save.isPending}
+          disabled={!gstRegistered || requiresInvoiceAllocation || save.isPending}
           className="border rounded px-1 py-0.5 w-full min-w-[110px] text-xs"
         >
           <option value="standard">standard</option>
@@ -431,11 +536,48 @@ function UncategorisedRow({
           <span className="text-xs text-slate-400">Saving…</span>
         ) : accountId === "" ? (
           <span className="text-xs text-slate-400">Pick account</span>
+        ) : requiresInvoiceAllocation ? (
+          <button
+            type="button"
+            className="btn-primary text-xs px-2 py-1"
+            disabled={!allocationValid || save.isPending}
+            onClick={() =>
+              saveWith(
+                accountId,
+                taxCode,
+                invoiceAllocations,
+                unappliedAccountId === "" ? null : unappliedAccountId,
+              )
+            }
+          >
+            Allocate
+          </button>
         ) : (
           <span className="text-xs text-emerald-600">✓</span>
         )}
       </td>
     </tr>
+    {requiresInvoiceAllocation && (
+      <tr className="border-b bg-blue-50/30">
+        <td></td>
+        <td colSpan={7} className="px-3 py-2">
+          <InvoiceAllocationEditor
+            account={selectedAccount}
+            direction={txn.direction}
+            transactionDate={txn.occurred_at}
+            transactionAmount={txn.amount}
+            accounts={accounts}
+            allocations={invoiceAllocations}
+            onChange={setInvoiceAllocations}
+            unappliedAccountId={unappliedAccountId}
+            onUnappliedAccountChange={setUnappliedAccountId}
+            onValidityChange={setAllocationValid}
+            disabled={save.isPending}
+          />
+        </td>
+      </tr>
+    )}
+    </>
   );
 }
 

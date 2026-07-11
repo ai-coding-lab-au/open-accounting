@@ -1,5 +1,6 @@
 export interface Company {
   id: string;
+  generation_id: string;
   name: string;
   legal_name: string | null;
   abn: string | null;
@@ -27,11 +28,14 @@ export interface Company {
   operating_bank_account_number: string | null;
   operating_bank_swift: string | null;
   default_payment_terms_days: number;
+  books_locked_through: string | null;
   acn: string | null;
   created_at: string;
 }
 
-export type CompanyUpdate = Partial<Omit<Company, "id" | "country" | "base_currency" | "created_at">>;
+export type CompanyUpdate = Partial<
+  Omit<Company, "id" | "generation_id" | "country" | "base_currency" | "created_at">
+>;
 
 export interface CompanyCreate {
   id: string;
@@ -186,13 +190,16 @@ export interface InvoiceLineIn {
   line_subtotal: string;
   line_gst?: string;
   line_total: string;
+  tax_code?: TaxCode;
 }
 
 export interface InvoiceUpdate {
+  direction?: InvoiceDirection;
   issue_date?: string | null;
   due_date?: string | null;
   contact_id?: number | null;
   invoice_number?: string;
+  currency?: string;
   subtotal?: string;
   gst_amount?: string;
   total?: string;
@@ -201,6 +208,7 @@ export interface InvoiceUpdate {
   paid_amount?: string;
   paid_date?: string | null;
   notes?: string | null;
+  lines?: InvoiceLineIn[] | null;
 }
 
 export interface PdfUploadResult {
@@ -335,6 +343,23 @@ export type BankTxnDirection = "in" | "out";
 
 export type TaxCode = "standard" | "gst_free" | "input_taxed" | "capital" | "none";
 
+export interface InvoicePaymentAllocationIn {
+  invoice_id: number;
+  amount: string;
+}
+
+export interface InvoicePaymentTaxComponent {
+  tax_code: TaxCode;
+  gross_amount: string;
+  gst_amount: string;
+}
+
+export interface InvoicePaymentAllocation extends InvoicePaymentAllocationIn {
+  id: number;
+  gst_amount: string;
+  tax_components: InvoicePaymentTaxComponent[];
+}
+
 export interface BankTransaction {
   id: number;
   bank_account_id: number;
@@ -347,6 +372,9 @@ export interface BankTransaction {
   gst_amount: string;
   tax_code: TaxCode;
   created_at: string;
+  invoice_allocations: InvoicePaymentAllocation[];
+  unapplied_account_id: number | null;
+  unapplied_amount: string;
 }
 
 export interface BankTransactionIn {
@@ -358,6 +386,8 @@ export interface BankTransactionIn {
   account_id?: number | null;
   gst_amount?: string;
   tax_code?: TaxCode;
+  invoice_allocations?: InvoicePaymentAllocationIn[];
+  unapplied_account_id?: number | null;
 }
 
 export interface BankTransactionUpdate {
@@ -366,6 +396,9 @@ export interface BankTransactionUpdate {
   account_id?: number | null;
   set_account_null?: boolean;
   gst_amount?: string | null;
+  tax_code?: TaxCode | null;
+  invoice_allocations?: InvoicePaymentAllocationIn[] | null;
+  unapplied_account_id?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +547,8 @@ export interface BankImportCommitRow {
   memo?: string | null;
   counter_party_name?: string | null;
   gst_amount?: string;
+  invoice_allocations?: InvoicePaymentAllocationIn[];
+  unapplied_account_id?: number | null;
 }
 
 export interface BankImportCommitResult {
@@ -527,6 +562,7 @@ export interface GSTExposureReport {
   period_end: string;
   fy_year: number | null;
   quarter: number | null;
+  gst_registered: boolean;
 
   g1_total_sales: string;
   g3_gst_free_sales: string;

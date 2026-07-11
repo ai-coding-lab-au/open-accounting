@@ -21,9 +21,10 @@ We support both. The user can override the mapping in the preview UI.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from sqlalchemy.orm import Session
@@ -46,11 +47,16 @@ from .excel_import import (
     _read_xlsx,
 )
 from .bank_accounts import (
+    BankTxnError,
     InvoicePaymentWouldDoubleCount,
+    reject_control_category_for_void_invoice,
+    reject_capital_tax_code_on_control_account,
     reject_expense_category_for_matching_ap_payment,
     reject_income_category_for_matching_ar_payment,
 )
+from . import gst_policy, invoice_payments
 from ..schemas.bank import check_txn_date
+from ..schemas._limits import SQLITE_EXACT_MONEY_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -311,17 +317,36 @@ def compute_dedup_key(
     amount: Decimal | str,
     occurred_at: date | str,
     memo: str | None,
+    counter_party_name: str | None,
 ) -> str:
     """Stable SHA-256 hash. Same logical txn → same hash, regardless of
     whether import is via CSV or XLSX or a re-import of the same statement.
 
-    Memo is normalised (trim + lowercase + collapse whitespace) so trivial
-    formatting changes don't break dedup.
+    Memo and counter-party are normalised (trim + lowercase + collapse
+    whitespace) so trivial formatting changes don't break dedup.  A structured
+    JSON tuple avoids delimiter-collision ambiguity between text fields.
     """
     amt = Decimal(str(amount)).quantize(Decimal("0.01"))
-    occ = occurred_at if isinstance(occurred_at, str) else occurred_at.isoformat()
-    norm_memo = " ".join((memo or "").lower().split())
-    payload = f"{bank_account_id}|{direction}|{amt}|{occ}|{norm_memo}"
+    occ = (
+        date.fromisoformat(occurred_at).isoformat()
+        if isinstance(occurred_at, str)
+        else occurred_at.isoformat()
+    )
+    direction_value = (
+        direction.value if hasattr(direction, "value") else str(direction)
+    )
+    payload = json.dumps(
+        [
+            int(bank_account_id),
+            direction_value,
+            f"{amt:.2f}",
+            occ,
+            _norm_text(memo),
+            _norm_text(counter_party_name),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -493,7 +518,14 @@ def _tax_code_value(value: TaxCode | str | None) -> str | None:
     return value.value if hasattr(value, "value") else str(value)
 
 
-def _suggested_gst_amount(amount: Decimal, tax_code: TaxCode | str | None) -> str | None:
+def _suggested_gst_amount(
+    amount: Decimal,
+    tax_code: TaxCode | str | None,
+    *,
+    gst_registered: bool = True,
+) -> str | None:
+    if not gst_registered:
+        return "0.00"
     if tax_code is None:
         return None
     try:
@@ -600,6 +632,7 @@ def preview_import(
     content: bytes,
     filename: str,
     bank_format: str | None = None,
+    gst_registered: bool,
 ) -> dict[str, Any]:
     bank = db.get(BankAccount, bank_account_id)
     if bank is None:
@@ -644,6 +677,7 @@ def preview_import(
             amount=shape["amount"],
             occurred_at=shape["occurred_at"],
             memo=shape["memo"],
+            counter_party_name=shape["counter_party_name"],
         )
         materialised.append({
             "row_no": row["row_no"],
@@ -712,7 +746,9 @@ def preview_import(
             tax_code = _tax_code_value(rule.set_tax_code)
             m["suggested_account_id"] = rule.set_account_id
             m["suggested_tax_code"] = tax_code
-            m["suggested_gst_amount"] = _suggested_gst_amount(amount, tax_code)
+            m["suggested_gst_amount"] = _suggested_gst_amount(
+                amount, tax_code, gst_registered=gst_registered
+            )
             m["suggestion_source"] = "rule"
             m["matched_rule_id"] = rule.id
             m["matched_rule_description"] = rule.description
@@ -727,17 +763,28 @@ def preview_import(
                 account, tax_code, keyword = suggestion
                 m["suggested_account_id"] = account.id
                 m["suggested_tax_code"] = tax_code
-                m["suggested_gst_amount"] = _suggested_gst_amount(amount, tax_code)
+                m["suggested_gst_amount"] = _suggested_gst_amount(
+                    amount, tax_code, gst_registered=gst_registered
+                )
                 m["suggestion_source"] = "heuristic"
                 m["matched_rule_id"] = None
                 m["matched_rule_description"] = keyword
             else:
                 m["suggested_account_id"] = None
                 m["suggested_tax_code"] = "standard"
-                m["suggested_gst_amount"] = None
+                m["suggested_gst_amount"] = (
+                    None if gst_registered else "0.00"
+                )
                 m["suggestion_source"] = None
                 m["matched_rule_id"] = None
                 m["matched_rule_description"] = None
+
+        if not gst_registered:
+            # Keep the useful account/category suggestion but persist the row
+            # outside BAS for its entire lifetime, including after a future
+            # change to gst_registered=True.
+            m["suggested_tax_code"] = "none"
+            m["suggested_gst_amount"] = "0.00"
 
     return {
         "bank_account_id": bank_account_id,
@@ -748,24 +795,136 @@ def preview_import(
     }
 
 
+_COMMIT_MONEY_MAX = SQLITE_EXACT_MONEY_MAX
+_COMMIT_MONEY_QUANTUM = Decimal("0.01")
+
+
+def _commit_row_error(row_index: int, reason: str) -> ValueError:
+    """Build a safe error that never serialises the caller's raw row."""
+    return ValueError(f"Row {row_index}: {reason}")
+
+
+def _commit_money(
+    value: Any,
+    *,
+    row_index: int,
+    field: str,
+    strictly_positive: bool,
+) -> Decimal:
+    try:
+        amount = Decimal(str(value))
+        quantised = amount.quantize(_COMMIT_MONEY_QUANTUM)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise _commit_row_error(row_index, f"{field} is not a valid amount") from exc
+    if not amount.is_finite() or amount != quantised:
+        raise _commit_row_error(
+            row_index,
+            f"{field} must have at most two decimal places",
+        )
+    if strictly_positive and amount <= 0:
+        raise _commit_row_error(row_index, f"{field} must be greater than zero")
+    if not strictly_positive and amount < 0:
+        raise _commit_row_error(row_index, f"{field} must not be negative")
+    if amount > _COMMIT_MONEY_MAX:
+        raise _commit_row_error(row_index, f"{field} exceeds the supported limit")
+    return quantised
+
+
+def _canonical_commit_row(
+    row: dict[str, Any],
+    *,
+    row_index: int,
+    bank_account_id: int,
+) -> dict[str, Any]:
+    """Validate a service caller and derive the server-owned dedup identity."""
+    try:
+        direction = BankTxnDirection(row.get("direction"))
+    except (TypeError, ValueError) as exc:
+        raise _commit_row_error(row_index, "direction must be 'in' or 'out'") from exc
+    try:
+        tax_code = TaxCode(row.get("tax_code") or TaxCode.STANDARD.value)
+    except (TypeError, ValueError) as exc:
+        raise _commit_row_error(row_index, "tax_code is invalid") from exc
+
+    amount = _commit_money(
+        row.get("amount"),
+        row_index=row_index,
+        field="amount",
+        strictly_positive=True,
+    )
+    gst_amount = _commit_money(
+        row.get("gst_amount", Decimal("0")),
+        row_index=row_index,
+        field="gst_amount",
+        strictly_positive=False,
+    )
+
+    occurred_value = row.get("occurred_at")
+    try:
+        occurred_at = (
+            occurred_value
+            if type(occurred_value) is date
+            else date.fromisoformat(occurred_value)
+        )
+    except (TypeError, ValueError) as exc:
+        raise _commit_row_error(row_index, "occurred_at is not a valid date") from exc
+    try:
+        check_txn_date(occurred_at)
+    except ValueError as exc:
+        raise _commit_row_error(
+            row_index,
+            "occurred_at is outside the supported reportable range",
+        ) from exc
+
+    memo = row.get("memo") or None
+    counter_party = row.get("counter_party_name") or None
+    if memo is not None and not isinstance(memo, str):
+        raise _commit_row_error(row_index, "memo must be text")
+    if counter_party is not None and not isinstance(counter_party, str):
+        raise _commit_row_error(row_index, "counter_party_name must be text")
+
+    return {
+        "row_index": row_index,
+        "occurred_at": occurred_at,
+        "direction": direction,
+        "amount": amount,
+        "dedup_key": compute_dedup_key(
+            bank_account_id=bank_account_id,
+            direction=direction.value,
+            amount=amount,
+            occurred_at=occurred_at,
+            memo=memo,
+            counter_party_name=counter_party,
+        ),
+        "account_id": row.get("account_id"),
+        "tax_code": tax_code,
+        "memo": memo,
+        "counter_party_name": counter_party,
+        "gst_amount": gst_amount,
+        "invoice_allocations": row.get("invoice_allocations") or [],
+        "unapplied_account_id": row.get("unapplied_account_id"),
+    }
+
+
 def commit_import(
     db: Session,
     *,
     bank_account_id: int,
     rows: list[dict[str, Any]],
+    gst_registered: bool,
 ) -> dict[str, Any]:
     """Write the rows the user accepted.
 
     Each row in `rows` must carry:
-      - occurred_at (str ISO)
+      - occurred_at (date)
       - direction ("in" | "out")
-      - amount (Decimal-as-string, positive)
-      - dedup_key (from preview)
+      - amount (Decimal, positive)
+      - dedup_key (legacy wire field; ignored and recomputed server-side)
       - account_id (int | None)
       - tax_code (TaxCode value)
       - memo (str | None)
       - counter_party_name (str | None)
-      - gst_amount (Decimal-as-string, default 0)
+      - gst_amount (Decimal, default 0)
 
     Rows that duplicate an existing transaction are silently skipped: by
     dedup_key (exact re-import) AND by fingerprint (amount+date+direction with
@@ -780,35 +939,50 @@ def commit_import(
     if not bank.is_active:
         raise ValueError(f"Bank account {bank.name} is inactive")
 
+    canonical_rows = [
+        _canonical_commit_row(
+            row,
+            row_index=row_index,
+            bank_account_id=bank_account_id,
+        )
+        for row_index, row in enumerate(rows, start=1)
+    ]
+
     seen = existing_dedup_keys(
         db,
         bank_account_id=bank_account_id,
-        keys=[r["dedup_key"] for r in rows if r.get("dedup_key")],
+        keys=[row["dedup_key"] for row in canonical_rows],
     )
     existing_index = existing_txn_fingerprints(db, bank_account_id=bank_account_id)
 
     created = 0
     skipped = 0
-    for r in rows:
-        dk = r.get("dedup_key")
-        if dk and dk in seen:
+    for row in canonical_rows:
+        row_index = row["row_index"]
+        dk = row["dedup_key"]
+        if dk in seen:
             skipped += 1
             continue
+        direction = row["direction"]
+        tc = row["tax_code"]
+        gst_amount = row["gst_amount"]
         try:
-            direction = BankTxnDirection(r["direction"])
-            tc = TaxCode(r.get("tax_code") or "standard")
-        except (KeyError, ValueError) as e:
-            raise ValueError(f"Row {r}: invalid direction or tax_code: {e}")
-
-        gst_amount = Decimal(r.get("gst_amount") or "0")
-        amount = Decimal(r["amount"])
-        occurred_at = date.fromisoformat(r["occurred_at"])
-        try:
-            check_txn_date(occurred_at)
-        except ValueError as e:
-            raise ValueError(f"Row {r}: {e}")
-        memo = r.get("memo") or None
-        counter_party = r.get("counter_party_name") or None
+            gst_policy.require_gst_registered_for_amount(
+                gst_registered=gst_registered,
+                gst_amount=gst_amount,
+                context="Bank import row",
+            )
+        except gst_policy.GstRegistrationError as exc:
+            raise _commit_row_error(
+                row_index,
+                "gst_amount is not allowed while the company is not GST-registered",
+            ) from exc
+        if not gst_registered:
+            tc = TaxCode.NONE
+        amount = row["amount"]
+        occurred_at = row["occurred_at"]
+        memo = row["memo"]
+        counter_party = row["counter_party_name"]
         # Skip a row that duplicates a transaction that was ALREADY on the
         # account before this payload (including manual rows with no dedup_key) —
         # the same fingerprint the preview flags with, so "Will import N" matches
@@ -826,15 +1000,24 @@ def commit_import(
         ):
             skipped += 1
             continue
-        account_id = r.get("account_id")
+        account_id = row["account_id"]
+        invoice_allocations = row["invoice_allocations"]
+        unapplied_account_id = row["unapplied_account_id"]
         acc = None
         if account_id is not None:
             acc = db.get(Account, account_id)
             if acc is None:
-                raise ValueError(f"Row {r}: account {account_id} not found")
+                raise _commit_row_error(
+                    row_index,
+                    "account_id does not reference an existing account",
+                )
             if not acc.active:
-                raise ValueError(f"Row {r}: account {acc.code} is inactive")
+                raise _commit_row_error(
+                    row_index,
+                    "account_id references an inactive account",
+                )
             try:
+                reject_capital_tax_code_on_control_account(acc, tc)
                 reject_income_category_for_matching_ar_payment(
                     db,
                     direction=direction,
@@ -842,6 +1025,7 @@ def commit_import(
                     account=acc,
                     memo=memo,
                     counter_party_name=counter_party,
+                    occurred_at=occurred_at,
                 )
                 reject_expense_category_for_matching_ap_payment(
                     db,
@@ -850,17 +1034,38 @@ def commit_import(
                     account=acc,
                     memo=memo,
                     counter_party_name=counter_party,
+                    occurred_at=occurred_at,
                 )
-            except InvoicePaymentWouldDoubleCount as e:
-                raise ValueError(f"Row {r}: {e}") from e
+                if not invoice_allocations:
+                    reject_control_category_for_void_invoice(
+                        db,
+                        direction=direction,
+                        amount=amount,
+                        account=acc,
+                        memo=memo,
+                        counter_party_name=counter_party,
+                        occurred_at=occurred_at,
+                    )
+            except InvoicePaymentWouldDoubleCount as exc:
+                raise _commit_row_error(
+                    row_index,
+                    "classification conflicts with an existing invoice settlement",
+                ) from exc
+            except BankTxnError as exc:
+                raise _commit_row_error(
+                    row_index,
+                    "account and tax_code are incompatible",
+                ) from exc
         # Sanity: forbid GST on non-standard/capital codes.
         if tc not in (TaxCode.STANDARD, TaxCode.CAPITAL) and gst_amount > 0:
-            raise ValueError(
-                f"Row {r}: tax_code={tc.value} forbids gst_amount > 0"
+            raise _commit_row_error(
+                row_index,
+                "gst_amount must be zero for the selected tax_code",
             )
         if gst_amount > amount:
-            raise ValueError(
-                f"Row {r}: gst_amount {gst_amount} > amount {amount}"
+            raise _commit_row_error(
+                row_index,
+                "gst_amount must not exceed amount",
             )
 
         txn = BankTransaction(
@@ -876,9 +1081,24 @@ def commit_import(
             dedup_key=dk,
         )
         db.add(txn)
+        db.flush()
+        try:
+            invoice_payments.replace_transaction_allocations(
+                db,
+                txn,
+                invoice_allocations,
+                unapplied_account_id=unapplied_account_id,
+            )
+        except invoice_payments.PaymentAllocationError as exc:
+            raise _commit_row_error(
+                row_index,
+                "invoice allocation is invalid or incomplete",
+            ) from exc
+        if not gst_registered:
+            txn.gst_amount = Decimal("0.00")
+            txn.tax_code = TaxCode.NONE
         created += 1
-        if dk:
-            seen.add(dk)  # don't double-add within the same payload
+        seen.add(dk)  # don't double-add within the same payload
 
     db.commit()
     return {"created": created, "skipped_duplicates": skipped}

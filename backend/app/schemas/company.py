@@ -1,6 +1,10 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from ._currency import normalise_aud
+from ._dates import MAX_REPORTABLE_DATE, MIN_REPORTABLE_DATE
+from ._limits import SQLITE_INT_MAX
 
 
 def _strip_internal_spaces(v: str | None) -> str | None:
@@ -21,6 +25,12 @@ class CompanyCreate(BaseModel):
     fy_start_month: int = Field(default=7, ge=1, le=12)
     gst_registered: bool = True
     default_payment_terms_days: int = Field(default=28, ge=0, le=365)
+
+    @field_validator("base_currency", mode="before")
+    @classmethod
+    def _aud_only(cls, v):
+        return normalise_aud(v)
+
     @field_validator("abn", mode="before")
     @classmethod
     def _normalise_reg_number(cls, v):
@@ -33,6 +43,7 @@ class CompanyUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     legal_name: str | None = Field(default=None, max_length=200)
     abn: str | None = Field(default=None, max_length=20)
+    base_currency: str | None = Field(default=None, min_length=3, max_length=3)
     fy_start_month: int | None = Field(default=None, ge=1, le=12)
     gst_registered: bool | None = None
     bilingual_labels: bool | None = None
@@ -57,8 +68,20 @@ class CompanyUpdate(BaseModel):
     operating_bank_account_number: str | None = Field(default=None, max_length=30)
     operating_bank_swift: str | None = Field(default=None, max_length=20)
     default_payment_terms_days: int | None = Field(default=None, ge=0, le=365)
+    books_locked_through: date | None = Field(
+        default=None,
+        ge=MIN_REPORTABLE_DATE,
+        le=MAX_REPORTABLE_DATE,
+    )
 
     acn: str | None = Field(default=None, max_length=20)
+
+    @field_validator("base_currency", mode="before")
+    @classmethod
+    def _aud_only(cls, v):
+        if v is None:
+            raise ValueError("base_currency cannot be null")
+        return normalise_aud(v)
 
     @field_validator("acn", mode="before")
     @classmethod
@@ -70,6 +93,7 @@ class CompanyOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    generation_id: str
     name: str
     legal_name: str | None
     abn: str | None
@@ -99,6 +123,7 @@ class CompanyOut(BaseModel):
     operating_bank_account_number: str | None = None
     operating_bank_swift: str | None = None
     default_payment_terms_days: int = 28
+    books_locked_through: date | None = None
 
     acn: str | None = None
 
@@ -125,7 +150,7 @@ class AccountCreate(BaseModel):
     code: str = Field(min_length=1, max_length=20, pattern=r"^[A-Za-z0-9._-]+$")
     name: str = Field(min_length=1, max_length=200)
     type: str = Field(pattern=r"^(ASSET|LIABILITY|EQUITY|INCOME|EXPENSE|COST_OF_SALES)$")
-    parent_id: int | None = None
+    parent_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     is_gst: bool = False
     description: str | None = Field(default=None, max_length=500)
 
@@ -134,7 +159,7 @@ class AccountUpdate(BaseModel):
     code: str | None = Field(default=None, min_length=1, max_length=20, pattern=r"^[A-Za-z0-9._-]+$")
     name: str | None = Field(default=None, min_length=1, max_length=200)
     type: str | None = Field(default=None, pattern=r"^(ASSET|LIABILITY|EQUITY|INCOME|EXPENSE|COST_OF_SALES)$")
-    parent_id: int | None = None
+    parent_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     set_parent_null: bool = False
     is_gst: bool | None = None
     active: bool | None = None

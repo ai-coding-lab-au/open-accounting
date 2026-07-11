@@ -5,10 +5,11 @@ import json
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...deps import PathId, get_company_db, get_current_company
@@ -22,8 +23,8 @@ from ...models.company import (
     JournalEntrySource,
 )
 from ...models.master import Company
+from ...schemas._currency import normalise_aud
 from ...schemas.invoice import (
-    AttachmentOut,
     ExcelImportPayload,
     InvoiceCreate,
     InvoiceOut,
@@ -32,8 +33,14 @@ from ...schemas.invoice import (
     SpreadsheetPreview,
 )
 from ...services import attachments as attach_svc
-from ...services import doc_numbering, excel_import, invoice_posting
-from ...services.invoice_math import GstMathError, check_gst_math
+from ...services import (
+    doc_numbering,
+    excel_import,
+    gst_policy,
+    invoice_posting,
+    period_lock,
+)
+from ...services.invoice_math import GstMathError, check_gst_math, check_invoice_lines
 from ...services.journal import JournalError
 from ...utils.http import safe_filename
 from .contacts import get_or_create_contact
@@ -42,6 +49,27 @@ from .contacts import get_or_create_contact
 # Hard cap on uploads to keep memory + disk under control. 25 MB comfortably
 # covers a scanned 50-page invoice PDF or a 10k-row spreadsheet.
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile) -> bytes:
+    """Read an upload in bounded chunks and reject it as soon as it is too large."""
+
+    chunks: list[bytes] = []
+    total_size = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+
+        total_size += len(chunk)
+        if total_size > _MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                413,
+                f"File too large ({total_size // (1024 * 1024)} MB). "
+                f"Maximum is {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+            )
+        chunks.append(chunk)
 
 
 def _check_gst_math(subtotal: Decimal, gst_amount: Decimal, total: Decimal) -> None:
@@ -51,7 +79,56 @@ def _check_gst_math(subtotal: Decimal, gst_amount: Decimal, total: Decimal) -> N
         raise HTTPException(422, str(exc)) from exc
 
 
+def _check_line_math(subtotal: Decimal, gst_amount: Decimal, total: Decimal, lines) -> None:
+    try:
+        check_invoice_lines(subtotal, gst_amount, total, lines)
+    except GstMathError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _ensure_invoice_gst_allowed(
+    company: Company,
+    *,
+    gst_amount: Decimal,
+    lines,
+    context: str,
+) -> None:
+    """Enforce the non-registered-company invariant on header and line GST."""
+
+    try:
+        gst_policy.require_gst_registered_for_amount(
+            gst_registered=company.gst_registered,
+            gst_amount=gst_amount,
+            context=context,
+        )
+        for line in lines or []:
+            line_gst = (
+                line.line_gst
+                if hasattr(line, "line_gst")
+                else line.get("line_gst", 0)
+            )
+            gst_policy.require_gst_registered_for_amount(
+                gst_registered=company.gst_registered,
+                gst_amount=line_gst,
+                context=f"{context} line",
+            )
+            if not company.gst_registered:
+                if hasattr(line, "tax_code"):
+                    line.tax_code = "none"
+                elif isinstance(line, dict):
+                    line["tax_code"] = "none"
+    except gst_policy.GstRegistrationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 router = APIRouter(prefix="/invoices", tags=["invoices"])
+
+
+def _require_open_period(company: Company, value: date, *, operation: str) -> None:
+    try:
+        period_lock.require_open_date(company, value, operation=operation)
+    except period_lock.AccountingPeriodLockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _excel_source_ref(*, row_no: int | None, parsed: dict) -> str:
@@ -225,10 +302,32 @@ def _source_ref_collision_message(source, source_ref: str, existing: Invoice) ->
 @router.post("", response_model=InvoiceOut, status_code=201)
 def create_invoice(
     payload: InvoiceCreate,
-    _: Company = Depends(get_current_company),
+    company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
+    if payload.status in {
+        InvoiceStatus.PARTIAL.value,
+        InvoiceStatus.PAID.value,
+        InvoiceStatus.VOID.value,
+    }:
+        raise HTTPException(
+            422,
+            "An invoice cannot be created as partial, paid, or void. Create/post "
+            "it first, then record settlement through the bank control account.",
+        )
+    _ensure_invoice_gst_allowed(
+        company,
+        gst_amount=payload.gst_amount,
+        lines=payload.lines,
+        context="Invoice",
+    )
     _check_gst_math(payload.subtotal, payload.gst_amount, payload.total)
+    _check_line_math(payload.subtotal, payload.gst_amount, payload.total, payload.lines)
+    if payload.lines:
+        try:
+            invoice_posting.validate_invoice_line_accounts(db, payload.direction, payload.lines)
+        except invoice_posting.InvoicePostingError as exc:
+            _raise_posting_http(exc)
     contact = _resolve_contact(db, payload)
 
     existing = _find_source_ref_collision(db, payload.source, payload.source_ref)
@@ -260,9 +359,12 @@ def create_invoice(
     db.add(inv)
     try:
         db.flush()
-    except Exception as e:
+    except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(409, f"Duplicate invoice (direction + contact + number): {e}") from e
+        raise HTTPException(
+            409,
+            "Duplicate invoice: direction, contact, and invoice number must be unique.",
+        ) from exc
 
     if payload.attachment_id:
         att = db.get(Attachment, payload.attachment_id)
@@ -274,17 +376,9 @@ def create_invoice(
 
     requested_status = payload.status or InvoiceStatus.DRAFT.value
     if requested_status != InvoiceStatus.DRAFT.value:
-        if requested_status == InvoiceStatus.VOID.value:
-            # A void-on-create invoice would have no journal entry to reverse
-            # and no way to ever be deleted — an unremovable zombie row.
-            raise HTTPException(422, "Cannot create an invoice as void.")
         try:
             invoice_posting.post_invoice(db, inv.id)
-            if requested_status in {
-                InvoiceStatus.UNPAID.value,
-                InvoiceStatus.PARTIAL.value,
-                InvoiceStatus.PAID.value,
-            }:
+            if requested_status == InvoiceStatus.UNPAID.value:
                 inv.status = requested_status
         except invoice_posting.InvoicePostingError as e:
             db.rollback()
@@ -327,7 +421,7 @@ def _resolve_contact(db: Session, payload: InvoiceCreate) -> Contact:
 def update_invoice(
     invoice_id: PathId,
     payload: InvoiceUpdate,
-    _: Company = Depends(get_current_company),
+    company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
     inv = db.get(Invoice, invoice_id)
@@ -336,13 +430,13 @@ def update_invoice(
     changes = payload.model_dump(exclude_unset=True)
     if "status" in changes:
         # Status transitions go through the post/void endpoints only; payment
-        # status is derived from paid_amount below. Allowing a raw status write
+        # status is derived from explicit bank allocations. Allowing a raw status write
         # let a posted invoice be demoted to draft and hard-deleted, orphaning
         # its locked journal entry (audit P0-E).
         raise HTTPException(
             422,
             "Status cannot be changed via PATCH. Use the post/void endpoints; "
-            "payment status is derived from paid_amount.",
+            "payment status is derived from explicit bank allocations.",
         )
     if not _is_draft(inv):
         if _is_void(inv) and ({"paid_amount", "paid_date"} & set(changes)):
@@ -352,8 +446,8 @@ def update_invoice(
         if {"paid_amount", "paid_date"} & set(changes):
             raise HTTPException(
                 409,
-                "Invoice payment status is document-only until bank clearing is implemented. "
-                "Record the bank transaction against the AR/AP control account instead.",
+                "Invoice payment amount, date, and status are derived from explicit "
+                "bank-to-invoice allocations and cannot be edited directly.",
             )
         forbidden = (
             set(changes)
@@ -370,6 +464,20 @@ def update_invoice(
         )
 
     lines = changes.pop("lines", None)
+
+    # Validate the effective draft before mutating it.  This covers a direction
+    # switch that keeps old lines as well as replacement lines supplied in the
+    # same PATCH.  Posting repeats the check to protect legacy/drifted rows.
+    effective_direction = changes.get("direction", inv.direction)
+    effective_lines = lines if lines is not None else inv.lines
+    if effective_lines:
+        try:
+            invoice_posting.validate_invoice_line_accounts(
+                db, effective_direction, effective_lines
+            )
+        except invoice_posting.InvoicePostingError as exc:
+            _raise_posting_http(exc)
+
     for field, value in changes.items():
         setattr(inv, field, value)
     if lines is not None:
@@ -378,18 +486,15 @@ def update_invoice(
         for li in lines:
             inv.lines.append(InvoiceLine(**li))
 
+    _ensure_invoice_gst_allowed(
+        company,
+        gst_amount=inv.gst_amount,
+        lines=inv.lines,
+        context="Invoice",
+    )
     # Re-validate totals after any change touching them.
     _check_gst_math(inv.subtotal, inv.gst_amount, inv.total)
-    # TODO(payment-posting): paid_amount/status changes currently update only
-    # the invoice document; the Bank ↔ AR/AP journal for payment matching is
-    # a separate increment.
-    if payload.paid_amount is not None:
-        if Decimal(inv.paid_amount) <= 0:
-            inv.status = "unpaid"
-        elif Decimal(inv.paid_amount) >= Decimal(inv.total):
-            inv.status = "paid"
-        else:
-            inv.status = "partial"
+    _check_line_math(inv.subtotal, inv.gst_amount, inv.total, inv.lines)
     db.commit()
     db.refresh(inv)
     return _serialize(_attach_journal_entries(db, inv))
@@ -398,7 +503,7 @@ def update_invoice(
 @router.post("/{invoice_id}/post")
 def post_invoice_endpoint(
     invoice_id: PathId,
-    _: Company = Depends(get_current_company),
+    company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
     # Take the write lock BEFORE the idempotency SELECT inside post_invoice, so
@@ -406,6 +511,20 @@ def post_invoice_endpoint(
     # AlreadyPosted (409) instead of racing to INSERT and hitting the DB unique
     # index → IntegrityError → 500 (audit round-3 P2, matching recognise/convert).
     doc_numbering._begin_sqlite_immediate(db)
+    inv = db.get(Invoice, invoice_id)
+    if inv is None:
+        raise HTTPException(404, "Invoice not found")
+    _require_open_period(
+        company,
+        inv.issue_date,
+        operation="post an invoice",
+    )
+    _ensure_invoice_gst_allowed(
+        company,
+        gst_amount=inv.gst_amount,
+        lines=inv.lines,
+        context="Invoice",
+    )
     try:
         entry = invoice_posting.post_invoice(db, invoice_id)
         db.commit()
@@ -424,13 +543,21 @@ def post_invoice_endpoint(
 @router.post("/{invoice_id}/void")
 def void_invoice_endpoint(
     invoice_id: PathId,
-    _: Company = Depends(get_current_company),
+    company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
     # Same write-lock treatment as /post: serialise concurrent voids so the loser
     # sees the winner's reversal and gets AlreadyVoided (409), not a 500 from the
     # uq_journal_source_doc unique index (audit round-3 P2).
     doc_numbering._begin_sqlite_immediate(db)
+    inv = db.get(Invoice, invoice_id)
+    if inv is None:
+        raise HTTPException(404, "Invoice not found")
+    _require_open_period(
+        company,
+        inv.issue_date,
+        operation="void an invoice",
+    )
     try:
         entry = invoice_posting.void_invoice(db, invoice_id)
         db.commit()
@@ -447,6 +574,10 @@ def void_invoice(
     company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
+    # The UI uses DELETE for both draft deletion and posted-invoice voiding.
+    # Serialise it with POST /void and bank categorisation so the settlement
+    # guard and the eventual reversal observe one stable database state.
+    doc_numbering._begin_sqlite_immediate(db)
     inv = db.get(Invoice, invoice_id)
     if inv is None:
         raise HTTPException(404, "Invoice not found")
@@ -489,6 +620,11 @@ def void_invoice(
         db.delete(inv)
         db.commit()
         return None
+    _require_open_period(
+        company,
+        inv.issue_date,
+        operation="void an invoice",
+    )
     try:
         invoice_posting.void_invoice(db, invoice_id)
         db.commit()
@@ -542,15 +678,9 @@ async def upload_pdf(
 ):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Please upload a .pdf file")
-    content = await file.read()
+    content = await _read_upload_capped(file)
     if not content:
         raise HTTPException(400, "Empty file")
-    if len(content) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            413,
-            f"File too large ({len(content) // (1024 * 1024)} MB). "
-            f"Maximum is {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
-        )
 
     # Save the file first (idempotent on sha256) so the user can re-confirm without re-uploading.
     try:
@@ -585,28 +715,26 @@ async def upload_excel(
 ):
     if not file.filename:
         raise HTTPException(400, "Missing filename")
-    content = await file.read()
+    content = await _read_upload_capped(file)
     if not content:
         raise HTTPException(400, "Empty file")
-    if len(content) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            413,
-            f"File too large ({len(content) // (1024 * 1024)} MB). "
-            f"Maximum is {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
-        )
     try:
         preview = excel_import.parse_spreadsheet(content=content, filename=file.filename)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except Exception as e:
-        raise HTTPException(400, f"Failed to parse spreadsheet: {e}") from e
+        raise HTTPException(
+            400,
+            "Failed to parse spreadsheet. Check that the file is a supported "
+            "CSV or Excel workbook and try again.",
+        ) from e
     return preview
 
 
 @router.post("/import-excel-rows")
 def import_excel_rows(
     payload: ExcelImportPayload,
-    _: Company = Depends(get_current_company),
+    company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
     """Bulk-create invoices from a pre-mapped spreadsheet preview.
@@ -646,10 +774,30 @@ def import_excel_rows(
             skipped.append({"row": r.row_no, "reason": "missing total"})
             continue
 
+        try:
+            currency = normalise_aud(parsed.get("currency") or "AUD")
+        except ValueError as exc:
+            skipped.append({"row": r.row_no, "reason": str(exc)})
+            continue
+        parsed["currency"] = currency
+
         sub = Decimal(parsed.get("subtotal") or "0")
         gst = Decimal(parsed.get("gst_amount") or "0")
         total = Decimal(parsed.get("total"))
-        if sub == 0 and gst == 0 and total > 0:
+        if not company.gst_registered and gst != 0:
+            skipped.append({
+                "row": r.row_no,
+                "reason": (
+                    "GST must be 0 because this company is not GST-registered; "
+                    "include the full gross amount in subtotal/total"
+                ),
+            })
+            continue
+        if sub == 0 and gst == 0 and total > 0 and not company.gst_registered:
+            # A total-only row has an unambiguous non-GST interpretation: the
+            # entire gross amount is the invoice amount, with no GST split.
+            sub = total
+        elif sub == 0 and gst == 0 and total > 0:
             # Assume GST-inclusive total, derive at 10%. ROUND_HALF_UP keeps us
             # in step with ATO BAS rounding (banker's rounding would round .5 down
             # in half the cases, leaving the line off by a cent).
@@ -657,6 +805,12 @@ def import_excel_rows(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
             gst = (total - sub).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        try:
+            _check_gst_math(sub, gst, total)
+        except HTTPException as exc:
+            skipped.append({"row": r.row_no, "reason": str(exc.detail)})
+            continue
 
         source_ref = _excel_source_ref(
             row_no=r.row_no,
@@ -685,7 +839,7 @@ def import_excel_rows(
                 invoice_number=parsed["invoice_number"],
                 issue_date=date.fromisoformat(parsed["issue_date"]),
                 due_date=date.fromisoformat(parsed["due_date"]) if parsed.get("due_date") else None,
-                currency=parsed.get("currency") or "AUD",
+                currency=currency,
                 subtotal=sub,
                 gst_amount=gst,
                 total=total,

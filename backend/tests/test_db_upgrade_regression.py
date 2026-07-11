@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -92,6 +93,25 @@ def _build_old_db(schema_script: str, insert_sql: str | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
     try:
+        # Keep the legacy graph structurally valid.  The transaction fixture
+        # below points at bank_account_id=1; older versions already had this
+        # parent table, and the migration now (correctly) runs an unconditional
+        # foreign_key_check before allowing startup to continue.
+        con.executescript(
+            """
+            CREATE TABLE bank_accounts (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                name VARCHAR(200) NOT NULL,
+                bsb VARCHAR(20),
+                account_number VARCHAR(50),
+                opening_balance NUMERIC(16, 2) NOT NULL DEFAULT 0,
+                is_active BOOLEAN NOT NULL DEFAULT 1,
+                notes VARCHAR(500),
+                created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL
+            );
+            INSERT INTO bank_accounts (id, name) VALUES (1, 'Legacy Bank');
+            """
+        )
         con.executescript(schema_script)
         if insert_sql:
             con.execute(insert_sql)
@@ -202,3 +222,163 @@ def test_mid_age_db_rebuild_preserves_tax_code_and_dedup_key(data_dir):
     added, applied = init_company_db(COMPANY_ID)
     assert added == []
     assert applied == []
+
+
+def test_startup_reconciles_system_accounts_with_backup_and_preserves_history(
+    data_dir,
+):
+    from app.config import settings
+    from app.db.company import get_company_engine, init_company_db
+
+    _added, first_applied = init_company_db(COMPANY_ID, allow_create=True)
+    engine = get_company_engine(COMPANY_ID)
+    db_path = settings.company_db_path(COMPANY_ID)
+    backup_pattern = f"{db_path.name}.pre-destructive-migration-*.bak"
+
+    assert any(step.startswith("seed:default_coa:") for step in first_applied)
+    assert list(db_path.parent.glob(backup_pattern)) == []
+
+    with engine.begin() as conn:
+        account_ids = dict(
+            conn.execute(
+                text(
+                    "SELECT code, id FROM accounts "
+                    "WHERE code IN ('1100', '1200', '2000', '2100', '3000')"
+                )
+            ).all()
+        )
+        entry_id = conn.execute(
+            text(
+                "INSERT INTO journal_entries (entry_date, memo, source_type) "
+                "VALUES ('2026-05-01', 'Legacy referenced controls', 'manual') "
+                "RETURNING id"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO journal_lines "
+                "(entry_id, account_id, debit_amount, credit_amount) VALUES "
+                "(:entry_id, :ap_id, 100, 0), "
+                "(:entry_id, :capital_id, 0, 100)"
+            ),
+            {
+                "entry_id": entry_id,
+                "ap_id": account_ids["2000"],
+                "capital_id": account_ids["3000"],
+            },
+        )
+        conn.execute(text("UPDATE accounts SET name='Trade Debtors' WHERE code='1100'"))
+        conn.execute(text("DELETE FROM accounts WHERE code='1200'"))
+        conn.execute(text("UPDATE accounts SET type='ASSET' WHERE code='2000'"))
+        conn.execute(text("UPDATE accounts SET active=0 WHERE code='2100'"))
+        conn.execute(
+            text("UPDATE accounts SET type='INCOME', active=0 WHERE code='3000'")
+        )
+
+    added, applied = init_company_db(COMPANY_ID)
+    assert added == []
+    assert "backup:system_accounts" in applied
+    assert "reconcile:system_account:1200:created" in applied
+    assert "reconcile:system_account:2000:type=LIABILITY" in applied
+    assert "reconcile:system_account:2100:active" in applied
+    assert "reconcile:system_account:3000:type=EQUITY+active" in applied
+
+    backups = list(db_path.parent.glob(backup_pattern))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as backup:
+        assert backup.execute(
+            "SELECT COUNT(*) FROM accounts WHERE code='1200'"
+        ).fetchone()[0] == 0
+        assert backup.execute(
+            "SELECT type FROM accounts WHERE code='2000'"
+        ).fetchone()[0] == "ASSET"
+        assert backup.execute(
+            "SELECT active FROM accounts WHERE code='2100'"
+        ).fetchone()[0] == 0
+
+    with engine.connect() as conn:
+        rows = {
+            row[0]: row[1:]
+            for row in conn.execute(
+                text(
+                    "SELECT code, id, name, type, active, is_gst FROM accounts "
+                    "WHERE code IN ('1100', '1200', '2000', '2100', '3000')"
+                )
+            ).all()
+        }
+        assert rows["1100"][1] == "Trade Debtors"
+        assert rows["1100"][2:] == ("ASSET", 1, 0)
+        assert rows["1200"][1:] == (
+            "GST Paid (Input Tax Credits)",
+            "ASSET",
+            1,
+            1,
+        )
+        assert rows["2000"][0] == account_ids["2000"]
+        assert rows["2000"][2:4] == ("LIABILITY", 1)
+        assert rows["2100"][0] == account_ids["2100"]
+        assert rows["2100"][2:4] == ("LIABILITY", 1)
+        assert rows["3000"][0] == account_ids["3000"]
+        assert rows["3000"][2:4] == ("EQUITY", 1)
+        referenced_ids = conn.execute(
+            text(
+                "SELECT account_id FROM journal_lines "
+                "WHERE entry_id=:entry_id ORDER BY id"
+            ),
+            {"entry_id": entry_id},
+        ).scalars().all()
+        assert referenced_ids == [account_ids["2000"], account_ids["3000"]]
+
+    second_added, second_applied = init_company_db(COMPANY_ID)
+    assert second_added == []
+    assert second_applied == []
+    assert len(list(db_path.parent.glob(backup_pattern))) == 1
+
+
+def test_duplicate_legacy_system_code_fails_closed_without_mutation(data_dir):
+    from app.config import settings
+    from app.db.company import init_company_db
+
+    db_path = settings.company_db_path(COMPANY_ID)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code VARCHAR(20) NOT NULL,
+                name VARCHAR(200) NOT NULL,
+                type VARCHAR(20) NOT NULL,
+                parent_id INTEGER,
+                is_gst BOOLEAN NOT NULL DEFAULT 0,
+                active BOOLEAN NOT NULL DEFAULT 1,
+                description VARCHAR(500),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+            );
+            INSERT INTO accounts (code, name, type)
+            VALUES ('1100', 'Legacy AR A', 'ASSET'),
+                   ('1100', 'Legacy AR B', 'LIABILITY');
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="code 1100 is not unique"):
+        init_company_db(COMPANY_ID)
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT id, code, name, type, active FROM accounts ORDER BY id"
+        ).fetchall() == [
+            (1, "1100", "Legacy AR A", "ASSET", 1),
+            (2, "1100", "Legacy AR B", "LIABILITY", 1),
+        ]
+    backups = list(
+        db_path.parent.glob(f"{db_path.name}.pre-destructive-migration-*.bak")
+    )
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as backup:
+        assert backup.execute(
+            "SELECT id, code, name, type, active FROM accounts ORDER BY id"
+        ).fetchall() == [
+            (1, "1100", "Legacy AR A", "ASSET", 1),
+            (2, "1100", "Legacy AR B", "LIABILITY", 1),
+        ]

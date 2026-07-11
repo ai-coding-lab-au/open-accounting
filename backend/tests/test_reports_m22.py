@@ -18,6 +18,8 @@ from decimal import Decimal
 import pytest
 from fastapi.testclient import TestClient
 
+from _request_headers import manual_transaction_headers
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -39,7 +41,8 @@ def client(monkeypatch, request):
             del sys.modules[mod]
     from app.main import app
     with TestClient(app) as c:
-        c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        company = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        HEAD["X-Company-Generation"] = company.json()["generation_id"]
         yield c
 
 
@@ -108,7 +111,7 @@ def test_trial_balance_balances_with_categorised_bank_txns(client, accounts, biz
     # Money in, categorised as sales.
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "in",
             "amount": "1100.00",
@@ -122,7 +125,7 @@ def test_trial_balance_balances_with_categorised_bank_txns(client, accounts, biz
     # Money out, categorised as rent.
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "out",
             "amount": "500.00",
@@ -140,11 +143,73 @@ def test_trial_balance_balances_with_categorised_bank_txns(client, accounts, biz
     assert Decimal(body["uncategorised_bank_out"]) == 0
 
 
+def test_trial_balance_posts_bank_gst_to_control_accounts(client, accounts, biz_bank):
+    """A formal Trial Balance must show net income/expense plus the GST
+    control leg, not a gross P&L account repaired only in the Balance Sheet."""
+    sales = accounts["4000"]
+    rent = accounts["6100"]
+    gst_paid = accounts["1200"]
+    gst_collected = accounts["2100"]
+
+    sale = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
+        headers=manual_transaction_headers(HEAD),
+        json={
+            "direction": "in",
+            "amount": "110.00",
+            "occurred_at": "2026-05-05",
+            "memo": "GST sale",
+            "account_id": sales["id"],
+            "tax_code": "standard",
+            "gst_amount": "10.00",
+        },
+    )
+    assert sale.status_code == 201, sale.text
+    purchase = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
+        headers=manual_transaction_headers(HEAD),
+        json={
+            "direction": "out",
+            "amount": "55.00",
+            "occurred_at": "2026-05-06",
+            "memo": "GST expense",
+            "account_id": rent["id"],
+            "tax_code": "standard",
+            "gst_amount": "5.00",
+        },
+    )
+    assert purchase.status_code == 201, purchase.text
+
+    body = client.get("/api/v1/reports/trial-balance", headers=HEAD).json()
+    assert body["is_balanced"], body
+    rows = {row.get("ref_id"): row for row in body["rows"]}
+
+    assert Decimal(rows[sales["id"]]["credit_total"]) == Decimal("100.00")
+    assert Decimal(rows[gst_collected["id"]]["credit_total"]) == Decimal("10.00")
+    assert Decimal(rows[rent["id"]]["debit_total"]) == Decimal("50.00")
+    assert Decimal(rows[gst_paid["id"]]["debit_total"]) == Decimal("5.00")
+
+    pnl = client.get(
+        "/api/v1/reports/profit-loss",
+        headers=HEAD,
+        params={"period_start": "2026-05-01", "period_end": "2026-05-31"},
+    ).json()
+    assert Decimal(pnl["total_income"]) == Decimal("100.00")
+    assert Decimal(pnl["total_expense"]) == Decimal("50.00")
+
+    bs = client.get(
+        "/api/v1/reports/balance-sheet",
+        headers=HEAD,
+        params={"as_of": "2026-05-31"},
+    ).json()
+    assert bs["is_balanced"], bs
+
+
 def test_trial_balance_uncategorised_breaks_balance(client, biz_bank):
     """An uncategorised bank txn is a half-posting; trial balance flags it."""
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "in",
             "amount": "200.00",
@@ -295,18 +360,16 @@ def test_balance_sheet_balances_after_opening_entry(client, accounts):
 
 def test_balance_sheet_balances_with_gst_on_asset_purchase(client, accounts, biz_bank):
     """Regression: a STANDARD-rated purchase with GST categorised to an ASSET
-    account must keep the balance sheet balanced. The contra leg is booked
-    gross, so the embedded GST has to be stripped from the asset (leaving it in
-    the net-GST line only). Previously only CAPITAL-coded purchases were
-    stripped, so a standard-rated asset purchase left Assets overstated by the
-    GST and `is_balanced` went False.
+    account must keep the balance sheet balanced. The Trial Balance posts the
+    asset net and the GST input credit explicitly to 1200, so the Balance Sheet
+    needs no synthetic GST repair.
     """
     prepay = accounts["1500"]  # Prepayments (asset)
 
     # $1,100 out = $1,000 prepaid asset + $100 GST input credit.
     r = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "out",
             "amount": "1100.00",
@@ -338,6 +401,104 @@ def test_balance_sheet_balances_with_gst_on_asset_purchase(client, accounts, biz
     )
     assert Decimal(prepay_line["balance"]) == Decimal("1000.00")
 
+    gst_paid_line = next(
+        line
+        for group in body["assets"]
+        for line in group["lines"]
+        if line.get("account_id") == accounts["1200"]["id"]
+    )
+    assert Decimal(gst_paid_line["balance"]) == Decimal("100.00")
+
+
+def test_capital_purchase_refund_reduces_gst_paid_not_gst_collected(
+    client, accounts, biz_bank
+):
+    ppe = accounts["1700"]
+    rows = (
+        ("out", "1100.00", "100.00", "PPE purchase"),
+        ("in", "220.00", "20.00", "Partial PPE refund"),
+    )
+    for direction, amount, gst, memo in rows:
+        response = client.post(
+            f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
+            headers=manual_transaction_headers(HEAD),
+            json={
+                "direction": direction,
+                "amount": amount,
+                "occurred_at": "2026-05-10",
+                "memo": memo,
+                "account_id": ppe["id"],
+                "tax_code": "capital",
+                "gst_amount": gst,
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    trial_balance = client.get(
+        "/api/v1/reports/trial-balance", headers=HEAD
+    ).json()
+    assert trial_balance["is_balanced"], trial_balance
+    by_code = {row["code"]: row for row in trial_balance["rows"]}
+    assert Decimal(by_code["1200"]["net_debit"]) == Decimal("80.00")
+    assert "2100" not in by_code or Decimal(by_code["2100"]["net_debit"]) == 0
+
+    exposure = client.get(
+        "/api/v1/reports/gst-exposure",
+        headers=HEAD,
+        params={"period_start": "2026-05-01", "period_end": "2026-05-31"},
+    ).json()
+    assert Decimal(exposure["g10_capital_purchases"]) == Decimal("880.00")
+    assert Decimal(exposure["one_b_gst_on_purchases"]) == Decimal("80.00")
+    assert Decimal(exposure["one_a_gst_on_sales"]) == 0
+
+
+def test_inventory_refund_uses_purchase_side_in_tb_and_bas(client, accounts, biz_bank):
+    created = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1300", "name": "Inventory", "type": "ASSET"},
+    )
+    assert created.status_code == 201, created.text
+    inventory = created.json()
+
+    for direction, amount, gst, memo in (
+        ("out", "110.00", "10.00", "Inventory purchase"),
+        ("in", "55.00", "5.00", "Inventory refund"),
+    ):
+        response = client.post(
+            f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
+            headers=manual_transaction_headers(HEAD),
+            json={
+                "direction": direction,
+                "amount": amount,
+                "occurred_at": "2026-05-10",
+                "memo": memo,
+                "account_id": inventory["id"],
+                "tax_code": "standard",
+                "gst_amount": gst,
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    trial_balance = client.get(
+        "/api/v1/reports/trial-balance", headers=HEAD
+    ).json()
+    assert trial_balance["is_balanced"], trial_balance
+    by_code = {row["code"]: row for row in trial_balance["rows"]}
+    assert Decimal(by_code["1300"]["net_debit"]) == Decimal("50.00")
+    assert Decimal(by_code["1200"]["net_debit"]) == Decimal("5.00")
+    assert "2100" not in by_code or Decimal(by_code["2100"]["net_debit"]) == 0
+
+    exposure = client.get(
+        "/api/v1/reports/gst-exposure",
+        headers=HEAD,
+        params={"period_start": "2026-05-01", "period_end": "2026-05-31"},
+    ).json()
+    assert Decimal(exposure["g11_non_capital_purchases"]) == Decimal("55.00")
+    assert Decimal(exposure["one_b_gst_on_purchases"]) == Decimal("5.00")
+    assert Decimal(exposure["g1_total_sales"]) == 0
+    assert Decimal(exposure["one_a_gst_on_sales"]) == 0
+
 
 def test_balance_sheet_with_pnl_balances(client, accounts, biz_bank):
     """Income & expense flow into retained earnings on the BS, keeping it
@@ -347,7 +508,7 @@ def test_balance_sheet_with_pnl_balances(client, accounts, biz_bank):
     # In: $1000 sales. Out: $400 rent. Net profit $600 → equity side.
     client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "in",
             "amount": "1000.00",
@@ -358,7 +519,7 @@ def test_balance_sheet_with_pnl_balances(client, accounts, biz_bank):
     )
     client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "out",
             "amount": "400.00",
@@ -415,7 +576,7 @@ def test_cash_basis_invoice_receipt_reports_net_income_and_no_open_ar(client, ac
 
     receipt = client.post(
         f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json={
             "direction": "in",
             "amount": "1100.00",
@@ -482,11 +643,34 @@ def test_bas_decimal_serialisation_always_two_decimals(client):
     assert body["g1_total_sales"] == "0.00"
 
 
+def test_gst_pdfs_are_explicitly_bookkeeping_aids_not_lodgment_forms(client):
+    import io
+
+    import pdfplumber
+
+    for endpoint, title in (
+        ("bas", "GST Activity Summary"),
+        ("gst-exposure", "GST Tax-Code Analysis"),
+    ):
+        response = client.get(
+            f"/api/v1/reports/{endpoint}/pdf",
+            headers=HEAD,
+            params={"fy_year": 2025, "quarter": 2},
+        )
+        assert response.status_code == 200, response.text
+        with pdfplumber.open(io.BytesIO(response.content)) as document:
+            text = "\n".join(page.extract_text() or "" for page in document.pages)
+        assert title in text
+        assert "not a BAS" in text
+        assert "lodgment" in text
+        assert "Business Activity Statement" not in text
+
+
 def test_bank_statement_boundaries_and_delete_recalculate(client, biz_bank):
     def post_txn(direction, amount, occurred_at, memo):
         r = client.post(
             f"/api/v1/bank-accounts/{biz_bank['id']}/transactions",
-            headers=HEAD,
+            headers=manual_transaction_headers(HEAD),
             json={
                 "direction": direction,
                 "amount": amount,

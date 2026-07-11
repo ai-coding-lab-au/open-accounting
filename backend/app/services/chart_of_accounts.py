@@ -18,11 +18,12 @@ DEFAULT_AU_COA: list[tuple[str, str, AccountType, bool]] = [
     ("1000", "Bank — Operating Account", AccountType.ASSET, False),
     ("1100", "Accounts Receivable", AccountType.ASSET, False),
     ("1200", "GST Paid (Input Tax Credits)", AccountType.ASSET, True),
-    ("1500", "Prepayments", AccountType.ASSET, False),
+    ("1500", "Supplier Prepayments", AccountType.ASSET, False),
     ("1700", "Property, Plant & Equipment", AccountType.ASSET, False),
     ("1710", "Accumulated Depreciation", AccountType.ASSET, False),
     # Liabilities
     ("2000", "Accounts Payable", AccountType.LIABILITY, False),
+    ("2050", "Customer Deposits", AccountType.LIABILITY, False),
     ("2100", "GST Collected", AccountType.LIABILITY, True),
     ("2200", "PAYG Withholding Payable", AccountType.LIABILITY, False),
     ("2300", "Superannuation Payable", AccountType.LIABILITY, False),

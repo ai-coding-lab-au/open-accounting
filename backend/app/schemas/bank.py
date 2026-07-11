@@ -7,6 +7,12 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ._dates import (
+    MAX_REPORTABLE_DATE,
+    MIN_REPORTABLE_DATE,
+    check_reportable_date,
+)
+from ._limits import SQLITE_EXACT_MONEY_MAX, SQLITE_INT_MAX
 from ._money import Money
 
 
@@ -14,22 +20,45 @@ from ._money import Money
 # (api/v1/reports.py), i.e. FY2000 = Jul 1999 .. FY2100 = Jun 2100. A
 # transaction dated outside this window can never appear in any BAS return, so
 # reject it at entry rather than create an unreportable "orphan" row.
-MIN_TXN_DATE = date(1999, 7, 1)
-MAX_TXN_DATE = date(2100, 6, 30)
+MIN_TXN_DATE = MIN_REPORTABLE_DATE
+MAX_TXN_DATE = MAX_REPORTABLE_DATE
 
 
 def check_txn_date(value: date) -> date:
-    if value < MIN_TXN_DATE or value > MAX_TXN_DATE:
-        raise ValueError(
-            f"occurred_at must be between {MIN_TXN_DATE.isoformat()} and "
-            f"{MAX_TXN_DATE.isoformat()} (a reportable BAS financial year)"
-        )
-    return value
+    return check_reportable_date(value, field_name="occurred_at")
 
 
 # ---------------------------------------------------------------------------
 # Bank accounts
 # ---------------------------------------------------------------------------
+
+
+class InvoicePaymentAllocationIn(BaseModel):
+    invoice_id: int = Field(ge=1, le=SQLITE_INT_MAX)
+    amount: Decimal = Field(
+        gt=0,
+        le=SQLITE_EXACT_MONEY_MAX,
+        max_digits=16,
+        decimal_places=2,
+    )
+
+
+class InvoicePaymentAllocationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    invoice_id: int
+    amount: Money
+    gst_amount: Money
+    tax_components: list["InvoicePaymentTaxComponentOut"] = Field(default_factory=list)
+
+
+class InvoicePaymentTaxComponentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    tax_code: str
+    gross_amount: Money
+    gst_amount: Money
 
 
 class BankAccountOut(BaseModel):
@@ -54,7 +83,7 @@ class BankAccountCreate(BaseModel):
     opening_balance: Decimal = Field(
         default=Decimal("0"),
         ge=0,
-        le=Decimal("99999999999999.99"),
+        le=SQLITE_EXACT_MONEY_MAX,
         max_digits=16,
         decimal_places=2,
     )
@@ -91,25 +120,34 @@ class BankTransactionOut(BaseModel):
     gst_amount: Money
     tax_code: str
     created_at: datetime
+    invoice_allocations: list[InvoicePaymentAllocationOut] = Field(default_factory=list)
+    unapplied_account_id: int | None = None
+    unapplied_amount: Money = Decimal("0")
 
 
 class BankTransactionIn(BaseModel):
     """Manual entry on a bank account."""
 
     direction: str = Field(pattern="^(in|out)$")
-    amount: Decimal = Field(gt=0, le=Decimal("99999999999999.99"), max_digits=16, decimal_places=2)
+    amount: Decimal = Field(gt=0, le=SQLITE_EXACT_MONEY_MAX, max_digits=16, decimal_places=2)
     occurred_at: date
     memo: str | None = Field(default=None, max_length=500)
     counter_party_name: str | None = Field(default=None, max_length=200)
-    account_id: int | None = None
+    account_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     gst_amount: Decimal = Field(
         default=Decimal("0"),
         ge=0,
-        le=Decimal("99999999999999.99"),
+        le=SQLITE_EXACT_MONEY_MAX,
         max_digits=16,
         decimal_places=2,
     )
     tax_code: str = Field(default="standard", pattern=_TAX_CODE_PATTERN)
+    invoice_allocations: list[InvoicePaymentAllocationIn] = Field(
+        default_factory=list, max_length=500
+    )
+    unapplied_account_id: int | None = Field(
+        default=None, ge=1, le=SQLITE_INT_MAX
+    )
 
     @field_validator("occurred_at")
     @classmethod
@@ -120,12 +158,18 @@ class BankTransactionIn(BaseModel):
 class BankTransactionRecategorise(BaseModel):
     """Inline edit from the Reconciliation page."""
 
-    account_id: int | None = None
+    account_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     tax_code: str | None = Field(default=None, pattern=_TAX_CODE_PATTERN)
     gst_amount: Decimal | None = Field(
         default=None,
         ge=0,
-        le=Decimal("99999999999999.99"),
+        le=SQLITE_EXACT_MONEY_MAX,
         max_digits=16,
         decimal_places=2,
+    )
+    invoice_allocations: list[InvoicePaymentAllocationIn] | None = Field(
+        default=None, max_length=500
+    )
+    unapplied_account_id: int | None = Field(
+        default=None, ge=1, le=SQLITE_INT_MAX
     )

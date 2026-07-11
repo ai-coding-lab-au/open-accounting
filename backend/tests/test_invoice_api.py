@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from _request_headers import manual_transaction_headers
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 PROJECT_ROOT = ROOT.parent
@@ -28,6 +30,7 @@ def client(monkeypatch, request):
     with TestClient(app) as c:
         r = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
         assert r.status_code == 201, r.text
+        HEAD["X-Company-Generation"] = r.json()["generation_id"]
         yield c
 
 
@@ -169,3 +172,59 @@ def test_concurrent_void_one_wins_other_409_not_500(client, accounts):
     assert r.status_code == 200
     entries = [e for e in r.json() if e["source_id"] == inv["id"]]
     assert len(entries) == 1
+
+
+def test_concurrent_settlement_and_void_have_one_safe_winner(client, accounts):
+    """A settle/void race must never leave both the bank settlement and the
+    invoice reversal committed. SQLite's immediate lock serialises the two
+    invariant checks; the loser receives a recoverable 409."""
+    inv = _create_invoice(client, accounts, number="INV-API-RACE-SETTLE-VOID")
+    assert client.post(f"/api/v1/invoices/{inv['id']}/post", headers=HEAD).status_code == 200
+    bank = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0]
+
+    def settle():
+        return client.post(
+            f"/api/v1/bank-accounts/{bank['id']}/transactions",
+            headers=manual_transaction_headers(HEAD),
+            json={
+                "direction": "in",
+                "amount": "50.00",
+                "occurred_at": "2026-06-01",
+                "account_id": accounts["1100"]["id"],
+                "tax_code": "standard",
+                "gst_amount": "0",
+            },
+        )
+
+    def void():
+        return client.post(f"/api/v1/invoices/{inv['id']}/void", headers=HEAD)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        settle_future = pool.submit(settle)
+        void_future = pool.submit(void)
+        settle_response = settle_future.result()
+        void_response = void_future.result()
+
+    assert sorted((settle_response.status_code, void_response.status_code)) in (
+        [200, 409],
+        [201, 409],
+    ), (settle_response.text, void_response.text)
+
+    current = client.get(f"/api/v1/invoices/{inv['id']}", headers=HEAD).json()
+    transactions = client.get(
+        f"/api/v1/bank-accounts/{bank['id']}/transactions",
+        headers=HEAD,
+    ).json()
+    matching_settlements = [
+        txn
+        for txn in transactions
+        if txn["account_id"] == accounts["1100"]["id"]
+        and txn["amount"] == "50.00"
+    ]
+    if current["status"] == "void":
+        assert matching_settlements == []
+        assert settle_response.status_code == 409
+    else:
+        assert len(matching_settlements) == 1
+        assert settle_response.status_code == 201
+        assert void_response.status_code == 409

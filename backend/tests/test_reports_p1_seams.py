@@ -23,6 +23,8 @@ from decimal import Decimal
 import pytest
 from fastapi.testclient import TestClient
 
+from _request_headers import manual_transaction_headers
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -44,7 +46,8 @@ def client(monkeypatch, request):
             del sys.modules[mod]
     from app.main import app
     with TestClient(app) as c:
-        c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        company = c.post("/api/v1/companies", json={"id": "tc", "marn": "1234567", "registered_agent_name": "Test Agent", "name": "Test Pty Ltd"})
+        HEAD["X-Company-Generation"] = company.json()["generation_id"]
         yield c
 
 
@@ -73,7 +76,7 @@ def _post_txn(client, bank_id, **overrides):
     payload.update(overrides)
     r = client.post(
         f"/api/v1/bank-accounts/{bank_id}/transactions",
-        headers=HEAD,
+        headers=manual_transaction_headers(HEAD),
         json=payload,
     )
     assert r.status_code == 201, r.text
@@ -165,6 +168,11 @@ def test_expense_refund_nets_expense_down_and_bs_balances(client, accounts, biz_
 
     tb = client.get("/api/v1/reports/trial-balance", headers=HEAD).json()
     assert tb["is_balanced"], tb
+    rows = {row.get("ref_id"): row for row in tb["rows"]}
+    # The refund credits rent by the ex-GST 100 and credits GST Paid by 10;
+    # it must not hide the GST inside a gross expense contra.
+    assert Decimal(rows[rent["id"]]["credit_total"]) == Decimal("100.00")
+    assert Decimal(rows[accounts["1200"]["id"]]["credit_total"]) == Decimal("10.00")
 
 
 def test_income_reversal_nets_income_down_and_bs_balances(client, accounts, biz_bank):

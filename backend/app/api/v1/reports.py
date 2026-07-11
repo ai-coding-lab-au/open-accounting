@@ -29,10 +29,12 @@ from ...schemas.reports import (
     PnLOut,
     TrialBalanceOut,
 )
+from ...schemas._limits import SQLITE_INT_MAX
 from ...services import gst as gst_svc
 from ...services import reports as reports_svc
 from ...services import report_render, signing_agents
 from ...services import trial_balance as trial_balance_svc
+from ...services.account_invariants import AccountInvariantError
 from ...utils.http import safe_filename
 
 
@@ -46,7 +48,7 @@ router = APIRouter(prefix="/reports", tags=["reports"])
 
 @router.get("/bank-statement", response_model=BankStatementOut)
 def bank_statement(
-    bank_account_id: int = Query(..., ge=1),
+    bank_account_id: int = Query(..., ge=1, le=SQLITE_INT_MAX),
     year: int = Query(..., ge=2000, le=2100),
     month: int = Query(..., ge=1, le=12),
     _: Company = Depends(get_current_company),
@@ -62,7 +64,7 @@ def bank_statement(
 
 @router.get("/bank-statement/pdf")
 def bank_statement_pdf(
-    bank_account_id: int = Query(..., ge=1),
+    bank_account_id: int = Query(..., ge=1, le=SQLITE_INT_MAX),
     year: int = Query(..., ge=2000, le=2100),
     month: int = Query(..., ge=1, le=12),
     company: Company = Depends(get_current_company),
@@ -137,7 +139,10 @@ def trial_balance(
     _: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
-    return trial_balance_svc.trial_balance(db, as_of=as_of)
+    try:
+        return trial_balance_svc.trial_balance(db, as_of=as_of)
+    except AccountInvariantError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/trial-balance/pdf")
@@ -146,7 +151,10 @@ def trial_balance_pdf(
     company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
-    data = trial_balance_svc.trial_balance(db, as_of=as_of)
+    try:
+        data = trial_balance_svc.trial_balance(db, as_of=as_of)
+    except AccountInvariantError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     pdf_bytes = report_render.render_trial_balance_pdf(company=company, data=data, signing_agent=signing_agents.first_active_mara(db))
     as_of_str = (as_of or date.today()).isoformat()
     filename = f"trial-balance-{as_of_str}.pdf"
@@ -168,7 +176,10 @@ def balance_sheet(
     _: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
-    return trial_balance_svc.balance_sheet(db, as_of=as_of)
+    try:
+        return trial_balance_svc.balance_sheet(db, as_of=as_of)
+    except AccountInvariantError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/balance-sheet/pdf")
@@ -177,7 +188,10 @@ def balance_sheet_pdf(
     company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
-    data = trial_balance_svc.balance_sheet(db, as_of=as_of)
+    try:
+        data = trial_balance_svc.balance_sheet(db, as_of=as_of)
+    except AccountInvariantError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     pdf_bytes = report_render.render_balance_sheet_pdf(company=company, data=data, signing_agent=signing_agents.first_active_mara(db))
     as_of_str = data["as_of"].isoformat() if hasattr(data["as_of"], "isoformat") else str(data["as_of"])
     filename = f"balance-sheet-{as_of_str}.pdf"
@@ -212,7 +226,7 @@ def bas_pdf(
 ):
     data = reports_svc.bas(db, fy_year=fy_year, quarter=quarter, gst_registered=company.gst_registered)
     pdf_bytes = report_render.render_bas_pdf(company=company, data=data, signing_agent=signing_agents.first_active_mara(db))
-    filename = f"bas-FY{fy_year}-Q{quarter}.pdf"
+    filename = f"gst-summary-FY{fy_year}-Q{quarter}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -231,22 +245,34 @@ def gst_exposure(
     period_end: date | None = Query(default=None),
     fy_year: int | None = Query(default=None, ge=2000, le=2100),
     quarter: int | None = Query(default=None, ge=1, le=4),
-    _: Company = Depends(get_current_company),
+    company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
     """Either pass (period_start, period_end) for an arbitrary window or
     (fy_year, quarter) for the standard AU BAS quarter."""
     if fy_year is not None and quarter is not None:
-        return gst_svc.gst_exposure_for_quarter(db, fy_year=fy_year, quarter=quarter)
+        data = gst_svc.gst_exposure_for_quarter(
+            db,
+            fy_year=fy_year,
+            quarter=quarter,
+            gst_registered=company.gst_registered,
+        )
+        data["gst_registered"] = company.gst_registered
+        return data
     if period_start is None or period_end is None:
         raise HTTPException(
             400,
             "Provide either (period_start, period_end) or (fy_year, quarter).",
         )
     try:
-        return gst_svc.gst_exposure(
-            db, period_start=period_start, period_end=period_end
+        data = gst_svc.gst_exposure(
+            db,
+            period_start=period_start,
+            period_end=period_end,
+            gst_registered=company.gst_registered,
         )
+        data["gst_registered"] = company.gst_registered
+        return data
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -261,8 +287,13 @@ def gst_exposure_pdf(
     db: Session = Depends(get_company_db),
 ):
     if fy_year is not None and quarter is not None:
-        data = gst_svc.gst_exposure_for_quarter(db, fy_year=fy_year, quarter=quarter)
-        filename = f"gst-exposure-FY{fy_year}-Q{quarter}.pdf"
+        data = gst_svc.gst_exposure_for_quarter(
+            db,
+            fy_year=fy_year,
+            quarter=quarter,
+            gst_registered=company.gst_registered,
+        )
+        filename = f"gst-tax-code-analysis-FY{fy_year}-Q{quarter}.pdf"
     else:
         if period_start is None or period_end is None:
             raise HTTPException(
@@ -271,11 +302,14 @@ def gst_exposure_pdf(
             )
         try:
             data = gst_svc.gst_exposure(
-                db, period_start=period_start, period_end=period_end
+                db,
+                period_start=period_start,
+                period_end=period_end,
+                gst_registered=company.gst_registered,
             )
         except ValueError as e:
             raise HTTPException(400, str(e))
-        filename = f"gst-exposure-{period_start}_{period_end}.pdf"
+        filename = f"gst-tax-code-analysis-{period_start}_{period_end}.pdf"
     pdf_bytes = report_render.render_gst_exposure_pdf(company=company, data=data, signing_agent=signing_agents.first_active_mara(db))
     return Response(
         content=pdf_bytes,

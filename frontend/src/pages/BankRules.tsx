@@ -14,20 +14,6 @@ import type {
   TaxCode,
 } from "../types/api";
 
-// Returns a human-readable error if the (trimmed, non-empty) value is not a
-// valid JS regex, else null. Used for live inline feedback on the regex fields.
-function regexError(value: string): string | null {
-  const v = value.trim();
-  if (!v) return null;
-  try {
-    // eslint-disable-next-line no-new
-    new RegExp(v);
-    return null;
-  } catch (e) {
-    return (e as Error).message;
-  }
-}
-
 async function fetchRules(): Promise<BankRule[]> {
   const { data } = await api.get<BankRule[]>("/bank-rules");
   return data;
@@ -273,21 +259,6 @@ function RuleDialog({
       setError("Pick a target account");
       return;
     }
-    // Validate regex client-side so a typo is caught before the round-trip.
-    // The backend also validates (schemas/bank_import.py) as the source of truth.
-    for (const [label, value] of [
-      ["Memo regex", memoRegex.trim()],
-      ["Counter-party regex", counterRegex.trim()],
-    ] as const) {
-      if (!value) continue;
-      try {
-        // eslint-disable-next-line no-new
-        new RegExp(value);
-      } catch (e) {
-        setError(`${label} is not a valid regular expression: ${(e as Error).message}`);
-        return;
-      }
-    }
     save.mutate();
   };
 
@@ -392,14 +363,9 @@ function RuleDialog({
               <input
                 value={memoRegex}
                 onChange={(e) => setMemoRegex(e.target.value)}
-                className={`input font-mono text-xs ${regexError(memoRegex) ? "border-rose-400" : ""}`}
+                className="input font-mono text-xs"
                 placeholder="e.g. (?i)rent|lease"
               />
-              {regexError(memoRegex) && (
-                <span className="mt-0.5 block text-[11px] text-rose-600">
-                  Invalid regex: {regexError(memoRegex)}
-                </span>
-              )}
             </label>
             <label className="block">
               <span className="block text-slate-600 mb-1">
@@ -408,13 +374,8 @@ function RuleDialog({
               <input
                 value={counterRegex}
                 onChange={(e) => setCounterRegex(e.target.value)}
-                className={`input font-mono text-xs ${regexError(counterRegex) ? "border-rose-400" : ""}`}
+                className="input font-mono text-xs"
               />
-              {regexError(counterRegex) && (
-                <span className="mt-0.5 block text-[11px] text-rose-600">
-                  Invalid regex: {regexError(counterRegex)}
-                </span>
-              )}
             </label>
           </div>
           <div className="grid grid-cols-2 gap-3">
@@ -462,11 +423,7 @@ function RuleDialog({
           <button
             className="btn-primary"
             onClick={submit}
-            disabled={
-              save.isPending ||
-              regexError(memoRegex) !== null ||
-              regexError(counterRegex) !== null
-            }
+            disabled={save.isPending}
           >
             {save.isPending ? "Saving…" : isEdit ? "Save changes" : "Create rule"}
           </button>

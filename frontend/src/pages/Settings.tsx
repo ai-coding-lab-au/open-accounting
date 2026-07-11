@@ -2,8 +2,11 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { apiErrorMessage } from "../lib/errors";
+import { todayLocal } from "../lib/date";
+import { formatDate } from "../lib/format";
 import { useCompanyStore } from "../store/company";
 import { ThemePickerGrid } from "../components/ThemePicker";
+import { ConfirmDialog } from "../components/ui/ConfirmDialog";
 import type { Company, CompanyUpdate, DocCounter, OutgoingDocType } from "../types/api";
 
 async function fetchCompany(id: string): Promise<Company> {
@@ -47,12 +50,185 @@ export default function SettingsPage() {
   return (
     <div className="max-w-5xl mx-auto space-y-6">
       <h1 className="text-xl font-semibold">Settings</h1>
+      <PeriodLockCard companyId={currentId} />
       <CompanyProfileCard companyId={currentId} />
       <BankDetailsCard companyId={currentId} />
       <NumberingCard />
       <StaffCard />
       <AppearanceCard />
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Irreversible accounting period lock
+// ---------------------------------------------------------------------------
+
+function PeriodLockCard({ companyId }: { companyId: string }) {
+  const qc = useQueryClient();
+  const setCurrentCompany = useCompanyStore((state) => state.setCurrent);
+  const { data: company, isLoading } = useQuery({
+    queryKey: ["company", companyId],
+    queryFn: () => fetchCompany(companyId),
+  });
+  const [targetDate, setTargetDate] = useState("");
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [successDate, setSuccessDate] = useState<string | null>(null);
+  const today = todayLocal();
+
+  useEffect(() => {
+    setTargetDate("");
+    setConfirmOpen(false);
+    setSuccessDate(null);
+  }, [companyId]);
+
+  const mutation = useMutation({
+    mutationFn: (date: string) =>
+      patchCompany(companyId, { books_locked_through: date }),
+    onSuccess: (updated) => {
+      setCurrentCompany(updated);
+      qc.setQueriesData<Company>(
+        { queryKey: ["company", companyId] },
+        updated,
+      );
+      qc.setQueryData<Company[]>(["companies"], (current) =>
+        current?.map((row) => (row.id === updated.id ? updated : row)),
+      );
+      void qc.invalidateQueries({ queryKey: ["company", companyId] });
+      void qc.invalidateQueries({ queryKey: ["companies"] });
+      setConfirmOpen(false);
+      setTargetDate("");
+      setSuccessDate(updated.books_locked_through);
+    },
+    onError: () => setConfirmOpen(false),
+  });
+
+  if (isLoading || !company) {
+    return <Card title="Accounting period lock">Loading...</Card>;
+  }
+
+  const currentLock = company.books_locked_through;
+  const invalidReason = !targetDate
+    ? null
+    : targetDate > today
+      ? "The lock date cannot be later than today."
+      : currentLock && targetDate < currentLock
+        ? `The lock cannot move backward from ${formatDate(currentLock)}.`
+        : null;
+  const canReview = !!targetDate && !invalidReason && !mutation.isPending;
+
+  return (
+    <>
+      <Card
+        title="Accounting period lock"
+        subtitle="Close completed accounting periods so historical financial records cannot be changed."
+      >
+        <div
+          className={`rounded border p-4 ${
+            currentLock
+              ? "border-amber-300 bg-amber-50"
+              : "border-emerald-200 bg-emerald-50"
+          }`}
+        >
+          <p className="text-xs font-medium uppercase tracking-wide text-slate-600">
+            Current lock
+          </p>
+          <p
+            className={`mt-1 text-lg font-semibold ${
+              currentLock ? "text-amber-900" : "text-emerald-800"
+            }`}
+          >
+            {currentLock
+              ? `Books locked through ${formatDate(currentLock)}`
+              : "Books are open - no period has been locked"}
+          </p>
+          <p className="mt-1 text-xs text-slate-600">
+            {currentLock
+              ? `Accounting writes dated on or before ${formatDate(currentLock)} are rejected.`
+              : "Historical accounting writes are currently permitted, subject to normal validation."}
+          </p>
+        </div>
+
+        <div className="mt-4 grid gap-3 md:grid-cols-[minmax(220px,320px)_auto] md:items-end">
+          <Field label="Lock through date">
+            <input
+              type="date"
+              className="input"
+              min={currentLock ?? undefined}
+              max={today}
+              value={targetDate}
+              onChange={(event) => {
+                mutation.reset();
+                setSuccessDate(null);
+                setTargetDate(event.target.value);
+              }}
+            />
+          </Field>
+          <button
+            type="button"
+            className="btn-danger h-[42px]"
+            disabled={!canReview}
+            onClick={() => setConfirmOpen(true)}
+          >
+            Review irreversible lock
+          </button>
+        </div>
+
+        <div className="mt-3 rounded border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600 space-y-1">
+          <p>
+            The lock may stay on the same date or move forward to today, but it can
+            never be cleared or moved backward.
+          </p>
+          <p>
+            If a closed period needs correction, record a clearly documented adjusting
+            entry in an open period instead of changing the historical transaction.
+          </p>
+        </div>
+
+        {invalidReason && (
+          <p className="mt-3 text-sm text-rose-700" role="alert">
+            {invalidReason}
+          </p>
+        )}
+        {mutation.isError && (
+          <p className="mt-3 text-sm text-rose-700" role="alert">
+            {apiErrorMessage(mutation.error)}
+          </p>
+        )}
+        {successDate && (
+          <p className="mt-3 text-sm text-emerald-700" role="status">
+            Accounting periods are now locked through {formatDate(successDate)}.
+          </p>
+        )}
+      </Card>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        title="Permanently lock this accounting period?"
+        destructive
+        busy={mutation.isPending}
+        confirmLabel="Lock period permanently"
+        onCancel={() => setConfirmOpen(false)}
+        onConfirm={() => {
+          if (canReview) mutation.mutate(targetDate);
+        }}
+        message={
+          <div className="space-y-2">
+            <p>
+              You are about to lock all accounting periods through{" "}
+              <strong>{targetDate ? formatDate(targetDate) : "the selected date"}</strong>.
+            </p>
+            <p className="font-medium text-rose-700">
+              This is irreversible: the date cannot be cleared or moved backward.
+            </p>
+            <p>
+              Dated accounting writes through this date will be rejected. Corrections
+              must be entered as documented adjustments in an open period.
+            </p>
+          </div>
+        }
+      />
+    </>
   );
 }
 
