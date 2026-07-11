@@ -281,14 +281,25 @@ if ($AllowUncommittedBuild) {
 python "$root\packaging\generate_third_party_notices.py" --output (Join-Path $stage "THIRD-PARTY-NOTICES.txt")
 if ($LASTEXITCODE -ne 0) { throw "Third-party notices generation failed" }
 
-$pythonVersion = (& python --version 2>&1 | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) { throw "Could not record the Python version." }
-$pyInstallerVersion = (& python -m PyInstaller --version 2>&1 | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) { throw "Could not record the PyInstaller version." }
-$nodeVersion = (& node --version 2>&1 | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) { throw "Could not record the Node version." }
-$npmVersion = (& npm.cmd --version 2>&1 | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) { throw "Could not record the npm version." }
+$pythonVersionOutput = @(& python --version 2>&1)
+$pythonVersionExitCode = $LASTEXITCODE
+if ($pythonVersionExitCode -ne 0) { throw "Could not record the Python version." }
+$pythonVersion = $pythonVersionOutput | Select-Object -First 1
+
+$pyInstallerVersionOutput = @(& python -m PyInstaller --version 2>&1)
+$pyInstallerVersionExitCode = $LASTEXITCODE
+if ($pyInstallerVersionExitCode -ne 0) { throw "Could not record the PyInstaller version." }
+$pyInstallerVersion = $pyInstallerVersionOutput | Select-Object -First 1
+
+$nodeVersionOutput = @(& node --version 2>&1)
+$nodeVersionExitCode = $LASTEXITCODE
+if ($nodeVersionExitCode -ne 0) { throw "Could not record the Node version." }
+$nodeVersion = $nodeVersionOutput | Select-Object -First 1
+
+$npmVersionOutput = @(& npm.cmd --version 2>&1)
+$npmVersionExitCode = $LASTEXITCODE
+if ($npmVersionExitCode -ne 0) { throw "Could not record the npm version." }
+$npmVersion = $npmVersionOutput | Select-Object -First 1
 $buildMode = if ($AllowUncommittedBuild) { "LOCAL CANDIDATE - DO NOT PUBLISH" } else { "OFFICIAL" }
 $buildInfo = @(
     "Open Accounting portable build information"
