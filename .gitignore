@@ -37,6 +37,8 @@ frontend/test-results/
 .claude/
 NEXT_AUDIT_*.md
 CLAUDE_CODE_AUDIT_FINDINGS_*.md
+AUDIT_REBUTTAL_*.md
+*_REBUTTAL_*_DISPATCH_*.md
 
 # Separate marketing website repository
 /website/
