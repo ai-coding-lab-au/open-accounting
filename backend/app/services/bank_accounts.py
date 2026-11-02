@@ -16,8 +16,15 @@ from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, selectinload
 
+from ..db.company import begin_sqlite_immediate, rollback_session_on_error
+from .allocation_history import (
+    guard_allocation_history_mutation,
+    has_allocation_history,
+    translate_allocation_history_db_error,
+)
 from . import gst_policy
 from . import invoice_payments
 from .account_invariants import (
@@ -692,6 +699,7 @@ def update_account(
     return account
 
 
+@rollback_session_on_error
 def record_manual_transaction(
     db: Session,
     *,
@@ -711,6 +719,7 @@ def record_manual_transaction(
     gst_registered: bool,
 ) -> BankTransaction:
     """Record a manual movement on the bank account."""
+    begin_sqlite_immediate(db)
     replay = replay_manual_transaction(
         db,
         idempotency_key=idempotency_key,
@@ -804,7 +813,11 @@ def record_manual_transaction(
         tax_code=tc,
     )
     db.add(txn)
-    db.flush()
+    try:
+        db.flush()
+    except DBAPIError as exc:
+        translate_allocation_history_db_error(db, exc)
+        raise
     try:
         invoice_payments.replace_transaction_allocations(
             db,
@@ -824,8 +837,11 @@ def record_manual_transaction(
             bank_transaction_id=txn.id,
         )
     )
-    db.flush()
-    db.commit()
+    try:
+        db.flush()
+    except DBAPIError as exc:
+        translate_allocation_history_db_error(db, exc)
+        raise
     persisted = _transaction_with_allocations(db, txn.id)
     if persisted is None:  # pragma: no cover - commit + PK lookup invariant
         raise BankTxnError("Manual bank transaction disappeared after commit.")
@@ -835,6 +851,7 @@ def record_manual_transaction(
 _UNSET = object()  # sentinel: distinguishes "field not provided" from explicit None
 
 
+@rollback_session_on_error
 def recategorise_transaction(
     db: Session,
     *,
@@ -853,9 +870,44 @@ def recategorise_transaction(
     `account_id` left at the _UNSET sentinel keeps the current category;
     an explicit None de-categorises the transaction.
     """
+    begin_sqlite_immediate(db)
     txn = db.get(BankTransaction, txn_id)
     if txn is None:
         raise BankAccountNotFound(f"Transaction {txn_id} not found")
+
+    if has_allocation_history(db, txn_id):
+        current_tax_code = (
+            txn.tax_code.value if hasattr(txn.tax_code, "value") else str(txn.tax_code)
+        )
+        requested_tax_code = (
+            tax_code.value if hasattr(tax_code, "value") else str(tax_code)
+        )
+        try:
+            requested_gst_changed = (
+                gst_amount is not None
+                and Decimal(str(gst_amount)) != Decimal(txn.gst_amount or 0)
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            requested_gst_changed = gst_amount is not None
+        state_changed = (
+            (account_id is not _UNSET and account_id != txn.account_id)
+            or (tax_code is not None and requested_tax_code != current_tax_code)
+            or requested_gst_changed
+            or invoice_allocations is not None
+            or (
+                unapplied_account_id is not _UNSET
+                and unapplied_account_id != txn.unapplied_account_id
+            )
+            or (
+                not gst_registered
+                and (
+                    current_tax_code != TaxCode.NONE.value
+                    or Decimal(txn.gst_amount or 0) != Decimal("0.00")
+                )
+            )
+        )
+        if state_changed:
+            guard_allocation_history_mutation(db, txn_id)
 
     if account_id is not _UNSET:
         acc = None
@@ -954,17 +1006,21 @@ def recategorise_transaction(
         txn.gst_amount = Decimal("0.00")
         txn.tax_code = TaxCode.NONE
 
-    db.commit()
-    db.refresh(txn)
     return txn
 
 
+@rollback_session_on_error
 def delete_manual_transaction(db: Session, *, txn_id: int) -> None:
+    begin_sqlite_immediate(db)
     txn = db.get(BankTransaction, txn_id)
     if txn is None:
         raise BankAccountNotFound(f"Transaction {txn_id} not found")
+    guard_allocation_history_mutation(db, txn_id)
     touched = [row.invoice_id for row in txn.invoice_allocations]
     db.delete(txn)
-    db.flush()
+    try:
+        db.flush()
+    except DBAPIError as exc:
+        translate_allocation_history_db_error(db, exc)
+        raise
     invoice_payments.recompute_invoice_payment_state(db, touched)
-    db.commit()

@@ -15,6 +15,7 @@ from sqlalchemy import create_engine, event, text
 
 from app.db.base import CompanyBase
 from app.db import migrations
+from app.db.errors import DataRecoveryRequiredError
 import app.models.company  # noqa: F401
 
 
@@ -216,6 +217,633 @@ def _bank_sequence(conn) -> int:
     )
 
 
+def test_allocation_batch_schema_migration_is_idempotent_without_backfill():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+
+    first_run = migrations.run_company_migrations(engine)
+    second_run = migrations.run_company_migrations(engine)
+
+    with engine.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ))
+        }
+        assert {
+            "allocation_batches",
+            "allocation_batch_lines",
+            "allocation_batch_tax_components",
+            "allocation_batch_finalizations",
+        } <= tables
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batches"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM allocation_batch_finalizations"
+        )).scalar_one() == 0
+        trigger_sql = connection.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_allocation_batches_domain'"
+        )).scalar_one()
+        assert "CREATE TRIGGER \"trg_allocation_batches_domain\"" in trigger_sql
+        assert "allocation_reallocation" in trigger_sql
+    assert "guards:allocation_batches_append_only" in first_run
+    assert "guards:allocation_batches_append_only" not in second_run
+    engine.dispose()
+
+
+def test_allocation_batch_migration_repairs_code_only_residual_trigger():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_allocation_batches_domain"))
+        connection.execute(text(
+            "CREATE TRIGGER trg_allocation_batches_domain "
+            "BEFORE INSERT ON allocation_batches "
+            "WHEN NEW.residual_amount_cents>0 AND NOT EXISTS ("
+            "SELECT 1 FROM accounts a WHERE a.id=NEW.residual_account_id "
+            "AND a.code NOT IN ('1100','1200','2000','2100')) "
+            "BEGIN SELECT RAISE(ABORT, 'Old code-only residual policy'); END"
+        ))
+
+    repaired = migrations.run_company_migrations(engine)
+    with engine.connect() as connection:
+        trigger_sql = connection.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_allocation_batches_domain'"
+        )).scalar_one()
+        assert "a.active=1" in trigger_sql
+        assert "a.type='LIABILITY'" in trigger_sql
+        assert "a.type='ASSET'" in trigger_sql
+        assert "FROM bank_accounts ba" in trigger_sql
+        assert "Old code-only residual policy" not in trigger_sql
+    assert "guards:allocation_batches_append_only" in repaired
+    assert "guards:allocation_batches_append_only" not in migrations.run_company_migrations(engine)
+    engine.dispose()
+
+
+def test_allocation_batch_migration_repairs_partial_schema_without_bank_table():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    initial_run = migrations.run_company_migrations(engine)
+    independent_trigger_names = {
+        f"trg_{table}_no_{operation}"
+        for table in (
+            "allocation_batches",
+            "allocation_batch_lines",
+            "allocation_batch_tax_components",
+            "allocation_batch_finalizations",
+        )
+        for operation in ("update", "delete", "replace_insert")
+    }
+    with engine.connect() as connection:
+        initial_independent_triggers = {
+            name: sql
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ))
+            if name in independent_trigger_names
+        }
+    assert independent_trigger_names <= initial_independent_triggers.keys()
+
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE bank_transactions"))
+
+    first_run = migrations.run_company_migrations(engine)
+    second_run = migrations.run_company_migrations(engine)
+    with engine.connect() as connection:
+        assert not _table_exists(connection, "bank_transactions")
+        invalid_triggers = connection.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND (lower(name) LIKE 'trg_allocation_batch%' "
+            "OR lower(name) LIKE 'trg_bank_transactions_allocation_batch%') "
+            "AND lower(COALESCE(sql, '')) LIKE '%bank_transactions%'"
+        )).scalars().all()
+        assert invalid_triggers == []
+        assert _table_exists(connection, "allocation_batches")
+        remaining_independent_triggers = {
+            name: sql
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ))
+            if name in independent_trigger_names
+        }
+        assert remaining_independent_triggers == initial_independent_triggers
+    assert "guards:allocation_batches_append_only" in initial_run
+    assert "drop_triggers:allocation_batches_missing_bank_table" in first_run
+    assert "guards:allocation_batches_append_only" not in first_run
+    assert second_run == []
+    engine.dispose()
+
+
+def test_allocation_batch_migration_repairs_empty_partial_tables_without_bank():
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE allocation_batches (id INTEGER PRIMARY KEY)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE allocation_batch_lines (id INTEGER PRIMARY KEY)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE allocation_batch_tax_components (id INTEGER PRIMARY KEY)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE allocation_batch_finalizations (batch_id INTEGER PRIMARY KEY)"
+        ))
+
+    applied = migrations.run_company_migrations(engine)
+    with engine.connect() as connection:
+        assert not _table_exists(connection, "bank_transactions")
+        assert {
+            "idempotency_key", "transaction_version", "expected_prior_version",
+            "bank_transaction_id", "baseline_finalization_id",
+        } <= {
+            row[1] for row in connection.execute(
+                text("PRAGMA table_info(allocation_batches)")
+            )
+        }
+        index_names = {
+            row[0] for row in connection.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ))
+        }
+        assert {
+            "uq_allocation_batch_idempotency",
+            "uq_allocation_batch_transaction_version",
+            "uq_allocation_batch_line_order",
+            "uq_allocation_batch_line_identity",
+            "uq_allocation_batch_component_tax_code",
+        } <= index_names
+        trigger_names = {
+            row[0] for row in connection.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            ))
+        }
+        assert "trg_allocation_batches_no_update" in trigger_names
+        assert "trg_allocation_batch_lines_no_update" in trigger_names
+        assert "trg_allocation_batch_tax_components_no_update" in trigger_names
+        assert "trg_allocation_batch_finalizations_no_update" in trigger_names
+        assert not any(
+            name.startswith("trg_allocation_batch")
+            and "domain" in name
+            and name in trigger_names
+            for name in (
+                "trg_allocation_batches_domain",
+                "trg_allocation_batch_lines_domain",
+                "trg_allocation_batch_finalizations_domain",
+            )
+        )
+    assert "schema:allocation_batches" in applied
+    assert "guards:allocation_batches_append_only" in applied
+    engine.dispose()
+
+
+def test_gst_adjustment_schema_survives_rebuild_without_legacy_backfill():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+
+    def gst_adjustment_snapshot(conn):
+        return {
+            "events": conn.execute(
+                text(
+                    "SELECT id, event_type, source_direction, adjustment_direction, "
+                    "projection_box, amount_cents, gst_amount_cents, tax_code, "
+                    "policy_version, reason, source_record_type, source_record_id, "
+                    "lifecycle_operation_type, lifecycle_operation_id, "
+                    "effective_date, awareness_date, agreement_date, "
+                    "refund_repayment_date, adjustment_note_reference, "
+                    "adjustment_note_held_date, manual_review_status, "
+                    "reversal_of_event_id, tax_slice_count, created_at "
+                    "FROM gst_adjustment_events ORDER BY id"
+                )
+            ).all(),
+            "slices": conn.execute(
+                text(
+                    "SELECT id, event_id, tax_code, amount_cents, gst_amount_cents "
+                    "FROM gst_adjustment_tax_slices ORDER BY id"
+                )
+            ).all(),
+            "finalizations": conn.execute(
+                text(
+                    "SELECT event_id, tax_slice_count, amount_cents, gst_amount_cents, "
+                    "finalized_at FROM gst_adjustment_finalizations ORDER BY event_id"
+                )
+            ).all(),
+            "evidence": conn.execute(
+                text(
+                    "SELECT id, event_id, evidence_type, evidence_reference, "
+                    "content_sha256, notes, created_at "
+                    "FROM gst_adjustment_evidence ORDER BY id"
+                )
+            ).all(),
+            "reviews": conn.execute(
+                text(
+                    "SELECT id, event_id, status, reviewer, reviewed_at, reason, created_at "
+                    "FROM gst_adjustment_manual_reviews ORDER BY id"
+                )
+            ).all(),
+        }
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO contacts (id, kind, name, active, created_at) "
+                "VALUES (1, 'customer', 'Synthetic legacy contact', 1, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO invoices ("
+                "id, direction, contact_id, invoice_number, issue_date, currency, "
+                "subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+                "source, created_at, updated_at"
+                ") VALUES (1, 'AR', 1, 'INV-LEGACY', '2026-07-01', 'AUD', "
+                "100, 10, 110, 1, 'draft', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO credit_notes ("
+                "id, source_invoice_id, direction, contact_id, credit_note_number, "
+                "issue_date, currency, subtotal, gst_amount, total, gst_inclusive, "
+                "status, created_at, updated_at"
+                ") VALUES (99, 1, 'AR', 1, 'CN-LEGACY', '2026-08-01', 'AUD', "
+                "100, 10, 110, 1, 'authorised', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_events ("
+                "id, event_type, source_direction, adjustment_direction, "
+                "projection_box, amount_cents, gst_amount_cents, tax_code, policy_version, "
+                "reason, source_record_type, source_record_id, effective_date, "
+                "awareness_date, agreement_date, refund_repayment_date, "
+                "adjustment_note_reference, adjustment_note_held_date, "
+                "manual_review_status, tax_slice_count"
+                ") VALUES (1, 'agreement', 'AR', 'decreasing', '1B', 11000, 1000, "
+                "'mixed', 'F-02-v1', 'Synthetic agreement', 'credit_note', 77, "
+                "'2026-09-01', '2026-09-02', '2026-09-03', '2026-09-04', "
+                "'CN-77', '2026-09-05', 'pending', 2)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (1, 'standard', 10000, 1000)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (1, 'gst_free', 1000, 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_manual_reviews "
+                "(event_id, status, reviewer, reviewed_at, reason) "
+                "VALUES (1, 'approved', 'Synthetic reviewer', "
+                "'2026-09-06 10:00:00', 'Synthetic approval')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_finalizations "
+                "(event_id, tax_slice_count, amount_cents, gst_amount_cents) "
+                "VALUES (1, 2, 11000, 1000)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_evidence "
+                "(event_id, evidence_type, evidence_reference, content_sha256) "
+                "VALUES (1, 'document', 'synthetic://agreement', "
+                "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')"
+            )
+        )
+        reversal_id = conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_events ("
+                "event_type, source_direction, adjustment_direction, projection_box, "
+                "amount_cents, gst_amount_cents, tax_code, policy_version, reason, "
+                "source_record_type, source_record_id, effective_date, awareness_date, "
+                "agreement_date, refund_repayment_date, adjustment_note_reference, "
+                "adjustment_note_held_date, manual_review_status, tax_slice_count, "
+                "reversal_of_event_id"
+                ") VALUES ('reversal', 'AR', 'increasing', '1A', 11000, 1000, "
+                "'mixed', 'F-02-v1', 'Synthetic reversal', 'credit_note', 77, "
+                "'2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10', "
+                "'CN-77-REV', '2026-09-11', 'pending', 2, 1) RETURNING id"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 'standard', 10000, 1000)"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 'gst_free', 1000, 0)"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_manual_reviews "
+                "(event_id, status, reviewer, reason) "
+                "VALUES (:event_id, 'pending', 'Synthetic reviewer', 'Reversal review opened')"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_manual_reviews "
+                "(event_id, status, reviewer, reviewed_at, reason) "
+                "VALUES (:event_id, 'approved', 'Synthetic reviewer', "
+                "'2026-09-12 10:00:00', 'Synthetic reversal approval')"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_evidence "
+                "(event_id, evidence_type, evidence_reference, content_sha256) "
+                "VALUES (:event_id, 'document', 'synthetic://reversal', "
+                "'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')"
+            ),
+            {"event_id": reversal_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_finalizations "
+                "(event_id, tax_slice_count, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 2, 11000, 1000)"
+            ),
+            {"event_id": reversal_id},
+        )
+        legacy_credit_note = conn.execute(
+            text(
+                "SELECT id, credit_note_number, subtotal, gst_amount, total, status "
+                "FROM credit_notes WHERE id=99"
+            )
+        ).one()
+        event_before_rebuild = conn.execute(
+            text(
+                "SELECT policy_version, effective_date, awareness_date, agreement_date, "
+                "refund_repayment_date, adjustment_note_held_date "
+                "FROM gst_adjustment_events WHERE id=1"
+            )
+        ).one()
+        f02_before_rebuild = gst_adjustment_snapshot(conn)
+        conn.execute(text("DROP TABLE bank_transactions"))
+        conn.execute(text(_OLD_BANK_TXN_DDL))
+
+    applied = migrations.run_company_migrations(engine)
+    assert "rebuild:bank_transactions" in applied
+
+    with engine.connect() as conn:
+        assert conn.execute(
+            text(
+                "SELECT id, credit_note_number, subtotal, gst_amount, total, status "
+                "FROM credit_notes WHERE id=99"
+            )
+        ).one() == legacy_credit_note
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_events WHERE source_record_id=99")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_events")
+        ).scalar_one() == 2
+        assert conn.execute(
+            text(
+                "SELECT id, event_type, reversal_of_event_id, source_record_type, "
+                "source_record_id, policy_version, amount_cents, gst_amount_cents "
+                "FROM gst_adjustment_events ORDER BY id"
+            )
+        ).all() == [
+            (1, "agreement", None, "credit_note", 77, "F-02-v1", 11000, 1000),
+            (reversal_id, "reversal", 1, "credit_note", 77, "F-02-v1", 11000, 1000),
+        ]
+        assert gst_adjustment_snapshot(conn) == f02_before_rebuild
+        assert conn.execute(
+            text(
+                "SELECT policy_version, effective_date, awareness_date, agreement_date, "
+                "refund_repayment_date, adjustment_note_held_date "
+                "FROM gst_adjustment_events WHERE id=1"
+            )
+        ).one() == event_before_rebuild
+        assert conn.execute(
+            text(
+                "SELECT tax_code, amount_cents, gst_amount_cents FROM gst_adjustment_tax_slices "
+                "WHERE event_id=1 ORDER BY tax_code"
+            )
+        ).all() == [("gst_free", 1000, 0), ("standard", 10000, 1000)]
+        assert conn.execute(
+            text(
+                "SELECT evidence_reference, content_sha256 FROM gst_adjustment_evidence "
+                "WHERE event_id=1"
+            )
+        ).one() == (
+            "synthetic://agreement",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        assert conn.execute(
+            text(
+                "SELECT status, reviewer FROM gst_adjustment_manual_reviews "
+                "WHERE event_id=1"
+            )
+        ).one() == ("approved", "Synthetic reviewer")
+        assert conn.execute(
+            text(
+                "SELECT tax_slice_count, amount_cents, gst_amount_cents "
+                "FROM gst_adjustment_finalizations WHERE event_id=1"
+            )
+        ).one() == (2, 11000, 1000)
+        reversal_index_sql = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='uq_gst_adjustment_events_reversal_once'"
+            )
+        ).scalar_one()
+        assert "WHERE reversal_of_event_id IS NOT NULL" in reversal_index_sql
+
+    second_applied = migrations.run_company_migrations(engine)
+    assert "rebuild:bank_transactions" not in second_applied
+    assert "guards:gst_adjustment_append_only" not in second_applied
+    with engine.connect() as conn:
+        assert gst_adjustment_snapshot(conn) == f02_before_rebuild
+        with pytest.raises(Exception, match="append-only"):
+            conn.execute(
+                text(
+                    "UPDATE gst_adjustment_events SET policy_version='F-02-v2' "
+                    "WHERE id=1"
+                )
+            )
+
+    engine.dispose()
+
+
+def test_gst_adjustment_lifecycle_operation_columns_are_additive_and_idempotent():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+
+    with engine.begin() as conn:
+        event_id = conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_events ("
+                "event_type, source_direction, adjustment_direction, projection_box, "
+                "amount_cents, gst_amount_cents, tax_code, policy_version, reason, "
+                "source_record_type, source_record_id, effective_date, tax_slice_count"
+                ") VALUES ('agreement', 'AP', 'decreasing', '1B', 10000, 1000, "
+                "'standard', 'F-02-v1', 'Synthetic legacy event', 'credit_note', "
+                "77, '2026-09-01', 1) RETURNING id"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_tax_slices "
+                "(event_id, tax_code, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 'standard', 10000, 1000)"
+            ),
+            {"event_id": event_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO gst_adjustment_finalizations "
+                "(event_id, tax_slice_count, amount_cents, gst_amount_cents) "
+                "VALUES (:event_id, 1, 10000, 1000)"
+            ),
+            {"event_id": event_id},
+        )
+        legacy_event = conn.execute(
+            text(
+                "SELECT event_type, source_direction, adjustment_direction, projection_box, "
+                "amount_cents, gst_amount_cents, tax_code, policy_version, source_record_type, "
+                "source_record_id, effective_date FROM gst_adjustment_events WHERE id=:event_id"
+            ),
+            {"event_id": event_id},
+        ).one()
+        trigger_names = conn.execute(
+            text(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND "
+                "(name LIKE 'trg_gst_adjustment_%' OR "
+                "name LIKE 'trg_journal_entries_gst_adjustment_%')"
+            )
+        ).scalars().all()
+        for trigger_name in trigger_names:
+            conn.execute(text(f'DROP TRIGGER "{trigger_name}"'))
+        conn.execute(
+            text("ALTER TABLE gst_adjustment_events DROP COLUMN lifecycle_operation_type")
+        )
+        conn.execute(
+            text("ALTER TABLE gst_adjustment_events DROP COLUMN lifecycle_operation_id")
+        )
+
+    repaired = migrations.run_company_migrations(engine)
+    assert "guards:gst_adjustment_append_only" in repaired
+    assert not any(step.startswith("rebuild:") for step in repaired)
+    with engine.connect() as conn:
+        event_columns = {
+            row[1]: row for row in conn.execute(text("PRAGMA table_info(gst_adjustment_events)"))
+        }
+        assert event_columns["lifecycle_operation_type"][2].upper() == "VARCHAR(50)"
+        assert event_columns["lifecycle_operation_id"][2].upper() == "INTEGER"
+        assert event_columns["lifecycle_operation_type"][3] == 0
+        assert event_columns["lifecycle_operation_id"][3] == 0
+        assert conn.execute(
+            text(
+                "SELECT lifecycle_operation_type, lifecycle_operation_id FROM "
+                "gst_adjustment_events WHERE id=:event_id"
+            ),
+            {"event_id": event_id},
+        ).one() == (None, None)
+        assert conn.execute(
+            text(
+                "SELECT event_type, source_direction, adjustment_direction, projection_box, "
+                "amount_cents, gst_amount_cents, tax_code, policy_version, source_record_type, "
+                "source_record_id, effective_date FROM gst_adjustment_events WHERE id=:event_id"
+            ),
+            {"event_id": event_id},
+        ).one() == legacy_event
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_finalizations WHERE event_id=:event_id"),
+            {"event_id": event_id},
+        ).scalar_one() == 1
+
+    assert "guards:gst_adjustment_append_only" not in migrations.run_company_migrations(engine)
+    engine.dispose()
+
+
+def test_legacy_credit_note_upgrade_does_not_infer_gst_events():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    with engine.begin() as conn:
+        for table in (
+            "gst_adjustment_evidence",
+            "gst_adjustment_manual_reviews",
+            "gst_adjustment_tax_slices",
+            "gst_adjustment_finalizations",
+            "gst_adjustment_events",
+        ):
+            conn.execute(text(f'DROP TABLE "{table}"'))
+        conn.execute(
+            text(
+                "INSERT INTO contacts (id, kind, name, active, created_at) "
+                "VALUES (1, 'customer', 'Synthetic legacy contact', 1, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO invoices ("
+                "id, direction, contact_id, invoice_number, issue_date, currency, "
+                "subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+                "source, created_at, updated_at"
+                ") VALUES (1, 'AR', 1, 'INV-LEGACY', '2026-07-01', 'AUD', "
+                "100, 10, 110, 1, 'draft', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO credit_notes ("
+                "id, source_invoice_id, direction, contact_id, credit_note_number, "
+                "issue_date, currency, subtotal, gst_amount, total, gst_inclusive, "
+                "status, created_at, updated_at"
+                ") VALUES (99, 1, 'AR', 1, 'CN-LEGACY', '2026-08-01', 'AUD', "
+                "100, 10, 110, 1, 'authorised', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    CompanyBase.metadata.create_all(engine)
+    applied = migrations.run_company_migrations(engine)
+    assert "guards:gst_adjustment_append_only" in applied
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM gst_adjustment_events")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text(
+                "SELECT credit_note_number, subtotal, gst_amount, total, status "
+                "FROM credit_notes WHERE id=99"
+            )
+        ).one() == ("CN-LEGACY", 100, 10, 110, "authorised")
+
+    assert "guards:gst_adjustment_append_only" not in migrations.run_company_migrations(engine)
+    engine.dispose()
+
+
 def test_rebuild_leaves_fk_enforcement_on_for_pooled_connections(tmp_path):
     """A rebuild toggles `PRAGMA foreign_keys=OFF` then runs DML, which opens the
     transaction and makes the closing `PRAGMA foreign_keys=ON` a silent no-op —
@@ -239,6 +867,13 @@ def test_rebuild_leaves_fk_enforcement_on_for_pooled_connections(tmp_path):
 
     with engine.connect() as conn:
         fk = conn.execute(text("PRAGMA foreign_keys")).scalar()
+        assert not _table_exists(conn, "bank_transactions")
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+            "AND (lower(name) LIKE 'trg_allocation_batch%' "
+            "OR lower(name) LIKE 'trg_bank_transactions_allocation_batch%') "
+            "AND lower(COALESCE(sql, '')) LIKE '%bank_transactions%'"
+        )).scalar_one() == 0
     assert fk == 1, "FK enforcement must stay on after a rebuild migration"
 
 
@@ -524,6 +1159,219 @@ def test_bank_rebuild_recovers_stale_helper_and_preserves_high_water(tmp_path):
         assert inserted_id == 81
 
 
+def test_bank_rebuild_batch_trigger_lifecycle_is_atomic_and_retryable(
+    tmp_path, monkeypatch
+):
+    engine = _file_engine_with_fk_hook(tmp_path / "batch-trigger-rebuild.db")
+    _populate_legacy_bank_graph(engine)
+    migrations.run_company_migrations(engine)
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO contacts (id, kind, name, active, created_at) "
+            "VALUES (1, 'customer', 'Synthetic batch customer', 1, CURRENT_TIMESTAMP)"
+        ))
+        connection.execute(text(
+            "INSERT INTO accounts (id, code, name, type, is_gst, active) "
+            "VALUES (2, '2200', 'Synthetic customer deposits', 'LIABILITY', 0, 1)"
+        ))
+        connection.execute(text(
+            "INSERT INTO invoices (id, direction, contact_id, invoice_number, issue_date, "
+            "currency, subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+            "source, created_at, updated_at) VALUES (1, 'AR', 1, 'SYN-BATCH', "
+            "'2026-05-01', 'AUD', 5, 0.5, 5.5, 1, 'authorised', 0, 'manual', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ))
+        connection.execute(text(
+            "DROP TRIGGER trg_allocation_history_baseline_finalizations_domain"
+        ))
+        event_id = connection.execute(text(
+            "INSERT INTO allocation_history_events (operation, bank_transaction_id) "
+            "VALUES ('legacy_history_unknown', 1) RETURNING id"
+        )).scalar_one()
+        connection.execute(text(
+            "INSERT INTO allocation_history_baseline_finalizations "
+            "(baseline_event_id, bank_transaction_id, observed_payment_date, observed_at, "
+            "observed_allocation_count, observed_component_count, "
+            "gross_allocation_total_cents, gst_total_cents, integrity_hash, status, "
+            "incomplete_reason_codes) VALUES (:event_id, 1, '2026-05-01', "
+            "'2026-05-01 00:00:00', 0, 0, 0, 0, :hash, 'complete', '[]')"
+        ), {"event_id": event_id, "hash": "0" * 64})
+        migrations._ensure_allocation_history_guards(connection)
+
+        batch_payload = {
+            "kind": "batch",
+            "bank_transaction_id": 1,
+            "operation": "allocation_correction",
+            "transaction_version": 1,
+            "expected_prior_version": 0,
+            "effective_date": "2026-05-01",
+            "recorded_at": "2026-05-02 00:00:00",
+            "idempotency_key": "synthetic-rebuild-batch",
+            "reason": "Synthetic rebuild preservation",
+            "evidence_reference": "synthetic://rebuild",
+            "evidence_sha256": None,
+            "actor_placeholder": "Synthetic operator",
+            "linked_prior_batch_id": None,
+            "internal_correction_approval_id": None,
+            "manual_review_status": "approved",
+            "residual_amount_cents": 500,
+            "residual_account_id": 2,
+            "baseline_finalization_id": event_id,
+        }
+        line_payload = {
+            "kind": "line",
+            "line_order": 0,
+            "source_kind": "invoice",
+            "invoice_or_bill_id": 1,
+            "gross_cents": 500,
+            "gst_cents": 50,
+        }
+        component_payload = {
+            "kind": "component",
+            "line_order": 0,
+            "tax_code": "standard",
+            "gross_cents": 500,
+            "gst_cents": 50,
+        }
+        batch_hash = migrations.allocation_baseline_integrity_hash(
+            [batch_payload, line_payload, component_payload]
+        )
+        batch_id = connection.execute(text(
+            "INSERT INTO allocation_batches (bank_transaction_id, operation, "
+            "transaction_version, expected_prior_version, effective_date, recorded_at, "
+            "idempotency_key, canonical_payload_hash, reason, evidence_reference, "
+            "actor_placeholder, manual_review_status, residual_amount_cents, "
+            "residual_account_id, baseline_finalization_id) VALUES "
+            "(1, 'allocation_correction', 1, 0, '2026-05-01', '2026-05-02 00:00:00', "
+            "'synthetic-rebuild-batch', :hash, 'Synthetic rebuild preservation', "
+            "'synthetic://rebuild', 'Synthetic operator', 'approved', 500, 2, "
+            ":event_id) RETURNING id"
+        ), {"hash": batch_hash, "event_id": event_id}).scalar_one()
+        line_id = connection.execute(text(
+            "INSERT INTO allocation_batch_lines "
+            "(batch_id, line_order, source_kind, invoice_or_bill_id, gross_cents, gst_cents) "
+            "VALUES (:batch_id, 0, 'invoice', 1, 500, 50) RETURNING id"
+        ), {"batch_id": batch_id}).scalar_one()
+        connection.execute(text(
+            "INSERT INTO allocation_batch_tax_components "
+            "(allocation_batch_line_id, tax_code, gross_cents, gst_cents) "
+            "VALUES (:line_id, 'standard', 500, 50)"
+        ), {"line_id": line_id})
+        connection.execute(text(
+            "INSERT INTO allocation_batch_finalizations "
+            "(batch_id, allocation_line_count, component_count, total_allocated_cents, "
+            "total_gst_cents, residual_cents, bank_cash_cents, "
+            "canonical_integrity_hash, finalized_at) "
+            "VALUES (:batch_id, 1, 1, 500, 50, 500, 1000, :hash, "
+            "'2026-05-02 00:01:00')"
+        ), {"batch_id": batch_id, "hash": batch_hash})
+
+    bank_dependent_names = {
+        "trg_allocation_batches_domain",
+        "trg_allocation_batch_lines_domain",
+        "trg_allocation_batch_finalizations_domain",
+        "trg_bank_transactions_allocation_batch_cash_immutable",
+        "trg_bank_transactions_allocation_batch_no_delete",
+        "trg_bank_transactions_allocation_batch_no_replace",
+    }
+    before_rows = None
+    with engine.connect() as connection:
+        before_rows = (
+            connection.execute(text("SELECT * FROM allocation_batches")).all(),
+            connection.execute(text("SELECT * FROM allocation_batch_lines")).all(),
+            connection.execute(text("SELECT * FROM allocation_batch_tax_components")).all(),
+            connection.execute(text("SELECT * FROM allocation_batch_finalizations")).all(),
+            connection.execute(text("SELECT * FROM bank_transactions")).all(),
+        )
+        before_triggers = {
+            name: sql
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ))
+            if name in bank_dependent_names
+        }
+    assert set(before_triggers) == bank_dependent_names
+
+    observed_during_rebuild = []
+    original_rebuild = migrations._rebuild_bank_transactions
+
+    def observe_dependencies(connection):
+        remaining = {
+            row[0]
+            for row in connection.execute(text(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            ))
+            if row[0] in bank_dependent_names
+        }
+        observed_during_rebuild.append(remaining)
+        return original_rebuild(connection)
+
+    should_fail = True
+
+    def inject_rebuild_failure(_conn, _cursor, statement, _params, _context, _many):
+        nonlocal should_fail
+        if should_fail and " ".join(statement.upper().split()).startswith(
+            "DROP TABLE BANK_TRANSACTIONS"
+        ):
+            should_fail = False
+            raise RuntimeError("synthetic batch-trigger rebuild failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(migrations, "_bank_needs_rebuild", lambda _conn: True)
+        patch.setattr(migrations, "_rebuild_bank_transactions", observe_dependencies)
+        event.listen(engine, "before_cursor_execute", inject_rebuild_failure)
+        try:
+            with pytest.raises(RuntimeError, match="synthetic batch-trigger rebuild failure"):
+                migrations.run_company_migrations(engine)
+        finally:
+            event.remove(engine, "before_cursor_execute", inject_rebuild_failure)
+
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT * FROM allocation_batches")).all() == before_rows[0]
+            assert connection.execute(text("SELECT * FROM allocation_batch_lines")).all() == before_rows[1]
+            assert connection.execute(text("SELECT * FROM allocation_batch_tax_components")).all() == before_rows[2]
+            assert connection.execute(text("SELECT * FROM allocation_batch_finalizations")).all() == before_rows[3]
+            assert connection.execute(text("SELECT * FROM bank_transactions")).all() == before_rows[4]
+            restored_triggers = {
+                name: sql
+                for name, sql in connection.execute(text(
+                    "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+                ))
+                if name in bank_dependent_names
+            }
+            assert restored_triggers == before_triggers
+            assert not _table_exists(connection, "new_bank_transactions")
+            assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
+            assert connection.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+
+        retry = migrations.run_company_migrations(engine)
+        assert "rebuild:bank_transactions" in retry
+
+    assert observed_during_rebuild == [set(), set()]
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT * FROM allocation_batches")).all() == before_rows[0]
+        assert connection.execute(text("SELECT * FROM allocation_batch_lines")).all() == before_rows[1]
+        assert connection.execute(text("SELECT * FROM allocation_batch_tax_components")).all() == before_rows[2]
+        assert connection.execute(text("SELECT * FROM allocation_batch_finalizations")).all() == before_rows[3]
+        assert connection.execute(text("SELECT * FROM bank_transactions")).all() == before_rows[4]
+        restored_triggers = {
+            name: sql
+            for name, sql in connection.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+            ))
+            if name in bank_dependent_names
+        }
+        assert restored_triggers == before_triggers
+        assert not _table_exists(connection, "new_bank_transactions")
+        assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
+        assert connection.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+    assert "rebuild:bank_transactions" not in migrations.run_company_migrations(engine)
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     "failure_statement",
     [
@@ -724,3 +1572,239 @@ def test_system_account_reconciliation_error_rolls_back_and_keeps_backup(tmp_pat
         assert conn.execute(
             text("SELECT name, type, active FROM accounts WHERE code='2000'")
         ).one() == ("AP renamed", "LIABILITY", 1)
+
+
+def test_allocation_history_migration_repairs_owned_guards_and_indexes_idempotently():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    first = migrations.run_company_migrations(engine)
+    second = migrations.run_company_migrations(engine)
+    assert "guards:allocation_history_append_only" in first
+    assert "guards:allocation_history_append_only" not in second
+    assert "schema:allocation_history" not in second
+
+    with engine.begin() as conn:
+        conn.execute(text('DROP INDEX "uq_allocation_history_idempotency"'))
+        conn.execute(
+            text(
+                "CREATE INDEX uq_allocation_history_idempotency "
+                "ON allocation_history_events (bank_transaction_id)"
+            )
+        )
+        conn.execute(text('DROP INDEX "uq_allocation_history_baseline_allocation"'))
+        conn.execute(
+            text(
+                "CREATE INDEX uq_allocation_history_baseline_allocation "
+                "ON allocation_history_baseline_bindings (bank_transaction_id)"
+            )
+        )
+        canonical = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_allocation_history_events_domain'"
+            )
+        ).scalar_one()
+        altered_case = canonical.replace(
+            "'allocation_correction'", "'ALLOCATION_CORRECTION'"
+        )
+        assert altered_case != canonical
+        conn.execute(text('DROP TRIGGER "trg_allocation_history_events_domain"'))
+        conn.exec_driver_sql(altered_case)
+        conn.execute(
+            text(
+                'DROP TRIGGER "trg_allocation_history_baseline_finalizations_domain"'
+            )
+        )
+        conn.execute(
+            text(
+                'CREATE TRIGGER "trg_allocation_history_baseline_finalizations_domain" '
+                'BEFORE INSERT ON allocation_history_baseline_finalizations '
+                'BEGIN SELECT 1; END'
+            )
+        )
+
+    repaired = migrations.run_company_migrations(engine)
+    assert "schema:allocation_history" in repaired
+    assert "guards:allocation_history_append_only" in repaired
+    with engine.connect() as conn:
+        assert migrations.sqlite_index_matches(
+            conn,
+            "allocation_history_events",
+            migrations.SQLiteIndexSignature(
+                "uq_allocation_history_idempotency",
+                ("idempotency_key",),
+                unique=True,
+                where="idempotency_key IS NOT NULL",
+            ),
+        )
+        assert migrations.sqlite_index_matches(
+            conn,
+            "allocation_history_baseline_bindings",
+            migrations.SQLiteIndexSignature(
+                "uq_allocation_history_baseline_allocation",
+                ("baseline_event_id", "allocation_row_id"),
+                unique=True,
+            ),
+        )
+        canonical = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_allocation_history_events_domain'"
+            )
+        ).scalar_one()
+        assert "'allocation_correction'" in canonical
+        assert "'ALLOCATION_CORRECTION'" not in canonical
+        assert "Invalid allocation history event" in canonical
+        baseline_finalization_sql = conn.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_allocation_history_baseline_finalizations_domain'"
+            )
+        ).scalar_one()
+        assert "allocation_baseline_sha256" in baseline_finalization_sql
+        assert "SELECT 1; END" not in baseline_finalization_sql
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM bas_period_lodgment_markers")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM allocation_history_events")
+        ).scalar_one() == 0
+        with pytest.raises(Exception, match="Invalid internal BAS period marker"):
+            conn.execute(
+                text(
+                    "INSERT INTO bas_period_lodgment_markers "
+                    "(period_id, period_start, period_end, lodged_status, "
+                    "internally_asserted_at, actor_placeholder, evidence_reference, "
+                    "evidence_scope) VALUES ('blank', '2026-10-01', '2026-10-31', 1, "
+                    "'2026-11-01', 'synthetic', ' ', "
+                    "'internal_assertion_not_ato_lodgment_evidence')"
+                )
+            )
+    engine.dispose()
+
+
+def test_allocation_history_migration_repairs_empty_partial_table_by_table():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE allocation_history_tax_components"))
+        conn.execute(
+            text(
+                "CREATE TABLE allocation_history_tax_components "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO allocation_history_tax_components (id) VALUES (7)")
+        )
+        conn.execute(
+            text("DROP TABLE allocation_history_baseline_tax_bindings")
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE allocation_history_baseline_tax_bindings "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO allocation_history_baseline_tax_bindings (id) VALUES (9)")
+        )
+
+    repaired = migrations.run_company_migrations(engine)
+    assert "schema:allocation_history" in repaired
+    with engine.connect() as conn:
+        assert {
+            "id", "snapshot_id", "tax_code", "gross_cents", "gst_cents"
+        }.issubset(
+            {row[1] for row in conn.execute(
+                text("PRAGMA table_info(allocation_history_tax_components)")
+            )}
+        )
+        assert conn.execute(
+            text(
+                "SELECT id, snapshot_id, tax_code, gross_cents, gst_cents "
+                "FROM allocation_history_tax_components"
+            )
+        ).one() == (7, None, None, None, None)
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM allocation_history_events")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM bas_period_lodgment_markers")
+        ).scalar_one() == 0
+        assert conn.execute(
+            text(
+                "SELECT id, allocation_binding_id, source_component_row_id, tax_code, "
+                "component_gross_cents, component_gross_source, component_gst_cents, "
+                "component_gst_source FROM allocation_history_baseline_tax_bindings"
+            )
+        ).one() == (9, None, None, None, None, None, None, None)
+    engine.dispose()
+
+
+def test_allocation_history_partial_binding_without_primary_key_fails_closed():
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE allocation_history_baseline_bindings"))
+        conn.execute(
+            text(
+                "CREATE TABLE allocation_history_baseline_bindings "
+                "(baseline_event_id INTEGER)"
+            )
+        )
+    with pytest.raises(DataRecoveryRequiredError, match="primary key is missing"):
+        migrations.run_company_migrations(engine)
+    engine.dispose()
+
+
+def test_bank_transaction_rebuild_preserves_allocation_history(monkeypatch):
+    engine = _engine()
+    CompanyBase.metadata.create_all(engine)
+    migrations.run_company_migrations(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO bank_accounts (id, name, opening_balance, is_active) "
+                "VALUES (1, 'Synthetic history bank', 0, 1)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO bank_transactions "
+                "(id, bank_account_id, direction, amount, occurred_at, gst_amount, "
+                "tax_code, unapplied_amount) "
+                "VALUES (1, 1, 'in', 20, '2026-10-01', 0, 'none', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO allocation_history_events "
+                "(operation, bank_transaction_id) "
+                "VALUES ('legacy_history_unknown', 1)"
+            )
+        )
+
+    monkeypatch.setattr(migrations, "_bank_needs_rebuild", lambda _conn: True)
+    rebuilt = migrations.run_company_migrations(engine)
+    assert "rebuild:bank_transactions" in rebuilt
+    with engine.connect() as conn:
+        assert conn.execute(
+            text(
+                "SELECT id, operation, bank_transaction_id, effective_date, "
+                "evidence_reference FROM allocation_history_events"
+            )
+        ).all() == [(1, "legacy_history_unknown", 1, None, None)]
+        assert conn.execute(
+            text("SELECT id, amount, occurred_at FROM bank_transactions")
+        ).one() == (1, 20, "2026-10-01")
+        assert conn.execute(text("PRAGMA foreign_key_check")).fetchall() == []
+        assert conn.execute(
+            text(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_bank_transactions_allocation_history_no_delete'"
+            )
+        ).scalar_one() == 1
+    engine.dispose()

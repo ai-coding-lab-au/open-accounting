@@ -27,8 +27,10 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from ..db.company import begin_sqlite_immediate, rollback_session_on_error
 from ..models.company import (
     Account,
     AccountType,
@@ -38,6 +40,7 @@ from ..models.company import (
     BankTxnDirection,
     TaxCode,
 )
+from .allocation_history import translate_allocation_history_db_error
 from .excel_import import (
     _cell_to_str,
     _normalise,
@@ -906,6 +909,7 @@ def _canonical_commit_row(
     }
 
 
+@rollback_session_on_error
 def commit_import(
     db: Session,
     *,
@@ -933,6 +937,7 @@ def commit_import(
     flagged in the preview. Guards against double-counting bank cash / GST / P&L
     / BAS even if a caller submits a preview-flagged duplicate.
     """
+    begin_sqlite_immediate(db)
     bank = db.get(BankAccount, bank_account_id)
     if bank is None:
         raise ValueError(f"Bank account {bank_account_id} not found")
@@ -1081,7 +1086,11 @@ def commit_import(
             dedup_key=dk,
         )
         db.add(txn)
-        db.flush()
+        try:
+            db.flush()
+        except DBAPIError as exc:
+            translate_allocation_history_db_error(db, exc)
+            raise
         try:
             invoice_payments.replace_transaction_allocations(
                 db,
@@ -1100,5 +1109,4 @@ def commit_import(
         created += 1
         seen.add(dk)  # don't double-add within the same payload
 
-    db.commit()
     return {"created": created, "skipped_duplicates": skipped}

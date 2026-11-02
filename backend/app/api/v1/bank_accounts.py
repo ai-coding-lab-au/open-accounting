@@ -19,7 +19,10 @@ from fastapi import (
 )
 from sqlalchemy.orm import Session, selectinload
 
-from ...db.company import begin_sqlite_immediate
+from ...db.company import (
+    SQLiteImmediateLockError,
+    begin_sqlite_immediate,
+)
 from ...deps import PathId, get_company_db, get_current_company
 from ...models.company import (
     BankAccount,
@@ -45,6 +48,7 @@ from ...schemas.bank import (
 )
 from ...services import bank_accounts as bank_accounts_svc
 from ...services import bank_import as bank_import_svc
+from ...services.allocation_history import AllocationHistoryConflict
 from ...services import period_lock
 from ...services.bank_accounts import bank_account_balance
 
@@ -58,6 +62,14 @@ def _require_open_period(company: Company, value, *, operation: str) -> None:
         period_lock.require_open_date(company, value, operation=operation)
     except period_lock.AccountingPeriodLockedError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _begin_bank_mutation(db: Session) -> None:
+    try:
+        begin_sqlite_immediate(db)
+    except SQLiteImmediateLockError as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
 
 
 router = APIRouter(prefix="/bank-accounts", tags=["bank-accounts"])
@@ -200,7 +212,7 @@ def create_manual_transaction(
         invoice_allocations=payload.invoice_allocations,
         unapplied_account_id=payload.unapplied_account_id,
     )
-    begin_sqlite_immediate(db)
+    _begin_bank_mutation(db)
     try:
         replay = bank_accounts_svc.replay_manual_transaction(
             db,
@@ -231,8 +243,12 @@ def create_manual_transaction(
             unapplied_account_id=payload.unapplied_account_id,
             gst_registered=company.gst_registered,
         )
+        db.commit()
     except bank_accounts_svc.BankTxnError as e:
         raise _map_bank_error(e)
+    except AllocationHistoryConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
     return txn
 
 
@@ -242,6 +258,7 @@ def delete_manual_transaction(
     company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
+    _begin_bank_mutation(db)
     txn = db.get(BankTransaction, txn_id)
     if txn is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -252,6 +269,10 @@ def delete_manual_transaction(
     )
     try:
         bank_accounts_svc.delete_manual_transaction(db, txn_id=txn_id)
+        db.commit()
+    except AllocationHistoryConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
     except bank_accounts_svc.BankTxnError as e:
         raise _map_bank_error(e)
 
@@ -266,6 +287,7 @@ def recategorise_transaction(
     company: Company = Depends(get_current_company),
     db: Session = Depends(get_company_db),
 ):
+    _begin_bank_mutation(db)
     txn = db.get(BankTransaction, txn_id)
     if txn is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -274,18 +296,22 @@ def recategorise_transaction(
         txn.occurred_at,
         operation="recategorise a bank transaction",
     )
-    begin_sqlite_immediate(db)
     try:
         # exclude_unset: an omitted account_id keeps the current category;
         # an explicit account_id=null de-categorises.
-        return bank_accounts_svc.recategorise_transaction(
+        transaction = bank_accounts_svc.recategorise_transaction(
             db,
             txn_id=txn_id,
             gst_registered=company.gst_registered,
             **payload.model_dump(exclude_unset=True),
         )
+        db.commit()
+        return transaction
     except bank_accounts_svc.BankTxnError as e:
         raise _map_bank_error(e)
+    except AllocationHistoryConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
 
 
 @router.get(
@@ -360,14 +386,19 @@ def import_commit(
             row.occurred_at,
             operation="import a bank transaction",
         )
-    begin_sqlite_immediate(db)
+    _begin_bank_mutation(db)
     try:
-        return bank_import_svc.commit_import(
+        result = bank_import_svc.commit_import(
             db,
             bank_account_id=bank_account_id,
             rows=[r.model_dump() for r in payload.rows],
             gst_registered=company.gst_registered,
         )
+        db.commit()
+        return result
+    except AllocationHistoryConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
     except ValueError as e:
         db.rollback()
         raise HTTPException(400, str(e)) from e

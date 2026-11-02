@@ -22,14 +22,16 @@ linear-history bookkeeping Alembic provides. Re-evaluate if any of:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.engine import Engine
 
@@ -142,6 +144,1954 @@ def _index_exists(conn, name: str) -> bool:
         {"n": name},
     ).fetchone()
     return row is not None
+
+
+def _sqlite_invalid_iso_date(value_sql: str) -> str:
+    return (
+        f"(typeof({value_sql}) != 'text' OR length({value_sql}) != 10 "
+        f"OR {value_sql} NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "
+        f"OR substr({value_sql}, 1, 4) NOT BETWEEN '0001' AND '9999' "
+        f"OR strftime('%Y-%m-%d', {value_sql}, '+0 days') IS NOT {value_sql})"
+    )
+
+
+def _ensure_gst_adjustment_append_only_guards(conn) -> bool:
+    """Install or repair canonical append-only and GST-domain triggers."""
+    from ..models.company import GST_ADJUSTMENT_MAX_CENTS
+
+    tables = (
+        "gst_adjustment_events",
+        "gst_adjustment_tax_slices",
+        "gst_adjustment_finalizations",
+        "gst_adjustment_evidence",
+        "gst_adjustment_manual_reviews",
+    )
+    changed = False
+    if _table_exists(conn, "gst_adjustment_events") and (
+        "tax_slice_count" not in _existing_columns(conn, "gst_adjustment_events")
+    ):
+        conn.execute(
+            text(
+                "ALTER TABLE gst_adjustment_events ADD COLUMN tax_slice_count "
+                "INTEGER NOT NULL DEFAULT 1"
+            )
+        )
+        changed = True
+    if _table_exists(conn, "gst_adjustment_events"):
+        event_columns = _existing_columns(conn, "gst_adjustment_events")
+        for column, column_type in (
+            ("lifecycle_operation_type", "VARCHAR(50)"),
+            ("lifecycle_operation_id", "INTEGER"),
+        ):
+            if column not in event_columns:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE gst_adjustment_events ADD COLUMN {column} "
+                        f"{column_type}"
+                    )
+                )
+                changed = True
+
+    for table in tables:
+        if not _table_exists(conn, table):
+            continue
+
+        for operation in ("UPDATE", "DELETE"):
+            name = f"trg_{table}_no_{operation.lower()}"
+            sql = (
+                f'CREATE TRIGGER "{name}" BEFORE {operation} ON "{table}" '
+                "BEGIN SELECT RAISE(ABORT, 'GST adjustment records are append-only'); END"
+            )
+            changed = _ensure_trigger(conn, name, sql) or changed
+
+        if table == "gst_adjustment_finalizations":
+            insert_conditions = [
+                "EXISTS (SELECT 1 FROM gst_adjustment_finalizations "
+                "WHERE event_id = NEW.event_id)"
+            ]
+        else:
+            insert_conditions = [
+                f'EXISTS (SELECT 1 FROM "{table}" WHERE id = NEW.id)'
+            ]
+        if table == "gst_adjustment_events":
+            insert_conditions.append(
+                "(NEW.reversal_of_event_id IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM gst_adjustment_events "
+                "WHERE reversal_of_event_id = NEW.reversal_of_event_id))"
+            )
+        elif table == "gst_adjustment_tax_slices":
+            insert_conditions.append(
+                "EXISTS (SELECT 1 FROM gst_adjustment_tax_slices "
+                "WHERE event_id = NEW.event_id AND tax_code = NEW.tax_code)"
+            )
+        insert_trigger = f"trg_{table}_no_replace_insert"
+        insert_sql = (
+            f'''CREATE TRIGGER "{insert_trigger}"
+            BEFORE INSERT ON "{table}"
+            WHEN {" OR ".join(insert_conditions)}
+            BEGIN
+                SELECT RAISE(ABORT, 'GST adjustment records are append-only');
+            END'''
+        )
+        changed = _ensure_trigger(conn, insert_trigger, insert_sql) or changed
+
+    if _table_exists(conn, "gst_adjustment_events"):
+        domain_trigger = "trg_gst_adjustment_events_domain"
+        effective_date_invalid = _sqlite_invalid_iso_date("NEW.effective_date")
+        awareness_date_invalid = _sqlite_invalid_iso_date("NEW.awareness_date")
+        agreement_date_invalid = _sqlite_invalid_iso_date("NEW.agreement_date")
+        refund_date_invalid = _sqlite_invalid_iso_date("NEW.refund_repayment_date")
+        note_held_date_invalid = _sqlite_invalid_iso_date("NEW.adjustment_note_held_date")
+        domain_sql = f'''CREATE TRIGGER "{domain_trigger}"
+            BEFORE INSERT ON "gst_adjustment_events"
+            WHEN length(trim(COALESCE(NEW.event_type, ''), char(9) || char(10) || char(13) || ' ')) = 0
+                            OR NEW.event_type NOT IN ('agreement', 'refund_repayment', 'adjustment_note', 'reversal')
+              OR NEW.source_direction NOT IN ('AR', 'AP')
+              OR NEW.adjustment_direction NOT IN ('increasing', 'decreasing')
+              OR NEW.projection_box NOT IN ('1A', '1B')
+              OR NEW.tax_code NOT IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none', 'mixed')
+              OR length(trim(COALESCE(NEW.tax_code, ''), char(9) || char(10) || char(13) || ' ')) = 0
+              OR NEW.policy_version NOT IN ('F-02-v1')
+              OR length(trim(COALESCE(NEW.reason, ''), char(9) || char(10) || char(13) || ' ')) = 0
+              OR typeof(NEW.amount_cents) != 'integer'
+              OR NEW.amount_cents < 1 OR NEW.amount_cents > {GST_ADJUSTMENT_MAX_CENTS}
+              OR typeof(NEW.gst_amount_cents) != 'integer'
+              OR NEW.gst_amount_cents < 0 OR NEW.gst_amount_cents > NEW.amount_cents
+              OR NEW.gst_amount_cents > {GST_ADJUSTMENT_MAX_CENTS}
+              OR NEW.manual_review_status NOT IN ('not_required', 'pending', 'approved', 'rejected')
+              OR typeof(NEW.tax_slice_count) != 'integer' OR NEW.tax_slice_count < 1
+              OR (NEW.tax_code = 'mixed' AND NEW.tax_slice_count < 2)
+              OR (NEW.tax_code != 'mixed' AND NEW.tax_slice_count != 1)
+                            OR NEW.source_record_type IS NULL
+                            OR length(trim(COALESCE(NEW.source_record_type, ''), char(9) || char(10) || char(13) || ' ')) = 0
+                            OR NEW.source_record_type NOT IN ('credit_note')
+                            OR typeof(NEW.source_record_id) != 'integer'
+                            OR NEW.source_record_id <= 0
+              OR ((NEW.lifecycle_operation_type IS NULL) != (NEW.lifecycle_operation_id IS NULL))
+              OR (NEW.lifecycle_operation_type IS NOT NULL AND
+                  NEW.lifecycle_operation_type NOT IN ('credit_note_ap', 'credit_note_void_ap'))
+              OR (NEW.lifecycle_operation_id IS NOT NULL AND (
+                  typeof(NEW.lifecycle_operation_id) != 'integer'
+                  OR NEW.lifecycle_operation_id <= 0
+              ))
+              OR ((NEW.event_type = 'reversal') != (NEW.reversal_of_event_id IS NOT NULL))
+              OR ((NEW.adjustment_note_reference IS NULL) != (NEW.adjustment_note_held_date IS NULL))
+              OR (NEW.adjustment_note_reference IS NOT NULL AND
+                  length(trim(NEW.adjustment_note_reference, char(9) || char(10) || char(13) || ' ')) = 0)
+              OR {effective_date_invalid}
+              OR (NEW.awareness_date IS NOT NULL AND (
+                  {awareness_date_invalid}
+                    OR julianday(NEW.awareness_date) < julianday(NEW.effective_date)
+                 ))
+              OR (NEW.agreement_date IS NOT NULL AND (
+                  {agreement_date_invalid}
+                    OR julianday(NEW.agreement_date) < julianday(NEW.effective_date)
+                 ))
+              OR (NEW.refund_repayment_date IS NOT NULL AND (
+                  {refund_date_invalid}
+                    OR julianday(NEW.refund_repayment_date) < julianday(NEW.effective_date)
+                 ))
+              OR (NEW.adjustment_note_held_date IS NOT NULL AND (
+                  {note_held_date_invalid}
+                    OR julianday(NEW.adjustment_note_held_date) < julianday(NEW.effective_date)
+                 ))
+              OR (NEW.tax_code IN ('gst_free', 'input_taxed', 'none') AND NEW.gst_amount_cents != 0)
+              OR (NEW.gst_amount_cents = 0 AND NEW.tax_code NOT IN ('gst_free', 'input_taxed', 'none', 'mixed'))
+            BEGIN
+                SELECT RAISE(ABORT, 'Invalid GST adjustment event');
+            END'''
+        changed = _ensure_trigger(conn, domain_trigger, domain_sql) or changed
+
+        reversal_trigger = "trg_gst_adjustment_events_reversal_opposite"
+        same_box_journal_condition = "0"
+        if _table_exists(conn, "journal_entries"):
+            same_box_journal_condition = """EXISTS (
+                SELECT 1 FROM journal_entries AS original_journal
+                JOIN journal_entries AS void_journal
+                  ON void_journal.id = NEW.lifecycle_operation_id
+                WHERE original_journal.id = original.lifecycle_operation_id
+                  AND original_journal.source_type = 'credit_note_ap'
+                  AND original_journal.source_id = original.source_record_id
+                  AND original_journal.entry_date = original.effective_date
+                  AND void_journal.source_type = 'credit_note_void_ap'
+                  AND void_journal.source_id = NEW.source_record_id
+                  AND void_journal.reverses_entry_id = original_journal.id
+                  AND void_journal.entry_date = NEW.effective_date
+            )"""
+        no_active_application_condition = (
+            "NOT EXISTS (SELECT 1 FROM credit_note_applications "
+            "WHERE credit_note_id = original.source_record_id AND status = 'active')"
+            if _table_exists(conn, "credit_note_applications")
+            else "0"
+        )
+        no_active_refund_condition = (
+            "NOT EXISTS (SELECT 1 FROM credit_note_refunds "
+            "WHERE credit_note_id = original.source_record_id AND status = 'active')"
+            if _table_exists(conn, "credit_note_refunds")
+            else "0"
+        )
+        same_box_exception = f"""(
+            original.projection_box = '1A'
+            AND NEW.projection_box = '1A'
+            AND original.source_direction = 'AP'
+            AND NEW.source_direction = 'AP'
+            AND original.lifecycle_operation_type = 'credit_note_ap'
+            AND NEW.lifecycle_operation_type = 'credit_note_void_ap'
+            AND original.lifecycle_operation_id IS NOT NULL
+            AND NEW.lifecycle_operation_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM gst_adjustment_events AS prior_reversal
+                WHERE prior_reversal.reversal_of_event_id = original.id
+            )
+            AND {same_box_journal_condition}
+            AND {no_active_application_condition}
+            AND {no_active_refund_condition}
+        )"""
+        if _table_exists(conn, "gst_adjustment_finalizations"):
+            reversal_sql = f'''CREATE TRIGGER "{reversal_trigger}"
+                BEFORE INSERT ON "gst_adjustment_events"
+                WHEN NEW.reversal_of_event_id IS NOT NULL
+                BEGIN
+                    SELECT CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM gst_adjustment_events AS original
+                        WHERE original.id = NEW.reversal_of_event_id
+                          AND original.reversal_of_event_id IS NULL
+                          AND original.source_direction = NEW.source_direction
+                          AND original.adjustment_direction <> NEW.adjustment_direction
+                         AND (original.projection_box <> NEW.projection_box
+                             OR {same_box_exception})
+                          AND original.amount_cents = NEW.amount_cents
+                          AND original.gst_amount_cents = NEW.gst_amount_cents
+                          AND original.tax_code = NEW.tax_code
+                          AND original.policy_version = NEW.policy_version
+                          AND original.source_record_type IS NEW.source_record_type
+                          AND original.source_record_id IS NEW.source_record_id
+                          AND original.tax_slice_count = NEW.tax_slice_count
+                          AND EXISTS (
+                              SELECT 1 FROM gst_adjustment_finalizations
+                              WHERE event_id = original.id
+                          )
+                          AND julianday(NEW.effective_date) >= julianday(original.effective_date)
+                    ) THEN RAISE(ABORT, 'GST adjustment reversal must be a full opposite linked event') END;
+                END'''
+        else:
+            reversal_sql = f'''CREATE TRIGGER "{reversal_trigger}"
+                BEFORE INSERT ON "gst_adjustment_events"
+                WHEN NEW.reversal_of_event_id IS NOT NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'GST adjustment finalization schema is unavailable');
+                END'''
+        changed = _ensure_trigger(conn, reversal_trigger, reversal_sql) or changed
+
+    if _table_exists(conn, "gst_adjustment_tax_slices") and _table_exists(
+        conn, "gst_adjustment_events"
+    ):
+        slice_trigger = "trg_gst_adjustment_tax_slices_domain"
+        slice_sql = f'''CREATE TRIGGER "{slice_trigger}"
+            BEFORE INSERT ON "gst_adjustment_tax_slices"
+            WHEN length(trim(COALESCE(NEW.tax_code, ''))) = 0
+              OR NEW.tax_code NOT IN ('standard', 'gst_free', 'input_taxed', 'capital', 'none')
+              OR typeof(NEW.amount_cents) != 'integer'
+              OR NEW.amount_cents < 1 OR NEW.amount_cents > {GST_ADJUSTMENT_MAX_CENTS}
+              OR typeof(NEW.gst_amount_cents) != 'integer'
+              OR NEW.gst_amount_cents < 0 OR NEW.gst_amount_cents > NEW.amount_cents
+              OR NEW.gst_amount_cents > {GST_ADJUSTMENT_MAX_CENTS}
+              OR (NEW.tax_code IN ('gst_free', 'input_taxed', 'none') AND NEW.gst_amount_cents != 0)
+              OR (NEW.gst_amount_cents = 0 AND NEW.tax_code NOT IN ('gst_free', 'input_taxed', 'none'))
+              OR NOT EXISTS (
+                    SELECT 1 FROM gst_adjustment_events AS parent
+                    WHERE parent.id = NEW.event_id
+                                            AND (parent.tax_code = 'mixed' OR (
+                                                        parent.tax_slice_count = 1 AND parent.tax_code = NEW.tax_code
+                                            ))
+                                            AND parent.tax_slice_count >= 1
+                      AND (SELECT COUNT(*) FROM gst_adjustment_tax_slices
+                           WHERE event_id = NEW.event_id) < parent.tax_slice_count
+                      AND (parent.reversal_of_event_id IS NULL OR EXISTS (
+                            SELECT 1 FROM gst_adjustment_tax_slices AS original_slice
+                            WHERE original_slice.event_id = parent.reversal_of_event_id
+                              AND original_slice.tax_code = NEW.tax_code
+                              AND original_slice.amount_cents = NEW.amount_cents
+                              AND original_slice.gst_amount_cents = NEW.gst_amount_cents
+                      ))
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'Invalid or unreconciled GST adjustment tax slice');
+            END'''
+        changed = _ensure_trigger(conn, slice_trigger, slice_sql) or changed
+
+    if all(
+        _table_exists(conn, table)
+        for table in (
+            "gst_adjustment_events",
+            "gst_adjustment_tax_slices",
+            "gst_adjustment_finalizations",
+        )
+    ):
+        finalization_trigger = "trg_gst_adjustment_finalizations_validate"
+        review_eligibility = (
+            "((parent.manual_review_status = 'not_required' AND NOT EXISTS ("
+            "SELECT 1 FROM gst_adjustment_manual_reviews WHERE event_id = parent.id)) "
+            "OR (parent.manual_review_status = 'pending' AND "
+            "(SELECT status FROM gst_adjustment_manual_reviews "
+            "WHERE event_id = parent.id ORDER BY id DESC LIMIT 1) = 'approved'))"
+            if _table_exists(conn, "gst_adjustment_manual_reviews")
+            else "0"
+        )
+        lifecycle_operation_eligibility = """(
+                        (parent.lifecycle_operation_type IS NULL AND parent.lifecycle_operation_id IS NULL)
+                        OR (
+                                parent.lifecycle_operation_type = 'credit_note_ap'
+                                AND parent.event_type != 'reversal'
+                                AND parent.source_direction = 'AP'
+                                AND (SELECT COUNT(*) FROM journal_entries AS posting_journal
+                                         WHERE posting_journal.id = parent.lifecycle_operation_id
+                                             AND posting_journal.source_type = 'credit_note_ap'
+                                             AND posting_journal.source_id = parent.source_record_id
+                                             AND posting_journal.entry_date = parent.effective_date) = 1
+                                AND (SELECT COUNT(*) FROM journal_entries AS matching_postings
+                                         WHERE matching_postings.source_type = 'credit_note_ap'
+                                             AND matching_postings.source_id = parent.source_record_id) = 1
+                        )
+                        OR (
+                                parent.lifecycle_operation_type = 'credit_note_void_ap'
+                                AND parent.event_type = 'reversal'
+                                AND parent.source_direction = 'AP'
+                                AND EXISTS (
+                                        SELECT 1 FROM gst_adjustment_events AS original
+                                        JOIN gst_adjustment_finalizations AS original_finalization
+                                            ON original_finalization.event_id = original.id
+                                        JOIN journal_entries AS posting_journal
+                                            ON posting_journal.id = original.lifecycle_operation_id
+                                        JOIN journal_entries AS void_journal
+                                            ON void_journal.id = parent.lifecycle_operation_id
+                                        WHERE original.id = parent.reversal_of_event_id
+                                            AND original.reversal_of_event_id IS NULL
+                                            AND original.source_direction = 'AP'
+                                            AND original.lifecycle_operation_type = 'credit_note_ap'
+                                            AND posting_journal.source_type = 'credit_note_ap'
+                                            AND posting_journal.source_id = original.source_record_id
+                                            AND posting_journal.entry_date = original.effective_date
+                                            AND void_journal.source_type = 'credit_note_void_ap'
+                                            AND void_journal.source_id = parent.source_record_id
+                                            AND void_journal.reverses_entry_id = posting_journal.id
+                                            AND void_journal.entry_date = parent.effective_date
+                                            AND (SELECT COUNT(*) FROM journal_entries AS matching_postings
+                                                     WHERE matching_postings.source_type = 'credit_note_ap'
+                                                         AND matching_postings.source_id = parent.source_record_id) = 1
+                                            AND (SELECT COUNT(*) FROM journal_entries AS matching_voids
+                                                     WHERE matching_voids.source_type = 'credit_note_void_ap'
+                                                         AND matching_voids.source_id = parent.source_record_id
+                                                         AND matching_voids.reverses_entry_id = posting_journal.id) = 1
+                                )
+                                AND NOT EXISTS (
+                                        SELECT 1 FROM credit_note_applications
+                                        WHERE credit_note_id = parent.source_record_id AND status = 'active'
+                                )
+                                AND NOT EXISTS (
+                                        SELECT 1 FROM credit_note_refunds
+                                        WHERE credit_note_id = parent.source_record_id AND status = 'active'
+                                )
+                        )
+                )""" if _table_exists(conn, "journal_entries") else "0"
+        finalization_sql = f'''CREATE TRIGGER "{finalization_trigger}"
+            BEFORE INSERT ON "gst_adjustment_finalizations"
+            WHEN NOT EXISTS (
+                SELECT 1 FROM gst_adjustment_events AS parent
+                WHERE parent.id = NEW.event_id
+                  AND NEW.tax_slice_count = parent.tax_slice_count
+                  AND NEW.amount_cents = parent.amount_cents
+                  AND NEW.gst_amount_cents = parent.gst_amount_cents
+                                    AND parent.source_record_type IS NOT NULL
+                                    AND length(trim(COALESCE(parent.source_record_type, ''), char(9) || char(10) || char(13) || ' ')) > 0
+                                    AND parent.source_record_type IN ('credit_note')
+                                    AND typeof(parent.source_record_id) = 'integer'
+                                    AND parent.source_record_id > 0
+                                      AND {lifecycle_operation_eligibility}
+                  AND {review_eligibility}
+                  AND (SELECT COUNT(*) FROM gst_adjustment_tax_slices
+                       WHERE event_id = parent.id) = parent.tax_slice_count
+                   AND (SELECT COALESCE(SUM(amount_cents), 0)
+                       FROM gst_adjustment_tax_slices
+                       WHERE event_id = parent.id) = parent.amount_cents
+                   AND (SELECT COALESCE(SUM(gst_amount_cents), 0)
+                       FROM gst_adjustment_tax_slices
+                       WHERE event_id = parent.id) = parent.gst_amount_cents
+                  AND (parent.reversal_of_event_id IS NULL OR (
+                      EXISTS (SELECT 1 FROM gst_adjustment_finalizations
+                              WHERE event_id = parent.reversal_of_event_id)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM gst_adjustment_tax_slices AS original_slice
+                          LEFT JOIN gst_adjustment_tax_slices AS reversal_slice
+                            ON reversal_slice.event_id = parent.id
+                           AND reversal_slice.tax_code = original_slice.tax_code
+                           AND reversal_slice.amount_cents = original_slice.amount_cents
+                           AND reversal_slice.gst_amount_cents = original_slice.gst_amount_cents
+                          WHERE original_slice.event_id = parent.reversal_of_event_id
+                            AND reversal_slice.id IS NULL
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM gst_adjustment_tax_slices AS reversal_slice
+                          LEFT JOIN gst_adjustment_tax_slices AS original_slice
+                            ON original_slice.event_id = parent.reversal_of_event_id
+                           AND original_slice.tax_code = reversal_slice.tax_code
+                           AND original_slice.amount_cents = reversal_slice.amount_cents
+                           AND original_slice.gst_amount_cents = reversal_slice.gst_amount_cents
+                          WHERE reversal_slice.event_id = parent.id
+                            AND original_slice.id IS NULL
+                      )
+                  ))
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'GST adjustment slices are incomplete or unreconciled');
+            END'''
+        changed = _ensure_trigger(conn, finalization_trigger, finalization_sql) or changed
+
+    if _table_exists(conn, "gst_adjustment_evidence"):
+        evidence_trigger = "trg_gst_adjustment_evidence_domain"
+        evidence_sql = f'''CREATE TRIGGER "{evidence_trigger}"
+            BEFORE INSERT ON "gst_adjustment_evidence"
+                        WHEN length(trim(COALESCE(NEW.evidence_type, ''), char(9) || char(10) || char(13) || ' ')) = 0
+                            OR NEW.evidence_type NOT IN ('document')
+                            OR length(trim(COALESCE(NEW.evidence_reference, ''), char(9) || char(10) || char(13) || ' ')) = 0
+              OR (NEW.content_sha256 IS NOT NULL AND (
+                    length(NEW.content_sha256) != 64
+                    OR lower(NEW.content_sha256) GLOB '*[^0-9a-f]*'
+                 ))
+            BEGIN
+                SELECT RAISE(ABORT, 'Invalid GST adjustment evidence');
+            END'''
+        changed = _ensure_trigger(conn, evidence_trigger, evidence_sql) or changed
+
+    if _table_exists(conn, "gst_adjustment_manual_reviews"):
+        review_trigger = "trg_gst_adjustment_manual_reviews_domain"
+        review_parent_condition = (
+            "EXISTS (SELECT 1 FROM gst_adjustment_events "
+            "WHERE id = NEW.event_id AND manual_review_status = 'pending')"
+            if _table_exists(conn, "gst_adjustment_events")
+            else "0"
+        )
+        terminal_review_condition = (
+            "EXISTS (SELECT 1 FROM gst_adjustment_manual_reviews "
+            "WHERE event_id = NEW.event_id AND status IN ('approved', 'rejected'))"
+        )
+        finalized_event_condition = (
+            "EXISTS (SELECT 1 FROM gst_adjustment_finalizations "
+            "WHERE event_id = NEW.event_id)"
+            if _table_exists(conn, "gst_adjustment_finalizations")
+            else "0"
+        )
+        review_sql = f'''CREATE TRIGGER "{review_trigger}"
+            BEFORE INSERT ON "gst_adjustment_manual_reviews"
+            WHEN NEW.status NOT IN ('pending', 'approved', 'rejected')
+                            OR NOT ({review_parent_condition})
+                            OR {terminal_review_condition}
+              OR {finalized_event_condition}
+              OR length(trim(COALESCE(NEW.reason, ''), char(9) || char(10) || char(13) || ' ')) = 0
+              OR (NEW.reviewer IS NOT NULL AND
+                  length(trim(NEW.reviewer, char(9) || char(10) || char(13) || ' ')) = 0)
+              OR (NEW.status = 'pending' AND NEW.reviewed_at IS NOT NULL)
+                  OR (NEW.status IN ('approved', 'rejected') AND (
+                          NEW.reviewed_at IS NULL
+                          OR length(NEW.reviewed_at) != 19
+                          OR NEW.reviewed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+                          OR strftime('%Y-%m-%d %H:%M:%S', NEW.reviewed_at) IS NULL
+                          OR strftime('%Y-%m-%d %H:%M:%S', NEW.reviewed_at, '+0 seconds') IS NOT NEW.reviewed_at
+                      ))
+            BEGIN
+                SELECT RAISE(ABORT, 'Invalid GST adjustment manual review');
+            END'''
+        changed = _ensure_trigger(conn, review_trigger, review_sql) or changed
+
+    if (
+        _table_exists(conn, "journal_entries")
+        and _table_exists(conn, "gst_adjustment_events")
+        and _table_exists(conn, "gst_adjustment_finalizations")
+    ):
+        referenced_journal = """EXISTS (
+            SELECT 1 FROM gst_adjustment_events AS event
+            JOIN gst_adjustment_finalizations AS finalization
+              ON finalization.event_id = event.id
+            WHERE event.lifecycle_operation_id = OLD.id
+              AND event.lifecycle_operation_type = OLD.source_type
+              AND event.source_record_id = OLD.source_id
+        )"""
+        journal_update_sql = f'''CREATE TRIGGER "trg_journal_entries_gst_adjustment_no_provenance_update"
+                        BEFORE UPDATE OF id, source_type, source_id, reverses_entry_id, entry_date
+            ON journal_entries
+            WHEN {referenced_journal}
+                            AND (OLD.id IS NOT NEW.id
+                                     OR OLD.source_type IS NOT NEW.source_type
+                   OR OLD.source_id IS NOT NEW.source_id
+                   OR OLD.reverses_entry_id IS NOT NEW.reverses_entry_id
+                   OR OLD.entry_date IS NOT NEW.entry_date)
+            BEGIN
+                SELECT RAISE(ABORT, 'Finalized GST adjustment journal provenance is immutable');
+            END'''
+        changed = _ensure_trigger(
+            conn,
+            "trg_journal_entries_gst_adjustment_no_provenance_update",
+            journal_update_sql,
+        ) or changed
+        journal_delete_sql = f'''CREATE TRIGGER "trg_journal_entries_gst_adjustment_no_provenance_delete"
+            BEFORE DELETE ON journal_entries
+            WHEN {referenced_journal}
+            BEGIN
+                SELECT RAISE(ABORT, 'Finalized GST adjustment journal provenance is immutable');
+            END'''
+        changed = _ensure_trigger(
+            conn,
+            "trg_journal_entries_gst_adjustment_no_provenance_delete",
+            journal_delete_sql,
+        ) or changed
+        journal_replace_sql = f'''CREATE TRIGGER "trg_journal_entries_gst_adjustment_no_provenance_replace"
+            BEFORE INSERT ON journal_entries
+            WHEN EXISTS (
+                SELECT 1 FROM journal_entries AS existing
+                WHERE (existing.id = NEW.id
+                   OR (NEW.source_id IS NOT NULL
+                       AND existing.source_type = NEW.source_type
+                       AND existing.source_id = NEW.source_id)
+                   OR (NEW.reverses_entry_id IS NOT NULL
+                       AND existing.reverses_entry_id = NEW.reverses_entry_id))
+                  AND EXISTS (
+                      SELECT 1 FROM gst_adjustment_events AS event
+                      JOIN gst_adjustment_finalizations AS finalization
+                        ON finalization.event_id = event.id
+                      WHERE event.lifecycle_operation_id = existing.id
+                        AND event.lifecycle_operation_type = existing.source_type
+                        AND event.source_record_id = existing.source_id
+                  )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'Finalized GST adjustment journal provenance is immutable');
+            END'''
+        changed = _ensure_trigger(
+            conn,
+            "trg_journal_entries_gst_adjustment_no_provenance_replace",
+            journal_replace_sql,
+        ) or changed
+    return changed
+
+
+def _normalise_trigger_sql(sql: str) -> str:
+    output: list[str] = []
+    pending_space = False
+    in_string = False
+    index = 0
+    while index < len(sql):
+        character = sql[index]
+        if in_string:
+            output.append(character)
+            if character == "'":
+                if index + 1 < len(sql) and sql[index + 1] == "'":
+                    output.append("'")
+                    index += 1
+                else:
+                    in_string = False
+        elif character == "'":
+            if pending_space and output:
+                output.append(" ")
+            pending_space = False
+            in_string = True
+            output.append(character)
+        elif character.isspace():
+            pending_space = True
+        else:
+            if pending_space and output:
+                output.append(" ")
+            pending_space = False
+            output.append(character.upper())
+        index += 1
+    return "".join(output).removesuffix(";")
+
+
+def _ensure_trigger(conn, name: str, canonical_sql: str) -> bool:
+    """Compare and restore the complete canonical SQL for one owned trigger."""
+    row = conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name = :n"),
+        {"n": name},
+    ).fetchone()
+    expected = _normalise_trigger_sql(canonical_sql)
+    if row is not None and row[0] and _normalise_trigger_sql(str(row[0])) == expected:
+        return False
+    if row is not None:
+        conn.execute(text(f'DROP TRIGGER "{name}"'))
+    conn.execute(text(canonical_sql))
+    installed = conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name = :n"),
+        {"n": name},
+    ).scalar_one()
+    if _normalise_trigger_sql(str(installed)) != expected:
+        raise RuntimeError(f"Could not install canonical owned trigger {name}")
+    return True
+
+
+_ALLOCATION_HISTORY_INDEXES = (
+    ("allocation_history_events", SQLiteIndexSignature(
+        "uq_allocation_history_idempotency", ("idempotency_key",), unique=True,
+        where="idempotency_key IS NOT NULL",
+    )),
+    ("allocation_history_events", SQLiteIndexSignature(
+        "uq_allocation_history_version", ("allocation_id", "version"), unique=True,
+        where="version IS NOT NULL",
+    )),
+    ("allocation_history_events", SQLiteIndexSignature(
+        "uq_allocation_history_legacy_unknown", ("bank_transaction_id",), unique=True,
+        where="operation = 'legacy_history_unknown'",
+    )),
+    ("allocation_history_events", SQLiteIndexSignature(
+        "uq_allocation_history_reversed_event", ("linked_event_id",), unique=True,
+        where="operation = 'allocation_reversal' AND linked_event_id IS NOT NULL",
+    )),
+    ("allocation_history_events", SQLiteIndexSignature(
+        "uq_allocation_history_reversed_allocation", ("linked_allocation_id",), unique=True,
+        where="operation = 'allocation_reversal' AND linked_allocation_id IS NOT NULL",
+    )),
+    ("allocation_history_events", SQLiteIndexSignature(
+        "uq_allocation_history_snapshot", ("snapshot_id",), unique=True,
+        where="snapshot_id IS NOT NULL",
+    )),
+    ("allocation_history_tax_components", SQLiteIndexSignature(
+        "uq_allocation_history_tax_component", ("snapshot_id", "tax_code"), unique=True,
+    )),
+    ("allocation_history_baseline_bindings", SQLiteIndexSignature(
+        "uq_allocation_history_baseline_allocation",
+        ("baseline_event_id", "allocation_row_id"), unique=True,
+    )),
+    ("allocation_history_baseline_tax_bindings", SQLiteIndexSignature(
+        "uq_allocation_history_baseline_component",
+        ("allocation_binding_id", "source_component_row_id"), unique=True,
+    )),
+    ("allocation_history_baseline_tax_bindings", SQLiteIndexSignature(
+        "uq_allocation_history_baseline_component_row",
+        ("source_component_row_id",), unique=True,
+    )),
+    ("allocation_history_baseline_finalizations", SQLiteIndexSignature(
+        "uq_allocation_history_baseline_finalization_transaction",
+        ("bank_transaction_id",), unique=True,
+    )),
+    ("bas_period_lodgment_markers", SQLiteIndexSignature(
+        "uq_bas_period_lodgment_period", ("period_id",), unique=True,
+    )),
+    ("allocation_period_correction_approvals", SQLiteIndexSignature(
+        "uq_allocation_period_correction_approval",
+        ("period_marker_id", "approved_idempotency_key"), unique=True,
+    )),
+)
+
+
+def allocation_baseline_integrity_hash(rows) -> str:
+    """Hash canonical JSON rows used by legacy allocation finalizations."""
+    encoded_rows = sorted(
+        json.dumps(row, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        for row in rows
+    )
+    payload = json.dumps(encoded_rows, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+_ALLOCATION_BASELINE_MAX_CENTS = (1 << 63) - 1
+
+
+def allocation_baseline_money_to_cents(value) -> int | None:
+    """Return exact nonnegative SQLite-safe cents, or NULL for invalid money."""
+    if value is None:
+        return None
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+
+    sign, digits, exponent = amount.as_tuple()
+    del sign
+    if not any(digits):
+        return 0
+
+    scaled_exponent = exponent + 2
+    digit_text = "".join(str(digit) for digit in digits)
+    if scaled_exponent >= 0:
+        if len(digit_text) + scaled_exponent > 19:
+            return None
+        cents = int(digit_text) * (10 ** scaled_exponent)
+    else:
+        discarded_digits = -scaled_exponent
+        if discarded_digits >= len(digit_text):
+            return None
+        if any(digit != "0" for digit in digits[-discarded_digits:]):
+            return None
+        retained_digits = digits[:-discarded_digits]
+        if len(retained_digits) > 19:
+            return None
+        cents = int("".join(str(digit) for digit in retained_digits))
+
+    if cents > _ALLOCATION_BASELINE_MAX_CENTS:
+        return None
+    return cents
+
+
+class _AllocationBaselineHash:
+    def __init__(self):
+        self.rows = []
+
+    def step(self, row_json):
+        self.rows.append(json.loads(row_json))
+
+    def finalize(self):
+        return allocation_baseline_integrity_hash(self.rows)
+
+
+def _register_allocation_baseline_hash(dbapi_connection, *_):
+    dbapi_connection.create_aggregate(
+        "allocation_baseline_sha256", 1, _AllocationBaselineHash
+    )
+    dbapi_connection.create_function(
+        "allocation_baseline_cents",
+        1,
+        allocation_baseline_money_to_cents,
+        deterministic=True,
+    )
+
+
+def _install_allocation_baseline_hash(engine: Engine) -> None:
+    if getattr(engine, "_allocation_baseline_hash_installed", False):
+        return
+    event.listen(engine, "checkout", _register_allocation_baseline_hash)
+    engine._allocation_baseline_hash_installed = True
+
+
+def _ensure_allocation_history_schema(conn) -> bool:
+    """Create or repair each owned table independently without backfilling data."""
+    tables = (
+        "allocation_history_snapshots",
+        "allocation_history_tax_components",
+        "allocation_history_finalizations",
+        "bas_period_lodgment_markers",
+        "allocation_period_correction_approvals",
+        "allocation_history_events",
+        "allocation_history_baseline_bindings",
+        "allocation_history_baseline_tax_bindings",
+        "allocation_history_baseline_finalizations",
+    )
+    metadata = _load_company_model_tables()
+    changed = False
+    for name in tables:
+        model_table = metadata[name]
+        if not _table_exists(conn, name):
+            model_table.create(conn, checkfirst=True)
+            changed = True
+            continue
+
+        existing = _existing_columns(conn, name)
+        missing = [column for column in model_table.columns if column.name not in existing]
+        if not missing:
+            continue
+        if any(column.primary_key for column in missing):
+            raise DataRecoveryRequiredError(
+                f"Cannot repair partial allocation-history table {name}: its primary key "
+                "is missing; records were left untouched."
+            )
+        # New columns stay nullable here: existing rows are preserved as-is,
+        # with no attempt to reconstruct facts that the partial schema omitted.
+        for column in missing:
+            type_sql = column.type.compile(dialect=conn.dialect)
+            conn.exec_driver_sql(
+                f'ALTER TABLE "{name}" ADD COLUMN "{column.name}" {type_sql}'
+            )
+        changed = True
+
+    for table, signature in _ALLOCATION_HISTORY_INDEXES:
+        if _repair_named_index(conn, table=table, signature=signature):
+            changed = True
+    return changed
+
+
+_ALLOCATION_BATCH_INDEXES = (
+    SQLiteIndexSignature(
+        "uq_allocation_batch_idempotency", ("idempotency_key",), unique=True,
+    ),
+    SQLiteIndexSignature(
+        "uq_allocation_batch_transaction_version",
+        ("bank_transaction_id", "transaction_version"), unique=True,
+    ),
+    SQLiteIndexSignature(
+        "uq_allocation_batch_line_order", ("batch_id", "line_order"), unique=True,
+    ),
+    SQLiteIndexSignature(
+        "uq_allocation_batch_line_identity",
+        ("batch_id", "source_kind", "invoice_or_bill_id"), unique=True,
+    ),
+    SQLiteIndexSignature(
+        "uq_allocation_batch_component_tax_code",
+        ("allocation_batch_line_id", "tax_code"), unique=True,
+    ),
+)
+
+MIGRATION_INDEX_SIGNATURES["allocation_batches"] = _ALLOCATION_BATCH_INDEXES[:2]
+MIGRATION_INDEX_SIGNATURES["allocation_batch_lines"] = _ALLOCATION_BATCH_INDEXES[2:4]
+MIGRATION_INDEX_SIGNATURES["allocation_batch_tax_components"] = _ALLOCATION_BATCH_INDEXES[4:]
+
+
+def _ensure_allocation_batch_schema(conn) -> bool:
+    """Create or safely repair empty partial batch tables without backfill."""
+    tables = (
+        "allocation_batches",
+        "allocation_batch_lines",
+        "allocation_batch_tax_components",
+        "allocation_batch_finalizations",
+    )
+    metadata = _load_company_model_tables()
+    changed = False
+    malformed = []
+    for name in tables:
+        model_table = metadata[name]
+        if not _table_exists(conn, name):
+            model_table.create(conn, checkfirst=True)
+            changed = True
+            continue
+
+        existing = _existing_columns(conn, name)
+        model_columns = {column.name for column in model_table.columns}
+        if existing != model_columns or table_signature_mismatches(
+            conn, inspect(conn), model_table, include_indexes=False
+        ):
+            malformed.append(name)
+
+    if malformed:
+        if any(_table_exists(conn, name) and _table_has_rows(conn, name) for name in tables):
+            raise DataRecoveryRequiredError(
+                "Cannot safely repair populated partial allocation-batch tables; "
+                "missing or weakened historic constraints were not inferred."
+            )
+        _drop_allocation_batch_triggers(conn)
+        for name in reversed(tables):
+            if name in malformed and _table_exists(conn, name):
+                conn.execute(text(f'DROP TABLE "{name}"'))
+        for name in tables:
+            if name in malformed:
+                metadata[name].create(conn, checkfirst=True)
+        changed = True
+
+    for signature in _ALLOCATION_BATCH_INDEXES:
+        table = {
+            "uq_allocation_batch_idempotency": "allocation_batches",
+            "uq_allocation_batch_transaction_version": "allocation_batches",
+            "uq_allocation_batch_line_order": "allocation_batch_lines",
+            "uq_allocation_batch_line_identity": "allocation_batch_lines",
+            "uq_allocation_batch_component_tax_code": "allocation_batch_tax_components",
+        }[signature.name]
+        try:
+            changed = _repair_named_index(
+                conn, table=table, signature=signature
+            ) or changed
+        except Exception as exc:
+            raise DataRecoveryRequiredError(
+                f"Cannot safely repair allocation-batch index {signature.name}; "
+                "records were left untouched."
+            ) from exc
+    return changed
+
+
+def _ensure_allocation_history_guards(conn) -> bool:
+    """Install canonical append-only, domain, finalization, and cash-row guards."""
+    tables = (
+        "allocation_history_events",
+        "allocation_history_snapshots",
+        "allocation_history_tax_components",
+        "allocation_history_finalizations",
+        "allocation_history_baseline_bindings",
+        "allocation_history_baseline_tax_bindings",
+        "allocation_history_baseline_finalizations",
+        "bas_period_lodgment_markers",
+        "allocation_period_correction_approvals",
+    )
+    changed = False
+    for table in tables:
+        if not _table_exists(conn, table):
+            continue
+        for operation in ("UPDATE", "DELETE"):
+            name = f"trg_{table}_no_{operation.lower()}"
+            sql = (
+                f'CREATE TRIGGER "{name}" BEFORE {operation} ON "{table}" '
+                "BEGIN SELECT RAISE(ABORT, 'Allocation history is append-only'); END"
+            )
+            changed = _ensure_trigger(conn, name, sql) or changed
+
+    replace_conditions = {
+        "allocation_history_events": (
+            "EXISTS (SELECT 1 FROM allocation_history_events WHERE id=NEW.id)",
+            "(NEW.idempotency_key IS NOT NULL AND EXISTS (SELECT 1 FROM allocation_history_events "
+            "WHERE idempotency_key=NEW.idempotency_key))",
+            "(NEW.version IS NOT NULL AND EXISTS (SELECT 1 FROM allocation_history_events "
+            "WHERE allocation_id=NEW.allocation_id AND version=NEW.version))",
+            "(NEW.operation='legacy_history_unknown' AND EXISTS (SELECT 1 FROM allocation_history_events "
+            "WHERE bank_transaction_id=NEW.bank_transaction_id AND operation='legacy_history_unknown'))",
+            "(NEW.linked_event_id IS NOT NULL AND NEW.operation='allocation_reversal' AND EXISTS "
+            "(SELECT 1 FROM allocation_history_events WHERE linked_event_id=NEW.linked_event_id "
+            "AND operation='allocation_reversal'))",
+            "(NEW.linked_allocation_id IS NOT NULL AND NEW.operation='allocation_reversal' AND EXISTS "
+            "(SELECT 1 FROM allocation_history_events WHERE linked_allocation_id=NEW.linked_allocation_id "
+            "AND operation='allocation_reversal'))",
+            "(NEW.snapshot_id IS NOT NULL AND EXISTS (SELECT 1 FROM allocation_history_events "
+            "WHERE snapshot_id=NEW.snapshot_id))",
+        ),
+        "allocation_history_snapshots": (
+            "EXISTS (SELECT 1 FROM allocation_history_snapshots WHERE id=NEW.id)",
+        ),
+        "allocation_history_tax_components": (
+            "EXISTS (SELECT 1 FROM allocation_history_tax_components WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_history_tax_components "
+            "WHERE snapshot_id=NEW.snapshot_id AND tax_code=NEW.tax_code)",
+        ),
+        "allocation_history_finalizations": (
+            "EXISTS (SELECT 1 FROM allocation_history_finalizations WHERE snapshot_id=NEW.snapshot_id)",
+        ),
+        "bas_period_lodgment_markers": (
+            "EXISTS (SELECT 1 FROM bas_period_lodgment_markers WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM bas_period_lodgment_markers WHERE period_id=NEW.period_id)",
+        ),
+        "allocation_period_correction_approvals": (
+            "EXISTS (SELECT 1 FROM allocation_period_correction_approvals WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_period_correction_approvals "
+            "WHERE period_marker_id=NEW.period_marker_id "
+            "AND approved_idempotency_key=NEW.approved_idempotency_key)",
+        ),
+        "allocation_history_baseline_bindings": (
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_bindings WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_bindings "
+            "WHERE baseline_event_id=NEW.baseline_event_id "
+            "AND allocation_row_id=NEW.allocation_row_id)",
+        ),
+        "allocation_history_baseline_tax_bindings": (
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings "
+            "WHERE source_component_row_id=NEW.source_component_row_id)",
+        ),
+        "allocation_history_baseline_finalizations": (
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations "
+            "WHERE baseline_event_id=NEW.baseline_event_id)",
+            "EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations "
+            "WHERE bank_transaction_id=NEW.bank_transaction_id)",
+        ),
+    }
+    for table, conditions in replace_conditions.items():
+        if not _table_exists(conn, table):
+            continue
+        name = f"trg_{table}_no_replace_insert"
+        sql = (
+            f'CREATE TRIGGER "{name}" BEFORE INSERT ON "{table}" '
+            f'WHEN {" OR ".join(conditions)} '
+            "BEGIN SELECT RAISE(ABORT, 'Allocation history is append-only'); END"
+        )
+        changed = _ensure_trigger(conn, name, sql) or changed
+
+    nonblank = lambda value: (
+        f"length(trim(COALESCE({value}, ''), char(9)||char(10)||char(13)||' '))=0"
+    )
+    snapshot_date = _sqlite_invalid_iso_date("NEW.created_at")
+    snapshot_sql = f'''CREATE TRIGGER "trg_allocation_history_snapshots_domain"
+        BEFORE INSERT ON "allocation_history_snapshots"
+        WHEN typeof(NEW.gross_cents)!='integer' OR NEW.gross_cents<=0
+          OR typeof(NEW.gst_cents)!='integer' OR NEW.gst_cents<0 OR NEW.gst_cents>NEW.gross_cents
+          OR NEW.source_kind NOT IN ('invoice','bill')
+          OR {nonblank('NEW.created_at')}
+                    OR julianday(NEW.created_at) IS NULL
+          OR NOT EXISTS (SELECT 1 FROM invoices i WHERE i.id=NEW.invoice_id
+             AND ((NEW.source_kind='invoice' AND i.direction='AR')
+               OR (NEW.source_kind='bill' AND i.direction='AP')))
+        BEGIN SELECT RAISE(ABORT, 'Invalid allocation snapshot'); END'''
+    changed = _ensure_trigger(
+        conn, "trg_allocation_history_snapshots_domain", snapshot_sql
+    ) or changed
+
+    component_sql = f'''CREATE TRIGGER "trg_allocation_history_tax_components_domain"
+        BEFORE INSERT ON "allocation_history_tax_components"
+        WHEN typeof(NEW.gross_cents)!='integer' OR NEW.gross_cents<=0
+          OR typeof(NEW.gst_cents)!='integer' OR NEW.gst_cents<0 OR NEW.gst_cents>NEW.gross_cents
+          OR NEW.tax_code NOT IN ('standard','gst_free','input_taxed','capital','none')
+          OR {nonblank('NEW.tax_code')}
+                    OR NOT EXISTS (SELECT 1 FROM allocation_history_snapshots s WHERE s.id=NEW.snapshot_id)
+          OR EXISTS (SELECT 1 FROM allocation_history_finalizations f WHERE f.snapshot_id=NEW.snapshot_id)
+        BEGIN SELECT RAISE(ABORT, 'Invalid or finalized allocation tax component'); END'''
+    changed = _ensure_trigger(
+        conn, "trg_allocation_history_tax_components_domain", component_sql
+    ) or changed
+
+    finalization_sql = f'''CREATE TRIGGER "trg_allocation_history_finalizations_domain"
+        BEFORE INSERT ON "allocation_history_finalizations"
+        WHEN typeof(NEW.component_count)!='integer' OR NEW.component_count<1
+          OR typeof(NEW.gross_cents)!='integer' OR typeof(NEW.gst_cents)!='integer'
+          OR {nonblank('NEW.finalized_at')}
+                    OR julianday(NEW.finalized_at) IS NULL
+          OR NOT EXISTS (SELECT 1 FROM allocation_history_snapshots s
+             WHERE s.id=NEW.snapshot_id AND s.gross_cents=NEW.gross_cents
+               AND s.gst_cents=NEW.gst_cents)
+          OR NEW.component_count != (SELECT COUNT(*) FROM allocation_history_tax_components c
+             WHERE c.snapshot_id=NEW.snapshot_id)
+          OR NEW.gross_cents != COALESCE((SELECT SUM(gross_cents)
+             FROM allocation_history_tax_components c WHERE c.snapshot_id=NEW.snapshot_id),-1)
+          OR NEW.gst_cents != COALESCE((SELECT SUM(gst_cents)
+             FROM allocation_history_tax_components c WHERE c.snapshot_id=NEW.snapshot_id),-1)
+        BEGIN SELECT RAISE(ABORT, 'Allocation snapshot does not reconcile'); END'''
+    changed = _ensure_trigger(
+        conn, "trg_allocation_history_finalizations_domain", finalization_sql
+    ) or changed
+
+    if all(_table_exists(conn, table) for table in (
+        "allocation_history_events",
+        "allocation_history_baseline_bindings",
+        "allocation_history_baseline_tax_bindings",
+        "allocation_history_baseline_finalizations",
+        "invoice_payment_allocations",
+        "invoice_payment_tax_components",
+        "invoices",
+        "bank_transactions",
+    )):
+        baseline_binding_sql = f'''CREATE TRIGGER "trg_allocation_history_baseline_bindings_domain"
+                BEFORE INSERT ON "allocation_history_baseline_bindings"
+                WHEN typeof(NEW.allocation_row_id)!='integer' OR NEW.allocation_row_id<=0
+                    OR (NEW.source_kind IS NOT NULL AND NEW.source_kind NOT IN ('invoice','bill'))
+                    OR (NEW.invoice_or_bill_id IS NOT NULL AND typeof(NEW.invoice_or_bill_id)!='integer')
+                    OR (NEW.allocated_gross_cents IS NOT NULL
+                            AND typeof(NEW.allocated_gross_cents)!='integer')
+                    OR (NEW.allocated_gst_cents IS NOT NULL
+                            AND typeof(NEW.allocated_gst_cents)!='integer')
+                    OR (NEW.allocated_gross_source IS NOT NULL
+                            AND typeof(NEW.allocated_gross_source)!='text')
+                    OR (NEW.allocated_gst_source IS NOT NULL
+                            AND typeof(NEW.allocated_gst_source)!='text')
+                    OR NOT EXISTS (SELECT 1 FROM allocation_history_events e
+                            WHERE e.id=NEW.baseline_event_id
+                                AND e.operation='legacy_history_unknown'
+                                AND e.bank_transaction_id=NEW.bank_transaction_id)
+                    OR EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations f
+                            WHERE f.baseline_event_id=NEW.baseline_event_id)
+                BEGIN SELECT RAISE(ABORT, 'Invalid or finalized legacy allocation binding'); END'''
+        changed = _ensure_trigger(
+                conn, "trg_allocation_history_baseline_bindings_domain", baseline_binding_sql
+        ) or changed
+
+        baseline_tax_binding_sql = f'''CREATE TRIGGER "trg_allocation_history_baseline_tax_bindings_domain"
+                BEFORE INSERT ON "allocation_history_baseline_tax_bindings"
+                WHEN typeof(NEW.source_component_row_id)!='integer'
+                    OR NEW.source_component_row_id<=0
+                    OR (NEW.component_gross_cents IS NOT NULL
+                            AND typeof(NEW.component_gross_cents)!='integer')
+                    OR (NEW.component_gst_cents IS NOT NULL
+                            AND typeof(NEW.component_gst_cents)!='integer')
+                    OR (NEW.tax_code IS NOT NULL AND typeof(NEW.tax_code)!='text')
+                    OR NOT EXISTS (SELECT 1 FROM allocation_history_baseline_bindings b
+                            WHERE b.id=NEW.allocation_binding_id)
+                    OR EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations f
+                            JOIN allocation_history_baseline_bindings b
+                                ON b.baseline_event_id=f.baseline_event_id
+                            WHERE b.id=NEW.allocation_binding_id)
+                BEGIN SELECT RAISE(ABORT, 'Invalid or finalized legacy tax binding'); END'''
+        changed = _ensure_trigger(
+                conn,
+                "trg_allocation_history_baseline_tax_bindings_domain",
+                baseline_tax_binding_sql,
+        ) or changed
+
+        allocation_identity_mismatch = """EXISTS (
+                SELECT 1 FROM invoice_payment_allocations a
+                LEFT JOIN allocation_history_baseline_bindings b
+                    ON b.baseline_event_id=NEW.baseline_event_id
+                 AND b.allocation_row_id=a.id
+                LEFT JOIN invoices i ON i.id=a.invoice_id
+                WHERE a.bank_transaction_id=NEW.bank_transaction_id
+                    AND (b.id IS NULL OR b.bank_transaction_id IS NOT a.bank_transaction_id
+                        OR b.invoice_or_bill_id IS NOT a.invoice_id
+                        OR b.source_kind IS NOT CASE i.direction
+                                 WHEN 'AR' THEN 'invoice' WHEN 'AP' THEN 'bill' ELSE NULL END
+                        OR b.allocated_gross_source IS NOT CAST(a.amount AS TEXT)
+                        OR b.allocated_gst_source IS NOT CAST(a.gst_amount AS TEXT)
+                        OR b.allocated_gross_cents IS NOT allocation_baseline_cents(a.amount)
+                        OR b.allocated_gst_cents IS NOT allocation_baseline_cents(a.gst_amount)
+                        OR b.allocation_created_at IS NOT CAST(a.created_at AS TEXT))
+        ) OR EXISTS (
+                SELECT 1 FROM allocation_history_baseline_bindings b
+                LEFT JOIN invoice_payment_allocations a ON a.id=b.allocation_row_id
+                WHERE b.baseline_event_id=NEW.baseline_event_id
+                    AND (a.id IS NULL OR a.bank_transaction_id IS NOT b.bank_transaction_id
+                        OR a.bank_transaction_id IS NOT NEW.bank_transaction_id)
+        )"""
+        component_identity_mismatch = """EXISTS (
+                SELECT 1 FROM invoice_payment_tax_components c
+                JOIN invoice_payment_allocations a ON a.id=c.allocation_id
+                LEFT JOIN allocation_history_baseline_bindings ab
+                    ON ab.baseline_event_id=NEW.baseline_event_id AND ab.allocation_row_id=a.id
+                LEFT JOIN allocation_history_baseline_tax_bindings tb
+                    ON tb.allocation_binding_id=ab.id AND tb.source_component_row_id=c.id
+                WHERE a.bank_transaction_id=NEW.bank_transaction_id
+                    AND (tb.id IS NULL OR c.allocation_id IS NOT ab.allocation_row_id
+                        OR c.tax_code IS NOT tb.tax_code
+                        OR tb.component_gross_source IS NOT CAST(c.gross_amount AS TEXT)
+                        OR tb.component_gst_source IS NOT CAST(c.gst_amount AS TEXT)
+                        OR tb.component_gross_cents IS NOT allocation_baseline_cents(c.gross_amount)
+                        OR tb.component_gst_cents IS NOT allocation_baseline_cents(c.gst_amount))
+        ) OR EXISTS (
+                SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                JOIN allocation_history_baseline_bindings ab
+                    ON ab.id=tb.allocation_binding_id
+                LEFT JOIN invoice_payment_tax_components c
+                    ON c.id=tb.source_component_row_id
+                WHERE ab.baseline_event_id=NEW.baseline_event_id
+                    AND (c.id IS NULL OR c.allocation_id IS NOT ab.allocation_row_id)
+        )"""
+        baseline_hash_sql = """(
+                SELECT allocation_baseline_sha256(row_json) FROM (
+                    SELECT json_array('meta', NEW.baseline_event_id,
+                            NEW.bank_transaction_id, NEW.observed_payment_date, NEW.observed_at,
+                            NEW.observed_allocation_count, NEW.observed_component_count,
+                            NEW.gross_allocation_total_cents, NEW.gst_total_cents,
+                            NEW.status, NEW.incomplete_reason_codes) AS row_json
+                    UNION ALL
+                    SELECT json_array('allocation', b.id, b.baseline_event_id,
+                            b.bank_transaction_id, b.allocation_row_id, b.source_kind,
+                            b.invoice_or_bill_id, b.allocated_gross_cents,
+                            b.allocated_gross_source, b.allocated_gst_cents,
+                            b.allocated_gst_source, b.allocation_created_at)
+                    FROM allocation_history_baseline_bindings b
+                    WHERE b.baseline_event_id=NEW.baseline_event_id
+                    UNION ALL
+                    SELECT json_array('component', tb.id, tb.allocation_binding_id,
+                            tb.source_component_row_id, tb.tax_code, tb.component_gross_cents,
+                            tb.component_gross_source, tb.component_gst_cents,
+                            tb.component_gst_source)
+                    FROM allocation_history_baseline_tax_bindings tb
+                    JOIN allocation_history_baseline_bindings b
+                        ON b.id=tb.allocation_binding_id
+                    WHERE b.baseline_event_id=NEW.baseline_event_id
+                )
+        )"""
+
+        reasons_sql = f"""(
+            SELECT json_group_array(code) FROM (
+                SELECT code FROM (
+                    SELECT 1 AS ordering, 'missing_tax_components' AS code
+                    WHERE EXISTS (SELECT 1 FROM allocation_history_baseline_bindings b
+                        WHERE b.baseline_event_id=NEW.baseline_event_id
+                            AND NOT EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id))
+                    UNION ALL
+                    SELECT 2, 'invalid_amount' WHERE EXISTS (
+                        SELECT 1 FROM allocation_history_baseline_bindings b
+                        JOIN invoice_payment_allocations a ON a.id=b.allocation_row_id
+                        WHERE b.baseline_event_id=NEW.baseline_event_id AND (
+                            a.amount<=0 OR allocation_baseline_cents(a.amount) IS NULL
+                            OR a.gst_amount<0 OR a.gst_amount>a.amount
+                            OR allocation_baseline_cents(a.gst_amount) IS NULL
+                            OR b.allocated_gross_cents IS NULL OR b.allocated_gst_cents IS NULL
+                            OR EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id AND (
+                                    tb.component_gross_cents IS NULL OR tb.component_gst_cents IS NULL
+                                    OR tb.component_gross_cents<=0 OR tb.component_gst_cents<0
+                                    OR tb.component_gst_cents>tb.component_gross_cents
+                                    OR tb.component_gross_source IS NULL OR tb.component_gst_source IS NULL))
+                        ))
+                    UNION ALL
+                    SELECT 3, 'unreconciled_totals' WHERE EXISTS (
+                        SELECT 1 FROM allocation_history_baseline_bindings b
+                        WHERE b.baseline_event_id=NEW.baseline_event_id AND (
+                            EXISTS (SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id) AND (
+                            b.allocated_gross_cents IS NOT COALESCE((SELECT SUM(tb.component_gross_cents)
+                                FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id),0)
+                            OR b.allocated_gst_cents IS NOT COALESCE((SELECT SUM(tb.component_gst_cents)
+                                FROM allocation_history_baseline_tax_bindings tb
+                                WHERE tb.allocation_binding_id=b.id),0))))
+                    UNION ALL
+                    SELECT 4, 'unsupported_tax_evidence' WHERE EXISTS (
+                        SELECT 1 FROM allocation_history_baseline_tax_bindings tb
+                        JOIN allocation_history_baseline_bindings b
+                            ON b.id=tb.allocation_binding_id
+                        WHERE b.baseline_event_id=NEW.baseline_event_id
+                            AND (tb.tax_code IS NULL OR tb.tax_code NOT IN
+                                ('standard','gst_free','input_taxed','capital','none')))
+                    UNION ALL
+                    SELECT 5, 'insufficient_source_data' WHERE EXISTS (
+                        SELECT 1 FROM allocation_history_baseline_bindings b
+                        LEFT JOIN invoices i ON i.id=b.invoice_or_bill_id
+                        JOIN bank_transactions t ON t.id=b.bank_transaction_id
+                        WHERE b.baseline_event_id=NEW.baseline_event_id AND (
+                            b.invoice_or_bill_id IS NULL OR b.source_kind IS NULL OR i.id IS NULL
+                            OR (b.source_kind='invoice' AND (i.direction!='AR' OR t.direction!='in'))
+                            OR (b.source_kind='bill' AND (i.direction!='AP' OR t.direction!='out'))))
+                                        UNION ALL
+                                        SELECT 6, 'insufficient_source_data'
+                                                WHERE NEW.observed_payment_date IS NULL
+                                                    OR {_sqlite_invalid_iso_date('NEW.observed_payment_date')}
+                ) ORDER BY ordering
+            )
+        )"""
+        baseline_finalization_sql = f'''CREATE TRIGGER "trg_allocation_history_baseline_finalizations_domain"
+                BEFORE INSERT ON "allocation_history_baseline_finalizations"
+                WHEN typeof(NEW.observed_allocation_count)!='integer'
+                    OR NEW.observed_allocation_count<0
+                    OR typeof(NEW.observed_component_count)!='integer'
+                    OR NEW.observed_component_count<0
+                    OR typeof(NEW.gross_allocation_total_cents)!='integer'
+                    OR typeof(NEW.gst_total_cents)!='integer'
+                    OR {nonblank('NEW.observed_at')} OR julianday(NEW.observed_at) IS NULL
+                    OR length(NEW.integrity_hash)!=64
+                    OR lower(NEW.integrity_hash) GLOB '*[^0-9a-f]*'
+                    OR NEW.status NOT IN ('complete','incomplete')
+                    OR json_valid(NEW.incomplete_reason_codes)!=1
+                    OR json_type(NEW.incomplete_reason_codes)!='array'
+                    OR NOT EXISTS (SELECT 1 FROM allocation_history_events e
+                            WHERE e.id=NEW.baseline_event_id
+                                AND e.operation='legacy_history_unknown'
+                                AND e.bank_transaction_id=NEW.bank_transaction_id)
+                    OR NOT EXISTS (SELECT 1 FROM bank_transactions t
+                            WHERE t.id=NEW.bank_transaction_id
+                                AND t.occurred_at IS NEW.observed_payment_date)
+                    OR NEW.observed_allocation_count != (SELECT COUNT(*)
+                            FROM allocation_history_baseline_bindings b
+                            WHERE b.baseline_event_id=NEW.baseline_event_id)
+                    OR NEW.observed_component_count != (SELECT COUNT(*)
+                            FROM allocation_history_baseline_tax_bindings tb
+                            JOIN allocation_history_baseline_bindings b
+                                ON b.id=tb.allocation_binding_id
+                            WHERE b.baseline_event_id=NEW.baseline_event_id)
+                    OR NEW.gross_allocation_total_cents != COALESCE((SELECT SUM(b.allocated_gross_cents)
+                            FROM allocation_history_baseline_bindings b
+                            WHERE b.baseline_event_id=NEW.baseline_event_id),0)
+                    OR NEW.gst_total_cents != COALESCE((SELECT SUM(tb.component_gst_cents)
+                            FROM allocation_history_baseline_tax_bindings tb
+                            JOIN allocation_history_baseline_bindings b
+                                ON b.id=tb.allocation_binding_id
+                            WHERE b.baseline_event_id=NEW.baseline_event_id),0)
+                    OR (SELECT COUNT(*) FROM invoice_payment_allocations a
+                            WHERE a.bank_transaction_id=NEW.bank_transaction_id)
+                         != (SELECT COUNT(*) FROM allocation_history_baseline_bindings b
+                            WHERE b.baseline_event_id=NEW.baseline_event_id)
+                    OR {allocation_identity_mismatch}
+                    OR (SELECT COUNT(*) FROM invoice_payment_tax_components c
+                            JOIN invoice_payment_allocations a ON a.id=c.allocation_id
+                            WHERE a.bank_transaction_id=NEW.bank_transaction_id)
+                         != (SELECT COUNT(*) FROM allocation_history_baseline_tax_bindings tb
+                            JOIN allocation_history_baseline_bindings b
+                                ON b.id=tb.allocation_binding_id
+                            WHERE b.baseline_event_id=NEW.baseline_event_id)
+                    OR {component_identity_mismatch}
+                    OR NEW.integrity_hash != {baseline_hash_sql}
+                    OR NEW.incomplete_reason_codes != {reasons_sql}
+                    OR (NEW.status='complete' AND {reasons_sql}!='[]')
+                    OR (NEW.status='incomplete' AND {reasons_sql}='[]')
+                BEGIN SELECT RAISE(ABORT, 'Legacy allocation baseline does not match observed rows'); END'''
+        changed = _ensure_trigger(
+                conn,
+                "trg_allocation_history_baseline_finalizations_domain",
+                baseline_finalization_sql,
+        ) or changed
+
+        finalized_allocation = """EXISTS (
+                SELECT 1 FROM allocation_history_baseline_finalizations f
+                JOIN allocation_history_baseline_bindings b
+                    ON b.baseline_event_id=f.baseline_event_id
+                WHERE f.bank_transaction_id={transaction}
+                    OR b.allocation_row_id={allocation_id})"""
+        allocation_guards = (
+                ("insert", "INSERT", "NEW", f"{finalized_allocation.format(transaction='NEW.bank_transaction_id', allocation_id='NEW.id')}"),
+                ("update", "UPDATE", "OLD", f"{finalized_allocation.format(transaction='OLD.bank_transaction_id', allocation_id='OLD.id')} OR {finalized_allocation.format(transaction='NEW.bank_transaction_id', allocation_id='NEW.id')}"),
+                ("delete", "DELETE", "OLD", finalized_allocation.format(transaction="OLD.bank_transaction_id", allocation_id="OLD.id")),
+        )
+        for suffix, operation, _row, condition in allocation_guards:
+                trigger_name = f"trg_invoice_payment_allocations_baseline_no_{suffix}"
+                sql = (
+                    f'CREATE TRIGGER "{trigger_name}" BEFORE {operation} '
+                        f'ON "invoice_payment_allocations" WHEN {condition} '
+                        "BEGIN SELECT RAISE(ABORT, 'Finalized legacy allocation baseline is immutable'); END"
+                )
+                changed = _ensure_trigger(conn, trigger_name, sql) or changed
+        allocation_replace_sql = f'''CREATE TRIGGER "trg_invoice_payment_allocations_baseline_no_replace"
+                BEFORE INSERT ON "invoice_payment_allocations"
+                WHEN {finalized_allocation.format(transaction='NEW.bank_transaction_id', allocation_id='NEW.id')}
+                BEGIN SELECT RAISE(ABORT, 'Finalized legacy allocation baseline is immutable'); END'''
+        changed = _ensure_trigger(
+                conn, "trg_invoice_payment_allocations_baseline_no_replace", allocation_replace_sql
+        ) or changed
+
+        finalized_component = """EXISTS (
+                SELECT 1 FROM allocation_history_baseline_finalizations f
+                JOIN allocation_history_baseline_bindings b
+                    ON b.baseline_event_id=f.baseline_event_id
+                JOIN allocation_history_baseline_tax_bindings tb
+                    ON tb.allocation_binding_id=b.id
+                WHERE b.allocation_row_id={allocation_id}
+                    OR tb.source_component_row_id={component_id})"""
+        component_guards = (
+                ("insert", "INSERT", finalized_component.format(
+                        allocation_id="NEW.allocation_id", component_id="NEW.id")),
+                ("update", "UPDATE", f"{finalized_component.format(allocation_id='OLD.allocation_id', component_id='OLD.id')} OR {finalized_component.format(allocation_id='NEW.allocation_id', component_id='NEW.id')}"),
+                ("delete", "DELETE", finalized_component.format(
+                        allocation_id="OLD.allocation_id", component_id="OLD.id")),
+        )
+        for suffix, operation, condition in component_guards:
+                trigger_name = f"trg_invoice_payment_tax_components_baseline_no_{suffix}"
+                sql = (
+                    f'CREATE TRIGGER "{trigger_name}" BEFORE {operation} '
+                        f'ON "invoice_payment_tax_components" WHEN {condition} '
+                        "BEGIN SELECT RAISE(ABORT, 'Finalized legacy allocation baseline is immutable'); END"
+                )
+                changed = _ensure_trigger(conn, trigger_name, sql) or changed
+        component_replace_sql = f'''CREATE TRIGGER "trg_invoice_payment_tax_components_baseline_no_replace"
+                BEFORE INSERT ON "invoice_payment_tax_components"
+                WHEN {finalized_component.format(allocation_id='NEW.allocation_id', component_id='NEW.id')}
+                BEGIN SELECT RAISE(ABORT, 'Finalized legacy allocation baseline is immutable'); END'''
+        changed = _ensure_trigger(
+                conn,
+                "trg_invoice_payment_tax_components_baseline_no_replace",
+                component_replace_sql,
+        ) or changed
+
+    period_start_invalid = _sqlite_invalid_iso_date("NEW.period_start")
+    period_end_invalid = _sqlite_invalid_iso_date("NEW.period_end")
+    marker_sql = f'''CREATE TRIGGER "trg_bas_period_lodgment_markers_domain"
+        BEFORE INSERT ON "bas_period_lodgment_markers"
+        WHEN {nonblank('NEW.period_id')} OR {nonblank('NEW.actor_placeholder')}
+          OR {nonblank('NEW.evidence_reference')}
+          OR {nonblank('NEW.internally_asserted_at')}
+                    OR julianday(NEW.internally_asserted_at) IS NULL
+          OR {period_start_invalid} OR {period_end_invalid}
+          OR julianday(NEW.period_end)<julianday(NEW.period_start)
+          OR NEW.lodged_status != 1
+          OR NEW.evidence_scope != 'internal_assertion_not_ato_lodgment_evidence'
+        BEGIN SELECT RAISE(ABORT, 'Invalid internal BAS period marker'); END'''
+    changed = _ensure_trigger(
+        conn, "trg_bas_period_lodgment_markers_domain", marker_sql
+    ) or changed
+
+    approval_sql = f'''CREATE TRIGGER "trg_allocation_period_correction_approvals_domain"
+        BEFORE INSERT ON "allocation_period_correction_approvals"
+        WHEN {nonblank('NEW.approved_idempotency_key')}
+          OR {nonblank('NEW.actor_placeholder')} OR {nonblank('NEW.reason')}
+          OR {nonblank('NEW.evidence_reference')} OR {nonblank('NEW.recorded_at')}
+                    OR julianday(NEW.recorded_at) IS NULL
+          OR NOT EXISTS (SELECT 1 FROM bas_period_lodgment_markers m
+             WHERE m.id=NEW.period_marker_id)
+          OR NOT EXISTS (SELECT 1 FROM invoice_payment_allocations a
+             WHERE a.id=NEW.allocation_id)
+        BEGIN SELECT RAISE(ABORT, 'Invalid allocation correction approval'); END'''
+    changed = _ensure_trigger(
+        conn, "trg_allocation_period_correction_approvals_domain", approval_sql
+    ) or changed
+
+    # A new event supersedes one exact version. Version zero is the explicit
+    # existing allocation row; subsequent versions point to the preceding event.
+    latest_version = (
+        "COALESCE((SELECT MAX(e.version) FROM allocation_history_events e "
+        "WHERE e.allocation_id=NEW.allocation_id AND e.version IS NOT NULL),0)"
+    )
+    other_cash_total = (
+        "(SELECT COALESCE(SUM(CASE WHEN latest.operation='allocation_reversal' THEN 0 "
+        "WHEN latest.id IS NULL THEN CAST(ROUND(a.amount*100) AS INTEGER) "
+        "ELSE s.gross_cents END),0) FROM invoice_payment_allocations a "
+        "LEFT JOIN allocation_history_events latest ON latest.id=(SELECT e.id "
+        "FROM allocation_history_events e WHERE e.allocation_id=a.id "
+        "AND e.version IS NOT NULL ORDER BY e.version DESC LIMIT 1) "
+        "LEFT JOIN allocation_history_snapshots s ON s.id=latest.snapshot_id "
+        "WHERE a.bank_transaction_id=NEW.bank_transaction_id AND a.id!=NEW.allocation_id)"
+    )
+    event_sql = f'''CREATE TRIGGER "trg_allocation_history_events_domain"
+        BEFORE INSERT ON "allocation_history_events"
+                WHEN NOT EXISTS (SELECT 1 FROM bank_transactions t WHERE t.id=NEW.bank_transaction_id)
+                    OR (NEW.operation='legacy_history_unknown' AND (
+             NEW.allocation_id IS NOT NULL OR NEW.snapshot_id IS NOT NULL
+             OR NEW.version IS NOT NULL OR NEW.effective_date IS NOT NULL
+             OR NEW.recorded_at IS NOT NULL OR NEW.idempotency_key IS NOT NULL
+             OR NEW.expected_prior_version IS NOT NULL OR NEW.actor_placeholder IS NOT NULL
+             OR NEW.reason IS NOT NULL OR NEW.evidence_reference IS NOT NULL
+             OR NEW.evidence_sha256 IS NOT NULL OR NEW.linked_event_id IS NOT NULL
+             OR NEW.linked_allocation_id IS NOT NULL OR NEW.approval_id IS NOT NULL))
+          OR (NEW.operation IN ('allocation_correction','allocation_reversal') AND (
+             NEW.allocation_id IS NULL OR NEW.snapshot_id IS NULL
+             OR typeof(NEW.version)!='integer' OR NEW.version<1
+             OR typeof(NEW.expected_prior_version)!='integer' OR NEW.expected_prior_version<0
+             OR NEW.version!=NEW.expected_prior_version+1
+             OR {nonblank('NEW.effective_date')} OR {_sqlite_invalid_iso_date('NEW.effective_date')}
+             OR {nonblank('NEW.recorded_at')} OR julianday(NEW.recorded_at) IS NULL
+             OR {nonblank('NEW.idempotency_key')}
+             OR {nonblank('NEW.actor_placeholder')} OR {nonblank('NEW.reason')}
+             OR {nonblank('NEW.evidence_reference')}
+             OR (NEW.evidence_sha256 IS NOT NULL AND (
+                 length(NEW.evidence_sha256)!=64 OR NEW.evidence_sha256 GLOB '*[^0-9a-fA-F]*'))
+             OR ((NEW.linked_event_id IS NOT NULL) = (NEW.linked_allocation_id IS NOT NULL))
+             OR NOT EXISTS (SELECT 1 FROM invoice_payment_allocations a
+                 WHERE a.id=NEW.allocation_id AND a.bank_transaction_id=NEW.bank_transaction_id)
+             OR NOT EXISTS (SELECT 1 FROM allocation_history_finalizations f
+                 WHERE f.snapshot_id=NEW.snapshot_id)
+             OR NOT EXISTS (SELECT 1 FROM allocation_history_snapshots s
+                 JOIN invoices i ON i.id=s.invoice_id
+                 JOIN bank_transactions t ON t.id=NEW.bank_transaction_id
+                 WHERE s.id=NEW.snapshot_id AND s.source_kind=CASE i.direction
+                   WHEN 'AR' THEN 'invoice' WHEN 'AP' THEN 'bill' ELSE '' END
+                   AND ((i.direction='AR' AND t.direction='in')
+                     OR (i.direction='AP' AND t.direction='out')))
+             OR NEW.expected_prior_version!={latest_version}
+             OR (NEW.expected_prior_version=0 AND (
+                 NEW.linked_allocation_id IS NOT NEW.allocation_id OR NEW.linked_event_id IS NOT NULL))
+             OR (NEW.expected_prior_version>0 AND (
+                 NEW.linked_allocation_id IS NOT NULL OR NOT EXISTS (
+                   SELECT 1 FROM allocation_history_events prior
+                   WHERE prior.id=NEW.linked_event_id AND prior.allocation_id=NEW.allocation_id
+                     AND prior.version=NEW.expected_prior_version
+                     AND prior.version={latest_version}
+                     AND prior.operation!='allocation_reversal')))
+             OR (NEW.operation='allocation_reversal' AND (
+                 (NEW.linked_event_id IS NOT NULL AND NOT EXISTS (
+                   SELECT 1 FROM allocation_history_events prior
+                   JOIN allocation_history_snapshots ps ON ps.id=prior.snapshot_id
+                   JOIN allocation_history_snapshots ns ON ns.id=NEW.snapshot_id
+                   WHERE prior.id=NEW.linked_event_id
+                     AND julianday(NEW.effective_date)>julianday(prior.effective_date)
+                     AND ps.invoice_id=ns.invoice_id AND ps.gross_cents=ns.gross_cents
+                                         AND ps.gst_cents=ns.gst_cents))
+                 OR (NEW.linked_allocation_id IS NOT NULL AND NOT EXISTS (
+                   SELECT 1 FROM invoice_payment_allocations prior
+                   JOIN allocation_history_snapshots ns ON ns.id=NEW.snapshot_id
+                   JOIN invoices i ON i.id=prior.invoice_id
+                   JOIN bank_transactions t ON t.id=prior.bank_transaction_id
+                   WHERE prior.id=NEW.linked_allocation_id AND prior.id=NEW.allocation_id
+                     AND julianday(NEW.effective_date)>julianday(t.occurred_at)
+                     AND ns.invoice_id=prior.invoice_id
+                     AND ns.gross_cents=CAST(ROUND(prior.amount*100) AS INTEGER)
+                    AND ns.gst_cents=CAST(ROUND(prior.gst_amount*100) AS INTEGER)))))
+             OR (NEW.operation='allocation_correction' AND NEW.linked_event_id IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM allocation_history_events prior
+                   WHERE prior.id=NEW.linked_event_id AND prior.operation='allocation_reversal'))
+             OR (NEW.operation='allocation_correction' AND NEW.linked_allocation_id IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations a
+                   WHERE a.id=NEW.linked_allocation_id AND a.id=NEW.allocation_id))
+             OR (CAST(ROUND((SELECT amount FROM bank_transactions
+                   WHERE id=NEW.bank_transaction_id)*100) AS INTEGER)
+                   < {other_cash_total} + CASE WHEN NEW.operation='allocation_reversal' THEN 0
+                       ELSE (SELECT gross_cents FROM allocation_history_snapshots
+                             WHERE id=NEW.snapshot_id) END)
+             OR (EXISTS (SELECT 1 FROM bas_period_lodgment_markers m
+                   WHERE NEW.effective_date BETWEEN m.period_start AND m.period_end)
+                 AND NOT EXISTS (SELECT 1 FROM allocation_period_correction_approvals a
+                   JOIN bas_period_lodgment_markers m ON m.id=a.period_marker_id
+                   WHERE a.id=NEW.approval_id AND a.allocation_id=NEW.allocation_id
+                     AND a.approved_idempotency_key=NEW.idempotency_key
+                     AND NEW.effective_date BETWEEN m.period_start AND m.period_end))
+          ))
+        BEGIN SELECT RAISE(ABORT, 'Invalid allocation history event'); END'''
+    changed = _ensure_trigger(
+        conn, "trg_allocation_history_events_domain", event_sql
+    ) or changed
+
+    reversal_components_sql = '''CREATE TRIGGER "trg_allocation_history_reversal_components"
+                BEFORE INSERT ON "allocation_history_events"
+                WHEN NEW.operation='allocation_reversal' AND (
+                    (NEW.linked_event_id IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM allocation_history_events prior
+                        JOIN allocation_history_snapshots ps ON ps.id=prior.snapshot_id
+                        JOIN allocation_history_snapshots ns ON ns.id=NEW.snapshot_id
+                        WHERE prior.id=NEW.linked_event_id AND (
+                            EXISTS (SELECT tc.tax_code, tc.gross_cents, tc.gst_cents
+                                FROM allocation_history_tax_components tc WHERE tc.snapshot_id=ps.id
+                                EXCEPT
+                                SELECT nc.tax_code, nc.gross_cents, nc.gst_cents
+                                FROM allocation_history_tax_components nc WHERE nc.snapshot_id=ns.id)
+                            OR EXISTS (SELECT nc.tax_code, nc.gross_cents, nc.gst_cents
+                                FROM allocation_history_tax_components nc WHERE nc.snapshot_id=ns.id
+                                EXCEPT
+                                SELECT tc.tax_code, tc.gross_cents, tc.gst_cents
+                                FROM allocation_history_tax_components tc WHERE tc.snapshot_id=ps.id))))
+                    OR (NEW.linked_allocation_id IS NOT NULL
+                        AND EXISTS (SELECT 1 FROM invoice_payment_tax_components c
+                                                WHERE c.allocation_id=NEW.linked_allocation_id)
+                        AND (
+                            EXISTS (SELECT c.tax_code, CAST(ROUND(c.gross_amount*100) AS INTEGER),
+                                                         CAST(ROUND(c.gst_amount*100) AS INTEGER)
+                                FROM invoice_payment_tax_components c
+                                WHERE c.allocation_id=NEW.linked_allocation_id
+                                EXCEPT
+                                SELECT nc.tax_code, nc.gross_cents, nc.gst_cents
+                                FROM allocation_history_tax_components nc WHERE nc.snapshot_id=NEW.snapshot_id)
+                            OR EXISTS (SELECT nc.tax_code, nc.gross_cents, nc.gst_cents
+                                FROM allocation_history_tax_components nc WHERE nc.snapshot_id=NEW.snapshot_id
+                                EXCEPT
+                                SELECT c.tax_code, CAST(ROUND(c.gross_amount*100) AS INTEGER),
+                                                         CAST(ROUND(c.gst_amount*100) AS INTEGER)
+                                FROM invoice_payment_tax_components c
+                                WHERE c.allocation_id=NEW.linked_allocation_id))))
+                BEGIN SELECT RAISE(ABORT, 'Allocation reversal components do not match prior version'); END'''
+    changed = _ensure_trigger(
+        conn, "trg_allocation_history_reversal_components", reversal_components_sql
+    ) or changed
+
+    bank_delete_sql = '''CREATE TRIGGER "trg_bank_transactions_allocation_history_no_delete"
+        BEFORE DELETE ON "bank_transactions"
+        WHEN EXISTS (SELECT 1 FROM allocation_history_events e
+                     WHERE e.bank_transaction_id=OLD.id)
+        BEGIN SELECT RAISE(ABORT, 'Bank transaction has allocation history'); END'''
+    bank_update_sql = '''CREATE TRIGGER "trg_bank_transactions_allocation_history_identity"
+        BEFORE UPDATE ON "bank_transactions"
+        WHEN EXISTS (SELECT 1 FROM allocation_history_events e
+                     WHERE e.bank_transaction_id=OLD.id)
+          AND (NEW.id IS NOT OLD.id OR NEW.occurred_at IS NOT OLD.occurred_at)
+        BEGIN SELECT RAISE(ABORT, 'Bank transaction identity is protected by allocation history'); END'''
+    bank_replace_sql = '''CREATE TRIGGER "trg_bank_transactions_allocation_history_no_replace"
+        BEFORE INSERT ON "bank_transactions"
+        WHEN EXISTS (SELECT 1 FROM bank_transactions old
+          WHERE (old.id=NEW.id OR (NEW.dedup_key IS NOT NULL
+            AND old.bank_account_id=NEW.bank_account_id AND old.dedup_key=NEW.dedup_key))
+            AND EXISTS (SELECT 1 FROM allocation_history_events e
+                        WHERE e.bank_transaction_id=old.id))
+        BEGIN SELECT RAISE(ABORT, 'Bank transaction has allocation history'); END'''
+    if _table_exists(conn, "bank_transactions"):
+        changed = _ensure_trigger(
+            conn, "trg_bank_transactions_allocation_history_no_delete", bank_delete_sql
+        ) or changed
+        changed = _ensure_trigger(
+            conn, "trg_bank_transactions_allocation_history_identity", bank_update_sql
+        ) or changed
+        changed = _ensure_trigger(
+            conn, "trg_bank_transactions_allocation_history_no_replace", bank_replace_sql
+        ) or changed
+    return changed
+
+
+def _ensure_allocation_batch_guards(conn) -> bool:
+    """Install canonical transaction-wide allocation-batch database controls."""
+    tables = (
+        "allocation_batches",
+        "allocation_batch_lines",
+        "allocation_batch_tax_components",
+        "allocation_batch_finalizations",
+    )
+    changed = False
+
+    def ensure_if_ready(name: str, sql: str, dependencies: tuple[str, ...]) -> bool:
+        if all(_table_exists(conn, table) for table in dependencies):
+            return _ensure_trigger(conn, name, sql)
+        if conn.execute(text(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=:name"
+        ), {"name": name}).first() is not None:
+            conn.execute(text(f'DROP TRIGGER "{name}"'))
+            return True
+        return False
+
+    for table in tables:
+        if not _table_exists(conn, table):
+            continue
+        for operation in ("UPDATE", "DELETE"):
+            name = f"trg_{table}_no_{operation.lower()}"
+            sql = (
+                f'CREATE TRIGGER "{name}" BEFORE {operation} ON "{table}" '
+                "BEGIN SELECT RAISE(ABORT, 'Allocation batches are append-only'); END"
+            )
+            changed = _ensure_trigger(conn, name, sql) or changed
+
+    replace_conditions = {
+        "allocation_batches": (
+            "EXISTS (SELECT 1 FROM allocation_batches WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_batches WHERE idempotency_key=NEW.idempotency_key)",
+            "EXISTS (SELECT 1 FROM allocation_batches WHERE bank_transaction_id=NEW.bank_transaction_id "
+            "AND transaction_version=NEW.transaction_version)",
+        ),
+        "allocation_batch_lines": (
+            "EXISTS (SELECT 1 FROM allocation_batch_lines WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_batch_lines WHERE batch_id=NEW.batch_id "
+            "AND line_order=NEW.line_order)",
+            "EXISTS (SELECT 1 FROM allocation_batch_lines WHERE batch_id=NEW.batch_id "
+            "AND source_kind=NEW.source_kind AND invoice_or_bill_id=NEW.invoice_or_bill_id)",
+        ),
+        "allocation_batch_tax_components": (
+            "EXISTS (SELECT 1 FROM allocation_batch_tax_components WHERE id=NEW.id)",
+            "EXISTS (SELECT 1 FROM allocation_batch_tax_components "
+            "WHERE allocation_batch_line_id=NEW.allocation_batch_line_id AND tax_code=NEW.tax_code)",
+        ),
+        "allocation_batch_finalizations": (
+            "EXISTS (SELECT 1 FROM allocation_batch_finalizations WHERE batch_id=NEW.batch_id)",
+        ),
+    }
+    for table, conditions in replace_conditions.items():
+        if not _table_exists(conn, table):
+            continue
+        name = f"trg_{table}_no_replace_insert"
+        sql = (
+            f'CREATE TRIGGER "{name}" BEFORE INSERT ON "{table}" '
+            f'WHEN {" OR ".join(conditions)} '
+            "BEGIN SELECT RAISE(ABORT, 'Allocation batches are append-only'); END"
+        )
+        changed = _ensure_trigger(conn, name, sql) or changed
+
+    nonblank = lambda value: (
+        f"length(trim(COALESCE({value}, ''), char(9)||char(10)||char(13)||' '))=0"
+    )
+    batch_sql = f'''CREATE TRIGGER "trg_allocation_batches_domain"
+        BEFORE INSERT ON "allocation_batches"
+        WHEN NOT EXISTS (SELECT 1 FROM bank_transactions t WHERE t.id=NEW.bank_transaction_id)
+          OR NEW.operation NOT IN ('allocation_correction','allocation_reversal','allocation_reallocation')
+          OR typeof(NEW.transaction_version)!='integer' OR NEW.transaction_version<=0
+          OR typeof(NEW.expected_prior_version)!='integer' OR NEW.expected_prior_version<0
+          OR NEW.transaction_version!=NEW.expected_prior_version+1
+          OR NEW.transaction_version!=COALESCE((SELECT MAX(b.transaction_version)+1
+              FROM allocation_batches b WHERE b.bank_transaction_id=NEW.bank_transaction_id),1)
+          OR {nonblank('NEW.effective_date')} OR {_sqlite_invalid_iso_date('NEW.effective_date')}
+          OR {nonblank('NEW.recorded_at')} OR julianday(NEW.recorded_at) IS NULL
+          OR {nonblank('NEW.idempotency_key')}
+          OR length(NEW.canonical_payload_hash)!=64
+          OR lower(NEW.canonical_payload_hash) GLOB '*[^0-9a-f]*'
+          OR {nonblank('NEW.reason')} OR {nonblank('NEW.evidence_reference')}
+          OR {nonblank('NEW.actor_placeholder')}
+          OR (NEW.evidence_sha256 IS NOT NULL AND (
+              length(NEW.evidence_sha256)!=64 OR lower(NEW.evidence_sha256) GLOB '*[^0-9a-f]*'))
+          OR NEW.manual_review_status NOT IN ('not_required','required','approved','rejected')
+          OR typeof(NEW.residual_amount_cents)!='integer' OR NEW.residual_amount_cents<0
+          OR ((NEW.residual_amount_cents=0) != (NEW.residual_account_id IS NULL))
+                    OR (NEW.residual_amount_cents>0 AND NOT EXISTS (
+                            SELECT 1 FROM accounts a
+                            JOIN bank_transactions t ON t.id=NEW.bank_transaction_id
+                            WHERE a.id=NEW.residual_account_id AND a.active=1
+                                AND a.code NOT IN ('1100','1200','2000','2100')
+                                AND NOT EXISTS (SELECT 1 FROM bank_accounts ba
+                                        WHERE ba.ledger_account_id=a.id)
+                                AND ((t.direction='in' AND a.type='LIABILITY')
+                                    OR (t.direction='out' AND a.type='ASSET'))))
+          OR NOT EXISTS (SELECT 1 FROM allocation_history_baseline_finalizations f
+              WHERE f.baseline_event_id=NEW.baseline_finalization_id
+                AND f.bank_transaction_id=NEW.bank_transaction_id AND f.status='complete'
+                AND NEW.recorded_at>=f.observed_at
+                AND NEW.effective_date>=f.observed_payment_date)
+          OR (NEW.expected_prior_version=0 AND (
+              NEW.linked_prior_batch_id IS NOT NULL OR NOT EXISTS (
+                SELECT 1 FROM allocation_history_baseline_finalizations f
+                WHERE f.baseline_event_id=NEW.baseline_finalization_id
+                  AND f.gross_allocation_total_cents>=0)))
+          OR (NEW.expected_prior_version>0 AND NOT EXISTS (
+              SELECT 1 FROM allocation_batches prior
+              WHERE prior.id=NEW.linked_prior_batch_id
+                AND prior.bank_transaction_id=NEW.bank_transaction_id
+                AND prior.transaction_version=NEW.expected_prior_version
+                AND EXISTS (SELECT 1 FROM allocation_batch_finalizations pf
+                    WHERE pf.batch_id=prior.id)))
+          OR (NEW.operation='allocation_correction' AND (
+              NEW.effective_date IS NOT (SELECT t.occurred_at FROM bank_transactions t
+                  WHERE t.id=NEW.bank_transaction_id)
+              OR (NEW.expected_prior_version>0 AND NOT EXISTS (
+                  SELECT 1 FROM allocation_batches prior WHERE prior.id=NEW.linked_prior_batch_id
+                    AND prior.operation='allocation_correction'))
+              OR (EXISTS (SELECT 1 FROM bas_period_lodgment_markers m
+                    WHERE NEW.effective_date BETWEEN m.period_start AND m.period_end)
+                  AND NOT EXISTS (SELECT 1 FROM allocation_period_correction_approvals a
+                    JOIN bas_period_lodgment_markers m ON m.id=a.period_marker_id
+                    WHERE a.id=NEW.internal_correction_approval_id
+                      AND a.approved_idempotency_key=NEW.idempotency_key
+                                            AND NEW.effective_date BETWEEN m.period_start AND m.period_end
+                                            AND (EXISTS (SELECT 1 FROM allocation_history_baseline_bindings bb
+                                                    WHERE bb.baseline_event_id=NEW.baseline_finalization_id
+                                                        AND bb.allocation_row_id=a.allocation_id)
+                                                OR EXISTS (SELECT 1 FROM invoice_payment_allocations current_a
+                                                    WHERE current_a.id=a.allocation_id
+                                                        AND current_a.bank_transaction_id=NEW.bank_transaction_id))))))
+          OR (NEW.operation='allocation_reversal' AND (
+                            NEW.internal_correction_approval_id IS NOT NULL
+                            OR
+              (NEW.expected_prior_version>0 AND NOT EXISTS (
+                  SELECT 1 FROM allocation_batches prior WHERE prior.id=NEW.linked_prior_batch_id
+                    AND prior.operation IN ('allocation_correction','allocation_reallocation')
+                    AND julianday(NEW.effective_date)>julianday(prior.effective_date)))
+              OR (NEW.expected_prior_version=0 AND NOT EXISTS (
+                  SELECT 1 FROM allocation_history_baseline_finalizations f
+                  WHERE f.baseline_event_id=NEW.baseline_finalization_id
+                    AND julianday(NEW.effective_date)>julianday(f.observed_payment_date)))
+              OR EXISTS (SELECT 1 FROM bas_period_lodgment_markers m
+                  WHERE NEW.effective_date BETWEEN m.period_start AND m.period_end)))
+          OR (NEW.operation='allocation_reallocation' AND (
+              NEW.expected_prior_version=0 OR NOT EXISTS (
+                  SELECT 1 FROM allocation_batches prior WHERE prior.id=NEW.linked_prior_batch_id
+                    AND prior.operation='allocation_reversal'
+                    AND julianday(NEW.effective_date)>julianday(prior.effective_date))))
+        BEGIN SELECT RAISE(ABORT, 'Invalid allocation batch'); END'''
+    batch_dependencies = (
+        "allocation_batches",
+        "bank_transactions",
+        "bank_accounts",
+        "accounts",
+        "allocation_history_baseline_finalizations",
+        "allocation_batch_finalizations",
+        "allocation_history_baseline_bindings",
+        "bas_period_lodgment_markers",
+        "allocation_period_correction_approvals",
+        "invoice_payment_allocations",
+    )
+    changed = ensure_if_ready(
+        "trg_allocation_batches_domain", batch_sql, batch_dependencies
+    ) or changed
+
+    line_sql = f'''CREATE TRIGGER "trg_allocation_batch_lines_domain"
+        BEFORE INSERT ON "allocation_batch_lines"
+        WHEN typeof(NEW.line_order)!='integer' OR NEW.line_order<0
+          OR NEW.source_kind NOT IN ('invoice','bill')
+          OR typeof(NEW.invoice_or_bill_id)!='integer' OR NEW.invoice_or_bill_id<=0
+          OR typeof(NEW.gross_cents)!='integer' OR NEW.gross_cents<=0
+          OR typeof(NEW.gst_cents)!='integer' OR NEW.gst_cents<0 OR NEW.gst_cents>NEW.gross_cents
+          OR NOT EXISTS (SELECT 1 FROM allocation_batches b
+              JOIN bank_transactions t ON t.id=b.bank_transaction_id
+              JOIN invoices i ON i.id=NEW.invoice_or_bill_id
+              WHERE b.id=NEW.batch_id
+                AND ((NEW.source_kind='invoice' AND i.direction='AR' AND t.direction='in')
+                  OR (NEW.source_kind='bill' AND i.direction='AP' AND t.direction='out')))
+          OR EXISTS (SELECT 1 FROM allocation_batch_finalizations f WHERE f.batch_id=NEW.batch_id)
+        BEGIN SELECT RAISE(ABORT, 'Invalid or finalized allocation batch line'); END'''
+    line_dependencies = (
+        "allocation_batch_lines",
+        "allocation_batches",
+        "bank_transactions",
+        "invoices",
+        "allocation_batch_finalizations",
+    )
+    changed = ensure_if_ready(
+        "trg_allocation_batch_lines_domain", line_sql, line_dependencies
+    ) or changed
+
+    component_sql = f'''CREATE TRIGGER "trg_allocation_batch_tax_components_domain"
+        BEFORE INSERT ON "allocation_batch_tax_components"
+        WHEN NEW.tax_code NOT IN ('standard','gst_free','input_taxed','capital','none')
+          OR {nonblank('NEW.tax_code')}
+          OR typeof(NEW.gross_cents)!='integer' OR NEW.gross_cents<=0
+          OR typeof(NEW.gst_cents)!='integer' OR NEW.gst_cents<0 OR NEW.gst_cents>NEW.gross_cents
+          OR NOT EXISTS (SELECT 1 FROM allocation_batch_lines l WHERE l.id=NEW.allocation_batch_line_id)
+          OR EXISTS (SELECT 1 FROM allocation_batch_lines l
+              JOIN allocation_batch_finalizations f ON f.batch_id=l.batch_id
+              WHERE l.id=NEW.allocation_batch_line_id)
+        BEGIN SELECT RAISE(ABORT, 'Invalid or finalized allocation batch component'); END'''
+    component_dependencies = (
+        "allocation_batch_tax_components",
+        "allocation_batch_lines",
+        "allocation_batch_finalizations",
+    )
+    changed = ensure_if_ready(
+        "trg_allocation_batch_tax_components_domain", component_sql,
+        component_dependencies,
+    ) or changed
+
+    before_vector = '''SELECT source_kind, tax_code, SUM(gross_cents) gross_cents, SUM(gst_cents) gst_cents
+        FROM (
+          SELECT b.source_kind, tb.tax_code, tb.component_gross_cents gross_cents,
+                 tb.component_gst_cents gst_cents
+          FROM allocation_history_baseline_bindings b
+          JOIN allocation_history_baseline_tax_bindings tb ON tb.allocation_binding_id=b.id
+          WHERE b.baseline_event_id=(SELECT baseline_event_id FROM allocation_history_baseline_finalizations
+              WHERE bank_transaction_id=(SELECT bank_transaction_id FROM allocation_batches WHERE id=NEW.batch_id))
+            AND (SELECT expected_prior_version FROM allocation_batches WHERE id=NEW.batch_id)=0
+          UNION ALL
+          SELECT l.source_kind, c.tax_code, c.gross_cents, c.gst_cents
+          FROM allocation_batch_lines l JOIN allocation_batch_tax_components c
+            ON c.allocation_batch_line_id=l.id
+          WHERE l.batch_id=(SELECT linked_prior_batch_id FROM allocation_batches WHERE id=NEW.batch_id)
+            AND (SELECT expected_prior_version FROM allocation_batches WHERE id=NEW.batch_id)>0
+        ) GROUP BY source_kind, tax_code'''
+    after_vector = '''SELECT l.source_kind, c.tax_code, SUM(c.gross_cents) gross_cents,
+               SUM(c.gst_cents) gst_cents
+        FROM allocation_batch_lines l JOIN allocation_batch_tax_components c
+          ON c.allocation_batch_line_id=l.id
+        WHERE l.batch_id=NEW.batch_id GROUP BY l.source_kind, c.tax_code'''
+    vector_diff = (
+        f"EXISTS (SELECT * FROM ({before_vector}) before_rows "
+        f"EXCEPT SELECT * FROM ({after_vector}) after_rows) OR "
+        f"EXISTS (SELECT * FROM ({after_vector}) after_rows "
+        f"EXCEPT SELECT * FROM ({before_vector}) before_rows)"
+    )
+
+    batch_hash_rows = '''SELECT json_object('kind','batch',
+          'bank_transaction_id',b.bank_transaction_id,'operation',b.operation,
+          'transaction_version',b.transaction_version,'expected_prior_version',b.expected_prior_version,
+          'effective_date',b.effective_date,'recorded_at',b.recorded_at,
+          'idempotency_key',b.idempotency_key,'reason',b.reason,
+          'evidence_reference',b.evidence_reference,'evidence_sha256',b.evidence_sha256,
+          'actor_placeholder',b.actor_placeholder,'linked_prior_batch_id',b.linked_prior_batch_id,
+          'internal_correction_approval_id',b.internal_correction_approval_id,
+          'manual_review_status',b.manual_review_status,
+          'residual_amount_cents',b.residual_amount_cents,'residual_account_id',b.residual_account_id,
+          'baseline_finalization_id',b.baseline_finalization_id) AS payload
+        FROM allocation_batches b WHERE b.id=NEW.batch_id
+        UNION ALL SELECT json_object('kind','line','line_order',l.line_order,
+          'source_kind',l.source_kind,'invoice_or_bill_id',l.invoice_or_bill_id,
+          'gross_cents',l.gross_cents,'gst_cents',l.gst_cents) AS payload
+        FROM allocation_batch_lines l WHERE l.batch_id=NEW.batch_id
+        UNION ALL SELECT json_object('kind','component','line_order',l.line_order,
+          'tax_code',c.tax_code,'gross_cents',c.gross_cents,'gst_cents',c.gst_cents) AS payload
+        FROM allocation_batch_lines l JOIN allocation_batch_tax_components c
+          ON c.allocation_batch_line_id=l.id WHERE l.batch_id=NEW.batch_id'''
+    integrity_hash = f"(SELECT allocation_baseline_sha256(payload) FROM ({batch_hash_rows}) AS hash_rows)"
+
+    finalization_sql = f'''CREATE TRIGGER "trg_allocation_batch_finalizations_domain"
+        BEFORE INSERT ON "allocation_batch_finalizations"
+        WHEN typeof(NEW.allocation_line_count)!='integer' OR NEW.allocation_line_count<0
+          OR typeof(NEW.component_count)!='integer' OR NEW.component_count<0
+          OR typeof(NEW.total_allocated_cents)!='integer' OR NEW.total_allocated_cents<0
+          OR typeof(NEW.total_gst_cents)!='integer' OR NEW.total_gst_cents<0
+          OR typeof(NEW.residual_cents)!='integer' OR NEW.residual_cents<0
+          OR typeof(NEW.bank_cash_cents)!='integer' OR NEW.bank_cash_cents<=0
+          OR length(NEW.canonical_integrity_hash)!=64
+          OR lower(NEW.canonical_integrity_hash) GLOB '*[^0-9a-f]*'
+          OR {nonblank('NEW.finalized_at')} OR julianday(NEW.finalized_at) IS NULL
+          OR NOT EXISTS (SELECT 1 FROM allocation_batches b WHERE b.id=NEW.batch_id)
+          OR NEW.allocation_line_count!=(SELECT COUNT(*) FROM allocation_batch_lines l WHERE l.batch_id=NEW.batch_id)
+          OR NEW.component_count!=(SELECT COUNT(*) FROM allocation_batch_lines l
+              JOIN allocation_batch_tax_components c ON c.allocation_batch_line_id=l.id
+              WHERE l.batch_id=NEW.batch_id)
+          OR NEW.total_allocated_cents!=COALESCE((SELECT SUM(gross_cents)
+              FROM allocation_batch_lines WHERE batch_id=NEW.batch_id),0)
+          OR NEW.total_gst_cents!=COALESCE((SELECT SUM(gst_cents)
+              FROM allocation_batch_lines WHERE batch_id=NEW.batch_id),0)
+          OR NEW.residual_cents!=(SELECT residual_amount_cents FROM allocation_batches WHERE id=NEW.batch_id)
+          OR allocation_baseline_cents((SELECT amount FROM bank_transactions
+              WHERE id=(SELECT bank_transaction_id FROM allocation_batches WHERE id=NEW.batch_id))) IS NULL
+          OR NEW.bank_cash_cents!=allocation_baseline_cents((SELECT amount FROM bank_transactions
+              WHERE id=(SELECT bank_transaction_id FROM allocation_batches WHERE id=NEW.batch_id)))
+          OR NEW.bank_cash_cents!=NEW.total_allocated_cents+NEW.residual_cents
+          OR NEW.canonical_integrity_hash!={integrity_hash}
+          OR NEW.canonical_integrity_hash!=(SELECT canonical_payload_hash
+              FROM allocation_batches WHERE id=NEW.batch_id)
+          OR EXISTS (SELECT 1 FROM allocation_batch_lines l WHERE l.batch_id=NEW.batch_id
+              AND ((SELECT COUNT(*) FROM allocation_batch_tax_components c
+                    WHERE c.allocation_batch_line_id=l.id)=0
+                OR l.gross_cents!=(SELECT COALESCE(SUM(c.gross_cents),-1)
+                    FROM allocation_batch_tax_components c WHERE c.allocation_batch_line_id=l.id)
+                OR l.gst_cents!=(SELECT COALESCE(SUM(c.gst_cents),-1)
+                    FROM allocation_batch_tax_components c WHERE c.allocation_batch_line_id=l.id)))
+          OR (({vector_diff}) AND (SELECT manual_review_status FROM allocation_batches
+              WHERE id=NEW.batch_id) NOT IN ('required','approved'))
+          OR (NOT ({vector_diff}) AND (SELECT manual_review_status FROM allocation_batches
+              WHERE id=NEW.batch_id)='required')
+          OR (({vector_diff}) AND (SELECT manual_review_status FROM allocation_batches
+              WHERE id=NEW.batch_id)!='approved')
+          OR ((NOT ({vector_diff})) AND (SELECT manual_review_status FROM allocation_batches
+              WHERE id=NEW.batch_id) NOT IN ('not_required','approved'))
+          OR ((SELECT operation FROM allocation_batches WHERE id=NEW.batch_id)='allocation_reversal'
+              AND EXISTS (SELECT 1 FROM allocation_batch_lines l
+                WHERE l.batch_id=NEW.batch_id AND NOT EXISTS (
+                  SELECT 1 FROM allocation_batch_lines prior_l
+                  JOIN allocation_batch_tax_components prior_c
+                    ON prior_c.allocation_batch_line_id=prior_l.id
+                  WHERE prior_l.batch_id=(SELECT linked_prior_batch_id FROM allocation_batches
+                    WHERE id=NEW.batch_id)
+                    AND prior_l.source_kind=l.source_kind
+                    AND prior_l.invoice_or_bill_id=l.invoice_or_bill_id
+                                        AND prior_l.gross_cents>=l.gross_cents AND prior_l.gst_cents>=l.gst_cents
+                                    UNION ALL
+                                    SELECT 1 FROM allocation_history_baseline_bindings base_l
+                                    WHERE base_l.baseline_event_id=(SELECT baseline_finalization_id
+                                            FROM allocation_batches WHERE id=NEW.batch_id)
+                                        AND base_l.source_kind=l.source_kind
+                                        AND base_l.invoice_or_bill_id=l.invoice_or_bill_id
+                                        AND base_l.allocated_gross_cents>=l.gross_cents
+                                        AND base_l.allocated_gst_cents>=l.gst_cents
+                                        AND (SELECT expected_prior_version FROM allocation_batches
+                                            WHERE id=NEW.batch_id)=0)))
+                    OR ((SELECT operation FROM allocation_batches WHERE id=NEW.batch_id)='allocation_reversal'
+                            AND EXISTS (SELECT 1 FROM allocation_batch_lines l
+                                JOIN allocation_batch_tax_components c ON c.allocation_batch_line_id=l.id
+                                WHERE l.batch_id=NEW.batch_id AND NOT EXISTS (
+                                    SELECT 1 FROM allocation_batch_lines prior_l
+                                    JOIN allocation_batch_tax_components prior_c
+                                        ON prior_c.allocation_batch_line_id=prior_l.id
+                                    WHERE prior_l.batch_id=(SELECT linked_prior_batch_id FROM allocation_batches
+                                        WHERE id=NEW.batch_id)
+                                        AND prior_l.source_kind=l.source_kind
+                                        AND prior_l.invoice_or_bill_id=l.invoice_or_bill_id
+                                        AND prior_c.tax_code=c.tax_code
+                                        AND prior_c.gross_cents>=c.gross_cents AND prior_c.gst_cents>=c.gst_cents
+                                    UNION ALL
+                                    SELECT 1 FROM allocation_history_baseline_bindings base_l
+                                    JOIN allocation_history_baseline_tax_bindings base_c
+                                        ON base_c.allocation_binding_id=base_l.id
+                                    WHERE base_l.baseline_event_id=(SELECT baseline_finalization_id
+                                            FROM allocation_batches WHERE id=NEW.batch_id)
+                                        AND base_l.source_kind=l.source_kind
+                                        AND base_l.invoice_or_bill_id=l.invoice_or_bill_id
+                                        AND base_c.tax_code=c.tax_code
+                                        AND base_c.component_gross_cents>=c.gross_cents
+                                        AND base_c.component_gst_cents>=c.gst_cents
+                                        AND (SELECT expected_prior_version FROM allocation_batches
+                                            WHERE id=NEW.batch_id)=0)))
+        BEGIN SELECT RAISE(ABORT, 'Allocation batch does not reconcile or requires manual GST review'); END'''
+    finalization_dependencies = (
+        "allocation_batch_finalizations",
+        "allocation_batches",
+        "allocation_batch_lines",
+        "allocation_batch_tax_components",
+        "bank_transactions",
+        "allocation_history_baseline_finalizations",
+        "allocation_history_baseline_bindings",
+        "allocation_history_baseline_tax_bindings",
+    )
+    changed = ensure_if_ready(
+        "trg_allocation_batch_finalizations_domain", finalization_sql,
+        finalization_dependencies,
+    ) or changed
+
+    bank_cash_sql = '''CREATE TRIGGER "trg_bank_transactions_allocation_batch_cash_immutable"
+        BEFORE UPDATE ON "bank_transactions"
+        WHEN EXISTS (SELECT 1 FROM allocation_batches b WHERE b.bank_transaction_id=OLD.id)
+          AND (NEW.amount IS NOT OLD.amount OR NEW.direction IS NOT OLD.direction)
+        BEGIN SELECT RAISE(ABORT, 'Bank cash is immutable after allocation batching'); END'''
+    bank_trigger_dependencies = ("bank_transactions", "allocation_batches")
+    changed = ensure_if_ready(
+        "trg_bank_transactions_allocation_batch_cash_immutable", bank_cash_sql,
+        bank_trigger_dependencies,
+    ) or changed
+    bank_delete_sql = '''CREATE TRIGGER "trg_bank_transactions_allocation_batch_no_delete"
+        BEFORE DELETE ON "bank_transactions"
+        WHEN EXISTS (SELECT 1 FROM allocation_batches b WHERE b.bank_transaction_id=OLD.id)
+        BEGIN SELECT RAISE(ABORT, 'Bank transaction has allocation batches'); END'''
+    changed = ensure_if_ready(
+        "trg_bank_transactions_allocation_batch_no_delete", bank_delete_sql,
+        bank_trigger_dependencies,
+    ) or changed
+    bank_replace_sql = '''CREATE TRIGGER "trg_bank_transactions_allocation_batch_no_replace"
+        BEFORE INSERT ON "bank_transactions"
+        WHEN EXISTS (SELECT 1 FROM bank_transactions prior
+          WHERE (prior.id=NEW.id OR (NEW.dedup_key IS NOT NULL
+            AND prior.bank_account_id=NEW.bank_account_id AND prior.dedup_key=NEW.dedup_key))
+            AND EXISTS (SELECT 1 FROM allocation_batches b
+              WHERE b.bank_transaction_id=prior.id))
+        BEGIN SELECT RAISE(ABORT, 'Bank transaction has allocation batches'); END'''
+    changed = ensure_if_ready(
+        "trg_bank_transactions_allocation_batch_no_replace", bank_replace_sql,
+        bank_trigger_dependencies,
+    ) or changed
+    return changed
+
+
+def _drop_allocation_batch_bank_transaction_triggers(conn) -> tuple[str, ...]:
+    """Drop all owned batch triggers whose SQL depends on bank_transactions."""
+    rows = conn.execute(text(
+        "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+        "AND (lower(name) GLOB 'trg_allocation_batch*' "
+        "OR lower(name) GLOB 'trg_bank_transactions_allocation_batch*')"
+    )).fetchall()
+    dropped = []
+    for name, sql in rows:
+        if "bank_transactions" not in (sql or "").lower():
+            continue
+        conn.execute(text(f'DROP TRIGGER "{name}"'))
+        dropped.append(name)
+    return tuple(dropped)
+
+
+def _drop_allocation_batch_triggers(conn) -> tuple[str, ...]:
+    """Drop all owned batch triggers before recreating empty partial tables."""
+    rows = conn.execute(text(
+        "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+        "AND (lower(name) GLOB 'trg_allocation_batch*' "
+        "OR lower(name) GLOB 'trg_bank_transactions_allocation_batch*')"
+    )).fetchall()
+    dropped = []
+    for name, sql in rows:
+        conn.execute(text(f'DROP TRIGGER "{name}"'))
+        dropped.append(name)
+    return tuple(dropped)
 
 
 _BANK_DEDUP_INDEX = SQLiteIndexSignature(
@@ -675,6 +2625,12 @@ def _migration_transaction(
                         "Migration rebuild requires foreign_keys=OFF before its transaction"
                     )
             with conn.begin():
+                if foreign_keys_off and conn.dialect.name == "sqlite":
+                    conn.exec_driver_sql("BEGIN IMMEDIATE")
+                    if not conn.connection.driver_connection.in_transaction:
+                        raise RuntimeError(
+                            "SQLite migration rebuild did not start a database transaction"
+                        )
                 yield conn
         finally:
             # Restore the exact DBAPI connection that ran the migration before
@@ -1276,7 +3232,9 @@ def _payment_reconciliation_counts(conn) -> dict[str, int]:
                 "LEFT JOIN journal_entries AS j ON j.source_id = i.id AND "
                 "((i.direction = 'AR' AND j.source_type = 'invoice_ar') OR "
                 " (i.direction = 'AP' AND j.source_type = 'invoice_ap')) "
-                "WHERE j.id IS NULL"
+                "WHERE j.id IS NULL AND NOT EXISTS (SELECT 1 "
+                "FROM allocation_history_events e WHERE e.bank_transaction_id=a.bank_transaction_id "
+                "AND e.operation='legacy_history_unknown')"
             )
         ).scalar_one()
     )
@@ -1288,7 +3246,10 @@ def _payment_reconciliation_counts(conn) -> dict[str, int]:
                 "WHERE ((a.code = '1100' AND t.direction = 'in') OR "
                 "       (a.code = '2000' AND t.direction = 'out')) "
                 "AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations AS p "
-                "                WHERE p.bank_transaction_id = t.id)"
+                "                WHERE p.bank_transaction_id = t.id) "
+                "AND NOT EXISTS (SELECT 1 FROM allocation_history_events e "
+                "                WHERE e.bank_transaction_id=t.id "
+                "                  AND e.operation='legacy_history_unknown')"
             )
         ).scalar_one()
     )
@@ -1302,7 +3263,10 @@ def _payment_reconciliation_counts(conn) -> dict[str, int]:
                 "OR (i.status NOT IN ('draft', 'void') AND NOT EXISTS ("
                 "    SELECT 1 FROM journal_entries AS j WHERE j.source_id = i.id "
                 "    AND ((i.direction = 'AR' AND j.source_type = 'invoice_ar') OR "
-                "         (i.direction = 'AP' AND j.source_type = 'invoice_ap'))))"
+                "         (i.direction = 'AP' AND j.source_type = 'invoice_ap')))) "
+                "AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations p "
+                "JOIN allocation_history_events e ON e.bank_transaction_id=p.bank_transaction_id "
+                "WHERE p.invoice_id=i.id AND e.operation='legacy_history_unknown')"
             )
         ).scalar_one()
     )
@@ -1358,7 +3322,9 @@ def _reconcile_legacy_payment_metadata(conn) -> dict[str, int]:
             "LEFT JOIN journal_entries AS j ON j.source_id = i.id AND "
             "((i.direction = 'AR' AND j.source_type = 'invoice_ar') OR "
             " (i.direction = 'AP' AND j.source_type = 'invoice_ap')) "
-            "WHERE j.id IS NULL"
+            "WHERE j.id IS NULL AND NOT EXISTS (SELECT 1 "
+            "FROM allocation_history_events e WHERE e.bank_transaction_id=t.id "
+            "AND e.operation='legacy_history_unknown')"
         )
     ).mappings().all()
     for row in invalid_txn_rows:
@@ -1405,7 +3371,10 @@ def _reconcile_legacy_payment_metadata(conn) -> dict[str, int]:
             "WHERE ((a.code = '1100' AND t.direction = 'in') OR "
             "       (a.code = '2000' AND t.direction = 'out')) "
             "AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations AS p "
-            "                WHERE p.bank_transaction_id = t.id)"
+                "                WHERE p.bank_transaction_id = t.id) "
+                "AND NOT EXISTS (SELECT 1 FROM allocation_history_events e "
+                "                WHERE e.bank_transaction_id=t.id "
+                "                  AND e.operation='legacy_history_unknown')"
         )
     ).mappings().all()
     for row in control_rows:
@@ -1438,7 +3407,10 @@ def _reconcile_legacy_payment_metadata(conn) -> dict[str, int]:
             "OR (i.status NOT IN ('draft', 'void') AND NOT EXISTS ("
             "    SELECT 1 FROM journal_entries AS j WHERE j.source_id = i.id "
             "    AND ((i.direction = 'AR' AND j.source_type = 'invoice_ar') OR "
-            "         (i.direction = 'AP' AND j.source_type = 'invoice_ap'))))"
+            "         (i.direction = 'AP' AND j.source_type = 'invoice_ap')))) "
+            "AND NOT EXISTS (SELECT 1 FROM invoice_payment_allocations p "
+            "JOIN allocation_history_events e ON e.bank_transaction_id=p.bank_transaction_id "
+            "WHERE p.invoice_id=i.id AND e.operation='legacy_history_unknown')"
         )
     ).mappings().all()
     for row in invoice_rows:
@@ -1629,6 +3601,7 @@ def run_company_migrations(
 
     Returns the list of step names that ran this call. Idempotent.
     """
+    _install_allocation_baseline_hash(engine)
     applied: list[str] = []
     backup_path, backup_reasons = _create_destructive_migration_backup(
         engine,
@@ -1638,9 +3611,16 @@ def run_company_migrations(
         applied.extend(f"backup:{reason}" for reason in backup_reasons)
     with engine.connect() as check_conn:
         rebuild_bank_accounts = _bank_accounts_need_rebuild(check_conn)
+        rebuild_bank_transactions = _bank_needs_rebuild(check_conn)
     with _migration_transaction(
-        engine, foreign_keys_off=rebuild_bank_accounts
+        engine,
+        foreign_keys_off=(rebuild_bank_accounts or rebuild_bank_transactions),
     ) as conn:
+        if not _table_exists(conn, "bank_transactions"):
+            dropped_batch_triggers = _drop_allocation_batch_bank_transaction_triggers(conn)
+            if dropped_batch_triggers:
+                applied.append("drop_triggers:allocation_batches_missing_bank_table")
+
         # 1. Table drops (for tables removed from the schema). FKs are
         # toggled off so a referenced table can be dropped even when some
         # *other* table still has the dangling FK column (cleaned up in
@@ -1719,8 +3699,21 @@ def run_company_migrations(
                     + ". A pre-repair backup was preserved; correct the data "
                     "through an operator-reviewed recovery workflow."
                 )
+            dropped_batch_triggers = _drop_allocation_batch_bank_transaction_triggers(conn)
+            if dropped_batch_triggers:
+                applied.append("drop_triggers:allocation_batches_bank_transaction")
+            for trigger in (
+                "trg_allocation_history_events_domain",
+                "trg_allocation_history_baseline_finalizations_domain",
+                "trg_bank_transactions_allocation_history_no_delete",
+                "trg_bank_transactions_allocation_history_identity",
+                "trg_bank_transactions_allocation_history_no_replace",
+            ):
+                conn.execute(text(f'DROP TRIGGER IF EXISTS "{trigger}"'))
             _rebuild_bank_transactions(conn)
             applied.append(f"rebuild:{table}")
+            if dropped_batch_triggers and _ensure_allocation_batch_guards(conn):
+                applied.append("guards:allocation_batches_append_only")
 
         # 3b. outgoing_documents rebuild — the SA/PR/Invoice/Partner columns were
         # removed when the document model was reduced to Receipt-only. Several are
@@ -1731,6 +3724,11 @@ def run_company_migrations(
                 _rebuild_outgoing_documents(conn)
                 applied.append("rebuild:outgoing_documents")
 
+        if _ensure_allocation_history_schema(conn):
+            applied.append("schema:allocation_history")
+        if _ensure_allocation_batch_schema(conn):
+            applied.append("schema:allocation_batches")
+
         # 4. Repair every missing/wrong model index plus the migration-owned
         # partial unique indexes by full signature, never by name alone.
         for table, signature in _pending_index_repairs(conn):
@@ -1739,6 +3737,13 @@ def run_company_migrations(
         for _table, index_name in _pending_unexpected_nonunique_indexes(conn):
             conn.execute(text(f'DROP INDEX "{index_name}"'))
             applied.append(f"drop_index:{index_name}")
+
+        if _ensure_gst_adjustment_append_only_guards(conn):
+            applied.append("guards:gst_adjustment_append_only")
+        if _ensure_allocation_history_guards(conn):
+            applied.append("guards:allocation_history_append_only")
+        if _ensure_allocation_batch_guards(conn):
+            applied.append("guards:allocation_batches_append_only")
 
         # Do not mutate financial rows while any non-targeted table constraint
         # remains absent or counterfeit. Populated drifted tables received an

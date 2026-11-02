@@ -20,6 +20,7 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from _request_headers import manual_transaction_headers
 
@@ -223,6 +224,126 @@ def test_dedup_marks_existing(client, biz_bank):
         ]},
     )
     assert commit2.json() == {"created": 0, "skipped_duplicates": 1}
+
+
+def test_duplicate_import_with_history_is_read_only(client, biz_bank):
+    row = {
+        "occurred_at": "2026-07-01",
+        "direction": "in",
+        "amount": "125.00",
+        "dedup_key": "history-replay-key",
+        "memo": "History replay receipt",
+    }
+    first = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json={"rows": [row]},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json() == {"created": 1, "skipped_duplicates": 0}
+
+    transactions_url = f"/api/v1/bank-accounts/{biz_bank['id']}/transactions"
+    transaction_before = client.get(transactions_url, headers=HEAD).json()
+    cash_before = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0][
+        "current_balance"
+    ]
+    transaction_id = transaction_before[0]["id"]
+    from app.db.company import company_session
+
+    with company_session("tc") as db:
+        db.execute(
+            text(
+                "INSERT INTO allocation_history_events "
+                "(operation, bank_transaction_id) "
+                "VALUES ('legacy_history_unknown', :transaction_id)"
+            ),
+            {"transaction_id": transaction_id},
+        )
+        db.commit()
+
+    replay = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json={"rows": [row]},
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {"created": 0, "skipped_duplicates": 1}
+    assert client.get(transactions_url, headers=HEAD).json() == transaction_before
+    assert client.get("/api/v1/bank-accounts", headers=HEAD).json()[0][
+        "current_balance"
+    ] == cash_before
+
+
+def test_multi_row_import_rolls_back_on_history_conflict(
+    client, biz_bank, monkeypatch
+):
+    from app.services import bank_import as bank_import_service
+
+    original_replace = bank_import_service.invoice_payments.replace_transaction_allocations
+    call_count = 0
+
+    def create_history_before_second_allocation(db, transaction, specs, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            db.execute(
+                text(
+                    "INSERT INTO allocation_history_events "
+                    "(operation, bank_transaction_id) "
+                    "VALUES ('legacy_history_unknown', :transaction_id)"
+                ),
+                {"transaction_id": transaction.id},
+            )
+        return original_replace(db, transaction, specs, **kwargs)
+
+    monkeypatch.setattr(
+        bank_import_service.invoice_payments,
+        "replace_transaction_allocations",
+        create_history_before_second_allocation,
+    )
+    cash_before = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0][
+        "current_balance"
+    ]
+    response = client.post(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/import/commit",
+        headers=HEAD,
+        json={
+            "rows": [
+                {
+                    "occurred_at": "2026-07-02",
+                    "direction": "in",
+                    "amount": "25.00",
+                    "dedup_key": "batch-first",
+                    "memo": "Batch first row",
+                },
+                {
+                    "occurred_at": "2026-07-03",
+                    "direction": "out",
+                    "amount": "15.00",
+                    "dedup_key": "batch-second",
+                    "memo": "Batch second row",
+                },
+            ]
+        },
+    )
+    assert call_count == 2
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == (
+        "This bank transaction has allocation history and cannot be changed."
+    )
+    assert "SQLite" not in response.text
+    assert "trigger" not in response.text.lower()
+    assert client.get(
+        f"/api/v1/bank-accounts/{biz_bank['id']}/transactions", headers=HEAD
+    ).json() == []
+    assert client.get("/api/v1/bank-accounts", headers=HEAD).json()[0][
+        "current_balance"
+    ] == cash_before
+
+    from app.db.company import company_session
+
+    with company_session("tc") as db:
+        assert db.execute(text("SELECT COUNT(*) FROM allocation_history_events")).scalar_one() == 0
 
 
 def test_dedup_flags_row_matching_manual_transaction(client, biz_bank):
