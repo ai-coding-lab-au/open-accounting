@@ -7,6 +7,7 @@ invoice paid/outstanding status.
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any, Iterable
 
@@ -317,6 +318,60 @@ def recompute_invoice_payment_state(db: Session, invoice_ids: Iterable[int]) -> 
         else:
             invoice.paid_amount = total
             invoice.paid_date = max(txn.occurred_at for _row, txn in allocations)
+            invoice.status = InvoiceStatus.PAID
+
+
+def refresh_paid_state_cache(db: Session, invoice_ids: Iterable[int]) -> None:
+    """Refresh paid/outstanding state for invoice or bill IDs touched by batch writes."""
+    for invoice_id in sorted({int(invoice_id) for invoice_id in invoice_ids if invoice_id is not None}):
+        invoice = db.get(Invoice, invoice_id)
+        if invoice is None or invoice.status in (InvoiceStatus.DRAFT, InvoiceStatus.VOID):
+            continue
+        rows = (
+            db.query(InvoicePaymentAllocation, BankTransaction)
+            .join(BankTransaction, BankTransaction.id == InvoicePaymentAllocation.bank_transaction_id)
+            .filter(InvoicePaymentAllocation.invoice_id == invoice_id)
+            .filter(BankTransaction.occurred_at <= current_date())
+            .all()
+        )
+        paid = _money(sum((row.amount for row, _txn in rows), Decimal("0.00")))
+        total = _money(invoice.total)
+        if paid <= 0:
+            invoice.paid_amount = Decimal("0.00")
+            invoice.paid_date = None
+            invoice.status = InvoiceStatus.AUTHORISED
+        elif paid < total:
+            invoice.paid_amount = paid
+            invoice.paid_date = max(txn.occurred_at for _row, txn in rows)
+            invoice.status = InvoiceStatus.PARTIAL
+        else:
+            invoice.paid_amount = total
+            invoice.paid_date = max(txn.occurred_at for _row, txn in rows)
+            invoice.status = InvoiceStatus.PAID
+
+
+def refresh_projected_paid_state_cache(
+    db: Session,
+    paid_cents_by_invoice: dict[int, tuple[int, date | None]],
+) -> None:
+    """Apply paid-state totals derived from projected settlement rows only."""
+    for invoice_id, (paid_cents, paid_date) in sorted(paid_cents_by_invoice.items()):
+        invoice = db.get(Invoice, invoice_id)
+        if invoice is None or invoice.status in (InvoiceStatus.DRAFT, InvoiceStatus.VOID):
+            continue
+        paid = _money(Decimal(paid_cents) / Decimal("100"))
+        total = _money(invoice.total)
+        if paid <= 0:
+            invoice.paid_amount = Decimal("0.00")
+            invoice.paid_date = None
+            invoice.status = InvoiceStatus.AUTHORISED
+        elif paid < total:
+            invoice.paid_amount = paid
+            invoice.paid_date = paid_date
+            invoice.status = InvoiceStatus.PARTIAL
+        else:
+            invoice.paid_amount = total
+            invoice.paid_date = paid_date
             invoice.status = InvoiceStatus.PAID
 
 

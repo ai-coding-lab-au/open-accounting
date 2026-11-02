@@ -10,8 +10,16 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import Session
 from fastapi.testclient import TestClient
+
+from app.db.base import CompanyBase
+from app.db.migrations import run_company_migrations
+from app.services.allocation_batches import (
+    InvalidExactMoneyInputError,
+    parse_exact_money,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -757,3 +765,365 @@ def test_startup_backfills_missing_allocation_tax_components(
         assert component.tax_code == "standard"
         assert Decimal(component.gross_amount) == Decimal("110.00")
         assert Decimal(component.gst_amount) == Decimal("10.00")
+
+
+def test_parse_exact_money_accepts_valid_values_and_rejects_invalid_input():
+    assert parse_exact_money("12.34") == 1234
+    assert parse_exact_money("12") == 1200
+    assert parse_exact_money(Decimal("44.44")) == 4444
+
+    for value in (
+        "1e2",
+        1.23,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "NaN",
+        "INF",
+        "-1.00",
+        "1.005",
+        "92233720368547758.08",
+    ):
+        with pytest.raises(InvalidExactMoneyInputError):
+            parse_exact_money(value)
+
+    assert parse_exact_money("2147483647.99") == 214748364799
+
+
+def _synthetic_projector_session(tmp_path, name="projector.db"):
+    db_path = tmp_path / name
+    engine = create_engine(
+        f"sqlite:///{db_path.as_posix()}",
+        future=True,
+        connect_args={"check_same_thread": False},
+    )
+
+    @event.listens_for(engine, "connect")
+    def _enable_foreign_keys(connection, _):
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    CompanyBase.metadata.create_all(engine)
+    run_company_migrations(engine)
+    return engine
+
+
+def _seed_synthetic_projector_parents(db):
+    db.execute(
+        text(
+            "INSERT INTO bank_accounts (id, name, opening_balance, is_active) "
+            "VALUES (1, 'Synthetic bank', 0, 1)"
+        )
+    )
+    db.execute(
+        text(
+            "INSERT INTO contacts (id, kind, name, active, created_at) "
+            "VALUES (1, 'customer', 'Synthetic customer', 1, CURRENT_TIMESTAMP)"
+        )
+    )
+    db.execute(
+        text(
+            "INSERT INTO invoices (id, direction, contact_id, invoice_number, issue_date, "
+            "currency, subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+            "source, created_at, updated_at) VALUES "
+            "(99, 'AR', 1, 'SYN-PROJECTOR', '2026-10-01', 'AUD', 10, 1.23, 11.23, 1, "
+            "'draft', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+    )
+
+
+def _seed_synthetic_projector_rows(
+    db, *, transaction_id, allocation_id=None, component_id=None
+):
+    db.execute(
+        text(
+            "INSERT INTO bank_transactions (id, bank_account_id, direction, amount, occurred_at, gst_amount, tax_code, unapplied_amount) "
+            "VALUES (:transaction_id, 1, 'in', 11.23, '2026-10-01', 1.23, 'standard', 0)"
+        ),
+        {"transaction_id": transaction_id},
+    )
+    if allocation_id is not None:
+        db.execute(
+            text(
+                "INSERT INTO invoice_payment_allocations "
+                "(id, bank_transaction_id, invoice_id, amount, gst_amount, created_at) "
+                "VALUES (:allocation_id, :transaction_id, 99, 11.23, 1.23, "
+                "'2026-10-01 08:00:00')"
+            ),
+            {"allocation_id": allocation_id, "transaction_id": transaction_id},
+        )
+    if component_id is not None:
+        db.execute(
+            text(
+                "INSERT INTO invoice_payment_tax_components "
+                "(id, allocation_id, tax_code, gross_amount, gst_amount) "
+                "VALUES (:component_id, :allocation_id, 'standard', 11.23, 1.23)"
+            ),
+            {"component_id": component_id, "allocation_id": allocation_id},
+        )
+
+
+def test_projector_reports_complete_and_uncertain_states_for_baseline_visibility(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from app.db.company import begin_sqlite_immediate
+    from app.db.migrations import allocation_baseline_integrity_hash
+    from app.services.allocation_history import capture_legacy_allocation_baseline
+    from app.services.allocation_projection import project_allocation_state
+
+    observed_at = datetime(2026, 10, 12)
+    engine = _synthetic_projector_session(tmp_path)
+    with Session(engine) as db:
+        begin_sqlite_immediate(db)
+        _seed_synthetic_projector_parents(db)
+        _seed_synthetic_projector_rows(db, transaction_id=2, allocation_id=22, component_id=222)
+        _seed_synthetic_projector_rows(db, transaction_id=3)
+        _seed_synthetic_projector_rows(db, transaction_id=4, allocation_id=24)
+        db.commit()
+
+    with Session(engine) as db:
+        baseline = capture_legacy_allocation_baseline(db, 2, observed_at)
+        assert baseline.status == "complete"
+        assert baseline.incomplete_reasons == ()
+        assert baseline.allocation_count == 1
+        assert baseline.component_count == 1
+        assert baseline.gross_total_cents == 1123
+        assert baseline.gst_total_cents == 123
+
+        allocation_binding = db.execute(
+            text(
+                "SELECT allocation_row_id, baseline_event_id, bank_transaction_id, "
+                "source_kind, invoice_or_bill_id, allocated_gross_cents, "
+                "allocated_gross_source, allocated_gst_cents, allocated_gst_source, "
+                "allocation_created_at FROM allocation_history_baseline_bindings "
+                "WHERE baseline_event_id = :event_id"
+            ),
+            {"event_id": baseline.baseline_event_id},
+        ).one()
+        assert tuple(allocation_binding) == (
+            22, baseline.baseline_event_id, 2, "invoice", 99, 1123, "11.23", 123,
+            "1.23", "2026-10-01 08:00:00",
+        )
+        component_binding = db.execute(
+            text(
+                "SELECT source_component_row_id, tax_code, component_gross_cents, "
+                "component_gross_source, component_gst_cents, component_gst_source "
+                "FROM allocation_history_baseline_tax_bindings tb "
+                "JOIN allocation_history_baseline_bindings b "
+                "ON b.id = tb.allocation_binding_id WHERE b.baseline_event_id = :event_id"
+            ),
+            {"event_id": baseline.baseline_event_id},
+        ).one()
+        assert tuple(component_binding) == (222, "standard", 1123, "11.23", 123, "1.23")
+        finalization = db.execute(
+            text(
+                "SELECT observed_payment_date, CAST(observed_at AS TEXT), "
+                "observed_allocation_count, observed_component_count, "
+                "gross_allocation_total_cents, gst_total_cents, integrity_hash, status, "
+                "incomplete_reason_codes FROM allocation_history_baseline_finalizations "
+                "WHERE baseline_event_id = :event_id"
+            ),
+            {"event_id": baseline.baseline_event_id},
+        ).one()
+        assert tuple(finalization) == (
+            "2026-10-01", "2026-10-12 00:00:00.000000", 1, 1, 1123, 123,
+            baseline.integrity_hash, "complete", "[]",
+        )
+        assert len(baseline.integrity_hash) == 64
+        db.commit()
+
+    batch_values = {
+        "bank_transaction_id": 2,
+        "operation": "allocation_correction",
+        "transaction_version": 1,
+        "expected_prior_version": 0,
+        "effective_date": "2026-10-01",
+        "recorded_at": "2026-10-13 00:00:00.000000",
+        "idempotency_key": "projector-baseline",
+        "reason": "Synthetic projector test",
+        "evidence_reference": "synthetic://projector",
+        "evidence_sha256": None,
+        "actor_placeholder": "Synthetic operator",
+        "linked_prior_batch_id": None,
+        "internal_correction_approval_id": None,
+        "manual_review_status": "not_required",
+        "residual_amount_cents": 0,
+        "residual_account_id": None,
+        "baseline_finalization_id": baseline.baseline_event_id,
+    }
+    batch_hash = allocation_baseline_integrity_hash([
+        {"kind": "batch", **batch_values},
+        {
+            "kind": "line",
+            "line_order": 0,
+            "source_kind": "invoice",
+            "invoice_or_bill_id": 99,
+            "gross_cents": 1123,
+            "gst_cents": 123,
+        },
+        {
+            "kind": "component",
+            "line_order": 0,
+            "tax_code": "standard",
+            "gross_cents": 1123,
+            "gst_cents": 123,
+        },
+    ])
+    with Session(engine) as db:
+        begin_sqlite_immediate(db)
+        from sqlalchemy.exc import IntegrityError
+
+        insert_batch = text(
+            "INSERT INTO allocation_batches "
+            "(bank_transaction_id, operation, transaction_version, expected_prior_version, "
+            "effective_date, recorded_at, idempotency_key, canonical_payload_hash, reason, "
+            "evidence_reference, evidence_sha256, actor_placeholder, linked_prior_batch_id, "
+            "internal_correction_approval_id, manual_review_status, residual_amount_cents, "
+            "residual_account_id, baseline_finalization_id) VALUES "
+            "(:bank_transaction_id, :operation, :transaction_version, :expected_prior_version, "
+            ":effective_date, :recorded_at, :idempotency_key, :canonical_payload_hash, :reason, "
+            ":evidence_reference, :evidence_sha256, :actor_placeholder, :linked_prior_batch_id, "
+            ":internal_correction_approval_id, :manual_review_status, :residual_amount_cents, "
+            ":residual_account_id, :baseline_finalization_id) RETURNING id"
+        )
+        for invalid_values in (
+            {**batch_values, "idempotency_key": "projector-invalid-hash", "canonical_payload_hash": "bad"},
+            {**batch_values, "idempotency_key": "projector-invalid-timestamp", "recorded_at": "not-a-timestamp", "canonical_payload_hash": batch_hash},
+        ):
+            with pytest.raises(IntegrityError):
+                with db.begin_nested():
+                    db.execute(insert_batch, invalid_values)
+
+        batch_id = db.execute(
+            insert_batch,
+            {**batch_values, "canonical_payload_hash": batch_hash},
+        ).scalar_one()
+        line_id = db.execute(
+            text(
+                "INSERT INTO allocation_batch_lines "
+                "(batch_id, line_order, source_kind, invoice_or_bill_id, gross_cents, gst_cents) "
+                "VALUES (:batch_id, 0, 'invoice', 99, 1123, 123) RETURNING id"
+            ),
+            {"batch_id": batch_id},
+        ).scalar_one()
+        db.execute(
+            text(
+                "INSERT INTO allocation_batch_tax_components "
+                "(allocation_batch_line_id, tax_code, gross_cents, gst_cents) "
+                "VALUES (:line_id, 'standard', 1123, 123)"
+            ),
+            {"line_id": line_id},
+        )
+        db.commit()
+
+    with Session(engine) as db:
+        projection = project_allocation_state(
+            db, 2, datetime(2026, 10, 1), datetime(2026, 10, 12, 23, 59, 59)
+        )
+        assert projection.certainty == "complete"
+        assert projection.source == "complete_baseline"
+        assert projection.transaction_id == 2
+        assert projection.selected_batch_id is None
+        assert projection.total_allocated_cents == 1123
+        assert projection.total_gst_cents == 123
+        assert projection.bank_cash_cents == 1123
+        assert projection.residual_cents == 0
+        assert len(projection.ordered_allocation_lines) == 1
+        baseline_line = projection.ordered_allocation_lines[0]
+        assert baseline_line.gross_cents == 1123
+        assert baseline_line.gst_cents == 123
+        assert baseline_line.tax_components == (("standard", 1123, 123),)
+
+    with Session(engine) as db:
+        projection = project_allocation_state(
+            db, 2, datetime(2026, 9, 30), datetime(2026, 10, 12, 23, 59, 59)
+        )
+        assert projection.certainty == "uncertain"
+        assert projection.source == "uncertain"
+        assert projection.uncertainty_reason == "pre_baseline_operation"
+
+    with Session(engine) as db:
+        projection = project_allocation_state(
+            db, 2, datetime(2026, 10, 1), datetime(2026, 10, 11, 23, 59, 59)
+        )
+        assert projection.certainty == "uncertain"
+        assert projection.source == "uncertain"
+        assert projection.uncertainty_reason == "pre_observation_knowledge"
+
+    with Session(engine) as db:
+        projection = project_allocation_state(
+            db, 2, datetime(2026, 10, 1), datetime(2026, 10, 13, 0, 0, 30)
+        )
+        assert projection.certainty == "complete"
+        assert projection.source == "complete_baseline"
+        assert projection.selected_batch_id is None
+
+    with Session(engine) as db:
+        begin_sqlite_immediate(db)
+        db.execute(
+            text(
+                "INSERT INTO allocation_batch_finalizations "
+                "(batch_id, allocation_line_count, component_count, total_allocated_cents, "
+                "total_gst_cents, residual_cents, bank_cash_cents, canonical_integrity_hash, finalized_at) "
+                "VALUES (:batch_id, 1, 1, 1123, 123, 0, 1123, :canonical_integrity_hash, :finalized_at)"
+            ),
+            {
+                "batch_id": batch_id,
+                "canonical_integrity_hash": batch_hash,
+                "finalized_at": "2026-10-13 00:01:00.000000",
+            },
+        )
+        db.commit()
+
+    with Session(engine) as db:
+        projection = project_allocation_state(
+            db, 2, datetime(2026, 10, 1), datetime(2026, 10, 13, 0, 1)
+        )
+        assert projection.certainty == "complete"
+        assert projection.source == "finalized_batch"
+        assert projection.selected_batch_id == batch_id
+        assert projection.selected_batch_version == 1
+        assert projection.total_allocated_cents == 1123
+        assert projection.total_gst_cents == 123
+        assert projection.bank_cash_cents == 1123
+        assert projection.residual_cents == 0
+
+    with Session(engine) as db:
+        execute = db.execute
+
+        def execute_with_orphaned_batch_lookup(statement, *args, **kwargs):
+            parameters = args[0] if args else kwargs.get("params", {})
+            if (
+                "SELECT 1 FROM allocation_batches" in str(statement)
+                and parameters.get("bank_transaction_id") == 3
+            ):
+                return SimpleNamespace(first=lambda: (1,))
+            return execute(statement, *args, **kwargs)
+
+        with patch.object(db, "execute", side_effect=execute_with_orphaned_batch_lookup):
+            projection = project_allocation_state(db, 3, "2026-10-01", "2026-10-12")
+        assert projection.certainty == "uncertain"
+        assert projection.uncertainty_reason == "missing_baseline"
+
+    with Session(engine) as db:
+        incomplete = capture_legacy_allocation_baseline(db, 4, observed_at)
+        assert incomplete.status == "incomplete"
+        assert incomplete.incomplete_reasons == ("missing_tax_components",)
+        stored_reasons = db.execute(
+            text(
+                "SELECT incomplete_reason_codes FROM allocation_history_baseline_finalizations "
+                "WHERE baseline_event_id = :event_id"
+            ),
+            {"event_id": incomplete.baseline_event_id},
+        ).scalar_one()
+        assert stored_reasons == '["missing_tax_components"]'
+        assert len(incomplete.integrity_hash) == 64
+        db.commit()
+
+    with Session(engine) as db:
+        projection = project_allocation_state(db, 4, "2026-10-01", "2026-10-12")
+        assert projection.certainty == "uncertain"
+        assert projection.uncertainty_reason == "baseline_incomplete"
+
+    assert not (tmp_path.parent / "companies").exists()
+    engine.dispose()

@@ -84,6 +84,57 @@ def _database(path):
         ))
     return engine
 
+class _ProjectorReadRows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+    def one_or_none(self):
+        if len(self._rows) > 1:
+            raise AssertionError("Expected at most one substituted projector row")
+        return self._rows[0] if self._rows else None
+
+
+def _substitute_projector_read(
+    monkeypatch,
+    session,
+    *,
+    query_fragment,
+    column,
+    value,
+    mapped=True,
+):
+    original_execute = session.execute
+    matched = False
+
+    def execute_with_substituted_read(statement, *args, **kwargs):
+        nonlocal matched
+        result = original_execute(statement, *args, **kwargs)
+        if query_fragment not in str(statement):
+            return result
+        matched = True
+        if mapped:
+            rows = [dict(row) for row in result.mappings().all()]
+            for row in rows:
+                row[column] = value
+            return _ProjectorReadRows(rows)
+
+        keys = tuple(result.keys())
+        rows = [dict(zip(keys, row)) for row in result.all()]
+        for row in rows:
+            row[column] = value
+        return _ProjectorReadRows(
+            [tuple(row[key] for key in keys) for row in rows]
+        )
+
+    monkeypatch.setattr(session, "execute", execute_with_substituted_read)
+    return lambda: matched
+
 
 def _allocation_batch_database(
     path, *, baseline_tax_code="standard", baseline_gst_amount="1"
@@ -117,6 +168,363 @@ def _allocation_batch_database(
         assert baseline.status == "complete"
         session.commit()
     return engine, baseline.baseline_event_id
+
+
+def _exact_bank_cash_writer_database(
+    path, *, bank_amount, allocation_amount, gst_amount, tax_code
+):
+    engine = _database(path)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE bank_transactions SET amount=:bank_amount, gst_amount=:gst_amount, "
+                "tax_code=:tax_code WHERE id=2"
+            ),
+            {
+                "bank_amount": bank_amount,
+                "gst_amount": gst_amount,
+                "tax_code": tax_code,
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE invoice_payment_allocations SET amount=:allocation_amount, "
+                "gst_amount=:gst_amount WHERE id=22"
+            ),
+            {"allocation_amount": allocation_amount, "gst_amount": gst_amount},
+        )
+        connection.execute(
+            text(
+                "UPDATE invoice_payment_tax_components SET tax_code=:tax_code, "
+                "gross_amount=:allocation_amount, gst_amount=:gst_amount WHERE id=222"
+            ),
+            {
+                "tax_code": tax_code,
+                "allocation_amount": allocation_amount,
+                "gst_amount": gst_amount,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO accounts (id, code, name, type, is_gst, active) "
+                "VALUES (3, '2200', 'Synthetic customer deposits', 'LIABILITY', 0, 1)"
+            )
+        )
+    with Session(engine) as session:
+        baseline = capture_legacy_allocation_baseline(
+            session, 2, datetime(2026, 10, 12, 9)
+        )
+        assert baseline.status == "complete"
+        session.commit()
+    return engine, baseline.baseline_event_id
+
+
+def _standard_writer_request(baseline_id, *, idempotency_key="replay-key"):
+    from app.services.allocation_batches import AllocationLineSpec
+
+    return {
+        "bank_transaction_id": 2,
+        "effective_date": "2026-10-01",
+        "recorded_at": "2026-10-12 10:00:00",
+        "idempotency_key": idempotency_key,
+        "reason": "Synthetic exact cash conversion test",
+        "evidence_reference": "synthetic://exact-cash",
+        "actor_placeholder": "Synthetic operator",
+        "expected_prior_version": 0,
+        "lines": [AllocationLineSpec("invoice", 2, 1000, 100, (("standard", 1000, 100),))],
+        "residual_cents": 100,
+        "residual_account_id": 3,
+        "baseline_finalization_id": baseline_id,
+        "books_locked_through": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("bank_amount", "allocation_amount", "gst_amount", "tax_code", "residual_cents", "expected_cash_cents"),
+    (
+        ("11.00", "10.00", "1.00", "standard", 100, 1100),
+        ("0.29", "0.29", "0", "none", 0, 29),
+        ("1", "1", "0", "none", 0, 100),
+        ("1.2", "1.2", "0", "none", 0, 120),
+        ("1.20", "1.20", "0", "none", 0, 120),
+        ("999999.99", "999999.99", "0", "none", 0, 99999999),
+    ),
+)
+def test_batch_writer_converts_bank_cash_to_exact_cents(
+    tmp_path,
+    bank_amount,
+    allocation_amount,
+    gst_amount,
+    tax_code,
+    residual_cents,
+    expected_cash_cents,
+):
+    from inspect import getsource
+    from unittest.mock import patch
+
+    from app.services import allocation_batches
+    from app.services.allocation_batches import (
+        AllocationLineSpec,
+        _batch_payload,
+        _hash_payload,
+        _payload_rows,
+        parse_exact_money,
+        write_allocation_correction,
+    )
+
+    assert "int(bank_transaction.amount)" not in getsource(allocation_batches)
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / f"cash-{expected_cash_cents}.db",
+        bank_amount=bank_amount,
+        allocation_amount=allocation_amount,
+        gst_amount=gst_amount,
+        tax_code=tax_code,
+    )
+    allocation_gross_cents = parse_exact_money(allocation_amount)
+    allocation_gst_cents = parse_exact_money(gst_amount)
+    line = AllocationLineSpec(
+        "invoice",
+        2,
+        allocation_gross_cents,
+        allocation_gst_cents,
+        ((tax_code, allocation_gross_cents, allocation_gst_cents),),
+    )
+    writer_args = {
+        "bank_transaction_id": 2,
+        "effective_date": "2026-10-01",
+        "recorded_at": "2026-10-12 10:00:00",
+        "idempotency_key": f"exact-cash-{expected_cash_cents}",
+        "reason": "Synthetic exact cash conversion test",
+        "evidence_reference": "synthetic://exact-cash",
+        "actor_placeholder": "Synthetic operator",
+        "expected_prior_version": 0,
+        "lines": [line],
+        "residual_cents": residual_cents,
+        "residual_account_id": 3 if residual_cents else None,
+        "baseline_finalization_id": baseline_id,
+        "books_locked_through": None,
+    }
+    request_payload = _batch_payload(
+        operation="allocation_correction",
+        bank_transaction_id=2,
+        expected_prior_version=0,
+        effective_date=writer_args["effective_date"],
+        recorded_at=writer_args["recorded_at"],
+        idempotency_key=writer_args["idempotency_key"],
+        reason=writer_args["reason"],
+        evidence_reference=writer_args["evidence_reference"],
+        evidence_sha256=None,
+        actor_placeholder=writer_args["actor_placeholder"],
+        linked_prior_batch_id=None,
+        internal_correction_approval_id=None,
+        residual_cents=residual_cents,
+        residual_account_id=writer_args["residual_account_id"],
+        baseline_finalization_id=baseline_id,
+    )
+    request_hash = _hash_payload(_payload_rows(request_payload, [line]))
+    with Session(engine) as session:
+        result = write_allocation_correction(session, **writer_args)
+        assert result.bank_cash_cents == expected_cash_cents
+        assert result.manual_review_status == "not_required"
+        finalized = session.execute(
+            text(
+                "SELECT b.canonical_payload_hash, f.canonical_integrity_hash, "
+                "f.bank_cash_cents, f.total_allocated_cents, f.residual_cents, "
+                "f.component_count "
+                "FROM allocation_batches b JOIN allocation_batch_finalizations f "
+                "ON f.batch_id=b.id WHERE b.id=:batch_id"
+            ),
+            {"batch_id": result.batch_id},
+        ).one()
+        assert finalized.canonical_payload_hash == finalized.canonical_integrity_hash
+        trigger_hash = session.execute(
+            text(
+                "SELECT allocation_baseline_sha256(payload) FROM ("
+                "SELECT json_object('kind','batch','bank_transaction_id',b.bank_transaction_id,"
+                "'operation',b.operation,'transaction_version',b.transaction_version,"
+                "'expected_prior_version',b.expected_prior_version,'effective_date',b.effective_date,"
+                "'recorded_at',b.recorded_at,'idempotency_key',b.idempotency_key,'reason',b.reason,"
+                "'evidence_reference',b.evidence_reference,'evidence_sha256',b.evidence_sha256,"
+                "'actor_placeholder',b.actor_placeholder,'linked_prior_batch_id',b.linked_prior_batch_id,"
+                "'internal_correction_approval_id',b.internal_correction_approval_id,"
+                "'manual_review_status',b.manual_review_status,'residual_amount_cents',b.residual_amount_cents,"
+                "'residual_account_id',b.residual_account_id,'baseline_finalization_id',"
+                "b.baseline_finalization_id) AS payload FROM allocation_batches b WHERE b.id=:batch_id "
+                "UNION ALL SELECT json_object('kind','line','line_order',l.line_order,"
+                "'source_kind',l.source_kind,'invoice_or_bill_id',l.invoice_or_bill_id,"
+                "'gross_cents',l.gross_cents,'gst_cents',l.gst_cents) "
+                "FROM allocation_batch_lines l WHERE l.batch_id=:batch_id "
+                "UNION ALL SELECT json_object('kind','component','line_order',l.line_order,"
+                "'tax_code',c.tax_code,'gross_cents',c.gross_cents,'gst_cents',c.gst_cents) "
+                "FROM allocation_batch_lines l JOIN allocation_batch_tax_components c "
+                "ON c.allocation_batch_line_id=l.id WHERE l.batch_id=:batch_id)"
+            ),
+            {"batch_id": result.batch_id},
+        ).scalar_one()
+        assert finalized.canonical_integrity_hash == trigger_hash
+        assert request_hash != finalized.canonical_integrity_hash
+        assert finalized.bank_cash_cents == expected_cash_cents
+        assert finalized.total_allocated_cents + finalized.residual_cents == expected_cash_cents
+        assert finalized.component_count == 1
+        assert session.execute(
+            text("SELECT idempotency_key FROM allocation_batches WHERE id=:batch_id"),
+            {"batch_id": result.batch_id},
+        ).scalar_one() == writer_args["idempotency_key"]
+        session.commit()
+
+    with Session(engine) as session:
+        cache_before_replay = session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one()
+        artifact_counts_before_replay = session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batches WHERE bank_transaction_id=2), "
+                "(SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one()
+    with Session(engine) as session:
+        assert session.execute(
+            text("SELECT id FROM allocation_batches WHERE idempotency_key=:key"),
+            {"key": writer_args["idempotency_key"]},
+        ).scalar_one() == result.batch_id
+    with Session(engine) as session:
+        from app.services import allocation_batches
+
+        owner_rows = []
+        original_lookup = allocation_batches._existing_idempotency_batch
+
+        def lookup_owner(db, key):
+            owner = original_lookup(db, key)
+            owner_rows.append(owner)
+            return owner
+
+        with patch.object(allocation_batches, "_existing_idempotency_batch", side_effect=lookup_owner):
+            with patch.object(
+                allocation_batches,
+                "_validate_priors",
+                side_effect=AssertionError("exact replay must bypass stale-version validation"),
+            ):
+                replay = write_allocation_correction(session, **writer_args)
+        assert len(owner_rows) == 1
+        assert owner_rows[0]["id"] == result.batch_id
+        assert replay.batch_id == result.batch_id
+        assert replay.operation == result.operation
+        assert replay.transaction_version == result.transaction_version
+        assert replay.expected_prior_version == result.expected_prior_version
+        assert replay.bank_transaction_id == result.bank_transaction_id == 2
+        assert replay.bank_cash_cents == expected_cash_cents
+        assert replay.manual_review_status == result.manual_review_status == "not_required"
+        assert replay.baseline_finalization_id == result.baseline_finalization_id == baseline_id
+        assert replay.finalization_integrity_hash == result.finalization_integrity_hash
+        assert session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batches WHERE bank_transaction_id=2), "
+                "(SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one() == artifact_counts_before_replay
+        assert session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one() == cache_before_replay
+        session.rollback()
+    engine.dispose()
+
+
+def test_batch_writer_rejects_subcent_stored_bank_cash_before_writes(tmp_path):
+    from app.services.allocation_batches import (
+        AllocationLineSpec,
+        InvalidExactMoneyInputError,
+        write_allocation_correction,
+    )
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / "cash-subcent.db",
+        bank_amount="11.005",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    line = AllocationLineSpec("invoice", 2, 1000, 100, (("standard", 1000, 100),))
+    with Session(engine) as session:
+        before_cache = session.execute(
+            text("SELECT paid_amount, paid_date, status FROM invoices WHERE id=2")
+        ).one()
+        before_allocations = session.execute(
+            text(
+                "SELECT id, bank_transaction_id, invoice_id, amount, gst_amount, created_at "
+                "FROM invoice_payment_allocations "
+                "WHERE bank_transaction_id=2 ORDER BY id"
+            )
+        ).all()
+        before_components = session.execute(
+            text(
+                "SELECT c.id, c.allocation_id, c.tax_code, c.gross_amount, c.gst_amount "
+                "FROM invoice_payment_tax_components c "
+                "JOIN invoice_payment_allocations a ON a.id=c.allocation_id "
+                "WHERE a.bank_transaction_id=2 ORDER BY c.id"
+            )
+        ).all()
+        before_transaction = session.execute(
+            text("SELECT amount, direction, occurred_at FROM bank_transactions WHERE id=2")
+        ).one()
+    with Session(engine) as session:
+        with pytest.raises(InvalidExactMoneyInputError, match="exact to the cent"):
+            write_allocation_correction(
+                session,
+                bank_transaction_id=2,
+                effective_date="2026-10-01",
+                recorded_at="2026-10-12 10:00:00",
+                idempotency_key="invalid-subcent-cash",
+                reason="Synthetic invalid stored cash test",
+                evidence_reference="synthetic://invalid-cash",
+                actor_placeholder="Synthetic operator",
+                expected_prior_version=0,
+                lines=[line],
+                residual_cents=100,
+                residual_account_id=3,
+                baseline_finalization_id=baseline_id,
+                books_locked_through=None,
+            )
+        assert not session.in_transaction()
+        session.commit()
+
+    with Session(engine) as session:
+        assert session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batches), "
+                "(SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one() == (0, 0, 0, 0)
+        assert session.execute(
+            text("SELECT paid_amount, paid_date, status FROM invoices WHERE id=2")
+        ).one() == before_cache
+        assert session.execute(
+            text(
+                "SELECT id, bank_transaction_id, invoice_id, amount, gst_amount, created_at "
+                "FROM invoice_payment_allocations "
+                "WHERE bank_transaction_id=2 ORDER BY id"
+            )
+        ).all() == before_allocations
+        assert session.execute(
+            text(
+                "SELECT c.id, c.allocation_id, c.tax_code, c.gross_amount, c.gst_amount "
+                "FROM invoice_payment_tax_components c "
+                "JOIN invoice_payment_allocations a ON a.id=c.allocation_id "
+                "WHERE a.bank_transaction_id=2 ORDER BY c.id"
+            )
+        ).all() == before_components
+        assert session.execute(
+            text("SELECT amount, direction, occurred_at FROM bank_transactions WHERE id=2")
+        ).one() == before_transaction
+        assert session.execute(
+            text("SELECT CAST(amount AS TEXT) FROM bank_transactions WHERE id=2")
+        ).scalar_one() == "11.005"
+    engine.dispose()
 
 
 def _batch_payload_rows(
@@ -1187,7 +1595,8 @@ def test_allocation_batch_rejects_missing_incomplete_and_cross_transaction_basel
     incomplete_engine.dispose()
 
 
-def test_allocation_batch_correction_reversal_and_reallocation_sequence(tmp_path):
+def test_allocation_batch_schema_sequence_allows_direct_sql_states(tmp_path):
+    """Direct-SQL trigger coverage; not public writer coverage."""
     engine, baseline_id = _allocation_batch_database(tmp_path / "batch-operations.db")
     line = _standard_batch_line()
     with pytest.raises(IntegrityError):
@@ -1380,9 +1789,10 @@ def test_allocation_batch_correction_reversal_and_reallocation_sequence(tmp_path
     ("link_reversal", "finalized", "effective_date"),
     [(False, True, "2026-10-03"), (True, False, "2026-10-03"), (True, True, "2026-10-02")],
 )
-def test_allocation_batch_reallocation_requires_later_finalized_reversal(
+def test_allocation_batch_schema_reallocation_requires_later_finalized_reversal(
     tmp_path, link_reversal, finalized, effective_date
 ):
+    """Direct-SQL schema trigger coverage, not a public writer workflow."""
     engine, baseline_id = _allocation_batch_database(
         tmp_path / f"batch-reallocation-gate-{link_reversal}-{finalized}-{effective_date}.db"
     )
@@ -1570,7 +1980,8 @@ def _insert_batch_correction_approval(connection, marker_id, idempotency_key):
     ), {"marker_id": marker_id, "key": idempotency_key}).scalar_one()
 
 
-def test_allocation_batch_lodged_correction_requires_transaction_approval(tmp_path):
+def test_allocation_batch_schema_lodged_correction_requires_transaction_approval(tmp_path):
+    """Direct-SQL schema coverage; the public writer has no approval path."""
     engine, baseline_id = _allocation_batch_database(tmp_path / "batch-correction-marker.db")
     with engine.begin() as connection:
         marker_id = _insert_batch_lodgment_marker(connection)
@@ -1607,7 +2018,8 @@ def test_allocation_batch_lodged_correction_requires_transaction_approval(tmp_pa
     engine.dispose()
 
 
-def test_allocation_batch_reversal_inside_marker_ignores_correction_approval(tmp_path):
+def test_allocation_batch_schema_reversal_inside_marker_ignores_correction_approval(tmp_path):
+    """Direct-SQL schema trigger coverage only."""
     engine, baseline_id = _allocation_batch_database(tmp_path / "batch-reversal-marker.db")
     with engine.begin() as connection:
         marker_id = _insert_batch_lodgment_marker(connection)
@@ -2652,4 +3064,1153 @@ def test_baseline_capture_serializes_with_allocation_import_and_delete(
         assert connection.execute(text(
             "SELECT COUNT(*) FROM bank_transactions"
         )).scalar_one() == (3 if mutation_kind == "import_new" else 2)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "bank_transaction_id",
+        "operation_reversal",
+        "operation_reallocation",
+        "effective_date",
+        "recorded_at",
+        "expected_prior_version",
+        "reason",
+        "evidence_reference",
+        "evidence_sha256",
+        "actor_placeholder",
+        "linked_prior_batch_id",
+        "allocation_line",
+        "tax_components",
+        "residual_cents",
+        "residual_account_id",
+        "baseline_finalization_id",
+    ),
+)
+def test_batch_writer_conflicting_replay_intent_is_not_stale(tmp_path, mutation):
+    from app.services.allocation_batches import (
+        AllocationLineSpec,
+        IdempotencyConflictError,
+        write_allocation_correction,
+        write_allocation_reallocation,
+        write_allocation_reversal,
+    )
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / f"conflict-{mutation}.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    request = _standard_writer_request(baseline_id, idempotency_key=f"conflict-{mutation}")
+    with Session(engine) as session:
+        write_allocation_correction(session, **request)
+        session.commit()
+
+    changed = dict(request)
+    writer = write_allocation_correction
+    if mutation == "bank_transaction_id":
+        changed["bank_transaction_id"] = 1
+    elif mutation == "operation_reversal":
+        writer = write_allocation_reversal
+    elif mutation == "operation_reallocation":
+        writer = write_allocation_reallocation
+    elif mutation == "effective_date":
+        changed["effective_date"] = "2026-10-02"
+    elif mutation == "recorded_at":
+        changed["recorded_at"] = "2026-10-12T10:00:00.000001"
+    elif mutation == "expected_prior_version":
+        changed["expected_prior_version"] = 1
+    elif mutation == "reason":
+        changed["reason"] += " changed"
+    elif mutation == "evidence_reference":
+        changed["evidence_reference"] += "/changed"
+    elif mutation == "evidence_sha256":
+        changed["evidence_sha256"] = "a" * 64
+    elif mutation == "actor_placeholder":
+        changed["actor_placeholder"] += " changed"
+    elif mutation == "linked_prior_batch_id":
+        changed["linked_prior_batch_id"] = 10
+    elif mutation == "allocation_line":
+        changed["lines"] = [AllocationLineSpec("invoice", 2, 900, 90, (("standard", 900, 90),))]
+    elif mutation == "tax_components":
+        changed["lines"] = [AllocationLineSpec(
+            "invoice", 2, 1000, 100, (("none", 100, 10), ("standard", 900, 90))
+        )]
+    elif mutation == "residual_cents":
+        changed["residual_cents"] = 99
+    elif mutation == "residual_account_id":
+        changed["residual_account_id"] = None
+    elif mutation == "baseline_finalization_id":
+        changed["baseline_finalization_id"] += 1
+
+    with Session(engine) as session:
+        with pytest.raises(IdempotencyConflictError):
+            writer(session, **changed)
+        session.rollback()
+    with Session(engine) as session:
+        assert session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batches WHERE bank_transaction_id=2), "
+                "(SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one() == (1, 1, 1, 1)
+    engine.dispose()
+
+
+def test_batch_writer_new_stale_key_still_raises_stale_version(tmp_path):
+    from app.services.allocation_batches import StaleVersionError, write_allocation_correction
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / "stale-new-key.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    request = _standard_writer_request(baseline_id, idempotency_key="first-correction")
+    with Session(engine) as session:
+        write_allocation_correction(session, **request)
+        session.commit()
+
+    stale_request = {**request, "idempotency_key": "different-new-key"}
+    with Session(engine) as session:
+        with pytest.raises(StaleVersionError):
+            write_allocation_correction(session, **stale_request)
+        session.rollback()
+    with Session(engine) as session:
+        assert session.execute(
+            text("SELECT COUNT(*) FROM allocation_batches WHERE bank_transaction_id=2")
+        ).scalar_one() == 1
+    engine.dispose()
+
+
+def test_batch_writer_does_not_replay_unfinalized_idempotency_owner(tmp_path):
+    from app.services.allocation_batches import (
+        AllocationLineSpec,
+        InvalidAllocationStateError,
+        write_allocation_correction,
+    )
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / "unfinalized-replay.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    line = {
+        "source_kind": "invoice",
+        "invoice_or_bill_id": 2,
+        "gross_cents": 1000,
+        "gst_cents": 100,
+        "components": [{"tax_code": "standard", "gross_cents": 1000, "gst_cents": 100}],
+    }
+    with engine.begin() as connection:
+        batch_id = _insert_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key="unfinalized-owner",
+            residual_cents=100,
+            residual_account_id=3,
+            line=line,
+        )
+        _insert_allocation_batch_line(connection, batch_id, line)
+
+    request = _standard_writer_request(baseline_id, idempotency_key="unfinalized-owner")
+    request.update({
+        "reason": "Synthetic transaction-wide allocation change",
+        "evidence_reference": "synthetic://allocation-batch",
+        "recorded_at": "2026-10-12 11:00:00",
+        "lines": [AllocationLineSpec("invoice", 2, 1000, 100, (("standard", 1000, 100),))],
+    })
+    with Session(engine) as session:
+        with pytest.raises(InvalidAllocationStateError, match="not finalized"):
+            write_allocation_correction(session, **request)
+        session.rollback()
+    with Session(engine) as session:
+        assert session.execute(
+            text("SELECT COUNT(*) FROM allocation_batches WHERE idempotency_key='unfinalized-owner'")
+        ).scalar_one() == 1
+        assert session.execute(
+            text("SELECT COUNT(*) FROM allocation_batch_finalizations")
+        ).scalar_one() == 0
+    engine.dispose()
+
+
+def test_batch_writer_rejects_inconsistent_finalization_on_replay(tmp_path):
+    from unittest.mock import patch
+
+    from app.services.allocation_batches import InvalidAllocationStateError, write_allocation_correction
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / "inconsistent-replay.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    request = _standard_writer_request(baseline_id, idempotency_key="inconsistent-owner")
+    with Session(engine) as session:
+        write_allocation_correction(session, **request)
+        session.commit()
+    with Session(engine) as session:
+        with patch("app.services.allocation_batches._finalization_integrity_hash", return_value="f" * 64):
+            with pytest.raises(InvalidAllocationStateError, match="inconsistent"):
+                write_allocation_correction(session, **request)
+        session.rollback()
+    with Session(engine) as session:
+        assert session.execute(
+            text("SELECT COUNT(*) FROM allocation_batches WHERE idempotency_key='inconsistent-owner'")
+        ).scalar_one() == 1
+    engine.dispose()
+
+
+def test_batch_writer_serializes_concurrent_identical_retries(tmp_path, monkeypatch):
+    import app.services.allocation_batches as batches
+    from app.services.allocation_batches import write_allocation_correction
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / "concurrent-replay.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    request = _standard_writer_request(baseline_id, idempotency_key="concurrent-replay")
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE invoices SET status='authorised', paid_amount=0, paid_date=NULL WHERE id=2")
+        )
+    first_acquired = threading.Event()
+    second_at_boundary = threading.Event()
+    second_acquired = threading.Event()
+    release_first = threading.Event()
+    begin_calls = []
+    insert_calls = []
+    original_begin = batches.begin_sqlite_immediate
+    original_insert = batches._insert_batch_rows
+    original_replay = batches._replay_existing_batch
+    replay_calls = []
+
+    def coordinated_begin(session):
+        if session.info.get("writer_begin_seen"):
+            return original_begin(session)
+        session.info["writer_begin_seen"] = True
+        label = session.info["writer_race_label"]
+        begin_calls.append(label)
+        if label == "second":
+            second_at_boundary.set()
+        original_begin(session)
+        if label == "first":
+            first_acquired.set()
+            if not release_first.wait(timeout=5):
+                raise AssertionError("first writer did not release its immediate lock")
+        else:
+            second_acquired.set()
+
+    def count_insert(*args, **kwargs):
+        insert_calls.append(True)
+        return original_insert(*args, **kwargs)
+
+    def count_replay(*args, **kwargs):
+        replay_calls.append(True)
+        return original_replay(*args, **kwargs)
+
+    monkeypatch.setattr(batches, "begin_sqlite_immediate", coordinated_begin)
+    monkeypatch.setattr(batches, "_insert_batch_rows", count_insert)
+    monkeypatch.setattr(batches, "_replay_existing_batch", count_replay)
+
+    def write_same_request(label):
+        with Session(engine) as session:
+            session.info["writer_race_label"] = label
+            result = write_allocation_correction(session, **request)
+            session.commit()
+            return result
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(write_same_request, "first")
+        assert first_acquired.wait(timeout=5), "first writer did not acquire BEGIN IMMEDIATE"
+        second_future = pool.submit(write_same_request, "second")
+        try:
+            assert second_at_boundary.wait(timeout=5), "second writer did not reach BEGIN IMMEDIATE"
+            assert not second_acquired.wait(timeout=0.25), (
+                "second writer acquired BEGIN IMMEDIATE while first still held it"
+            )
+        finally:
+            release_first.set()
+        first = first_future.result(timeout=10)
+        second = second_future.result(timeout=10)
+    assert first == second
+    assert set(begin_calls) == {"first", "second"}
+    assert len(insert_calls) == 1
+    assert len(replay_calls) == 1
+    with Session(engine) as session:
+        assert session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batches WHERE bank_transaction_id=2), "
+                "(SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one() == (1, 1, 1, 1)
+        assert session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one() == (10, "partial", "2026-10-01")
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("operation", "writer_name"),
+    (
+        ("allocation_correction", "write_allocation_correction"),
+        ("allocation_reversal", "write_allocation_reversal"),
+        ("allocation_reallocation", "write_allocation_reallocation"),
+    ),
+)
+def test_allocation_writers_enforce_detached_period_lock_context(
+    tmp_path, operation, writer_name
+):
+    from inspect import signature
+
+    import app.services.allocation_batches as batches
+    from app.services.allocation_batches import (
+        InvalidAllocationStateError,
+        PeriodLockedError,
+    )
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / f"period-lock-{operation}.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    writer = getattr(batches, writer_name)
+    request = _standard_writer_request(baseline_id, idempotency_key=f"lock-{operation}")
+    assert "before_vector" not in signature(writer).parameters
+    assert "internal_correction_approval_id" not in signature(writer).parameters
+    cache_before = (Decimal("0"), "draft", None)
+    with Session(engine) as session:
+        cache_before = session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one()
+        missing_context = dict(request)
+        missing_context.pop("books_locked_through")
+        with pytest.raises(InvalidAllocationStateError, match="books_locked_through"):
+            writer(session, **missing_context)
+        session.commit()
+
+    locked_request = {
+        **request,
+        "books_locked_through": date(2026, 10, 1),
+    }
+    if operation == "allocation_correction":
+        assert "internal_correction_approval_id" not in signature(writer).parameters
+    with Session(engine) as session:
+        with pytest.raises(PeriodLockedError):
+            writer(session, **locked_request)
+        session.commit()
+
+    with Session(engine) as session:
+        assert session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batches), "
+                "(SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one() == (0, 0, 0, 0)
+        assert session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one() == cache_before
+
+    open_request = {
+        **request,
+        "books_locked_through": date(2026, 9, 30),
+    }
+    if operation == "allocation_correction":
+        with Session(engine) as session:
+            result = writer(session, **open_request)
+            assert result.manual_review_status == "not_required"
+            session.rollback()
+    engine.dispose()
+
+
+def test_legacy_current_projection_never_claims_historical_certainty(tmp_path):
+    from app.services.allocation_projection import project_allocation_state
+
+    engine = _database(tmp_path / "legacy-current-certainty.db")
+    with Session(engine) as session:
+        current = project_allocation_state(
+            session, 2, date(2026, 10, 1), date(2026, 10, 12)
+        )
+        assert current.source == "legacy_current"
+        assert current.certainty == "uncertain"
+        assert current.uncertainty_reason == "historical_evidence_unavailable"
+        assert current.ordered_allocation_lines
+
+    with Session(engine) as session:
+        before_effective = project_allocation_state(
+            session, 2, date(2026, 9, 30), date(2026, 10, 12)
+        )
+        assert before_effective.source == "uncertain"
+        assert before_effective.certainty == "uncertain"
+        assert before_effective.uncertainty_reason == "historical_evidence_unavailable"
+        assert before_effective.ordered_allocation_lines == ()
+
+    with Session(engine) as session:
+        before_knowledge = project_allocation_state(
+            session, 2, date(2026, 10, 1), date(2026, 9, 30)
+        )
+        assert before_knowledge.source == "uncertain"
+        assert before_knowledge.certainty == "uncertain"
+        assert before_knowledge.uncertainty_reason == "historical_evidence_unavailable"
+        assert before_knowledge.ordered_allocation_lines == ()
+    engine.dispose()
+
+
+def test_batch_cache_projects_removed_and_added_ar_and_ap_documents(tmp_path):
+    from app.services.allocation_batches import (
+        AllocationLineSpec,
+        write_allocation_correction,
+    )
+
+    engine = _database(tmp_path / "projected-cache-ar-ap.db")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE invoices SET status='authorised', paid_amount=0, paid_date=NULL "
+                "WHERE id IN (1, 2)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO invoices (id, direction, contact_id, invoice_number, issue_date, "
+                "currency, subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+                "source, created_at, updated_at) VALUES "
+                "(3, 'AR', 1, 'SYN-AR-NEW', '2026-09-01', 'AUD', 10, 1, 11, 1, "
+                "'authorised', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+                "(4, 'AP', 1, 'SYN-AP-NEW', '2026-09-01', 'AUD', 10, 1, 11, 1, "
+                "'authorised', 0, 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+    with Session(engine) as session:
+        ap_baseline = capture_legacy_allocation_baseline(
+            session, 1, datetime(2026, 10, 12, 10)
+        )
+        ar_baseline = capture_legacy_allocation_baseline(
+            session, 2, datetime(2026, 10, 12, 10)
+        )
+        session.commit()
+
+    with Session(engine) as session:
+        original_allocations = session.execute(
+            text(
+                "SELECT id, bank_transaction_id, invoice_id, amount, gst_amount, created_at "
+                "FROM invoice_payment_allocations ORDER BY id"
+            )
+        ).all()
+        original_components = session.execute(
+            text(
+                "SELECT id, allocation_id, tax_code, gross_amount, gst_amount "
+                "FROM invoice_payment_tax_components ORDER BY id"
+            )
+        ).all()
+        original_transactions = session.execute(
+            text(
+                "SELECT id, amount, direction, occurred_at FROM bank_transactions "
+                "WHERE id IN (1, 2) ORDER BY id"
+            )
+        ).all()
+
+    requests = (
+        (1, "bill", 4, ap_baseline.baseline_event_id, "ap-replacement"),
+        (2, "invoice", 3, ar_baseline.baseline_event_id, "ar-replacement"),
+    )
+    for transaction_id, source_kind, new_document_id, baseline_id, key in requests:
+        with Session(engine) as session:
+            write_allocation_correction(
+                session,
+                bank_transaction_id=transaction_id,
+                effective_date="2026-10-01",
+                recorded_at="2026-10-13 00:00:00",
+                idempotency_key=key,
+                reason="Synthetic unchanged-vector document replacement",
+                evidence_reference="synthetic://projected-cache",
+                actor_placeholder="Synthetic operator",
+                expected_prior_version=0,
+                lines=[AllocationLineSpec(
+                    source_kind, new_document_id, 1000, 100,
+                    (("standard", 1000, 100),),
+                )],
+                residual_cents=0,
+                residual_account_id=None,
+                baseline_finalization_id=baseline_id,
+                books_locked_through=None,
+            )
+            session.commit()
+
+    with Session(engine) as session:
+        states = {
+            int(row.id): (Decimal(row.paid_amount), row.status, row.paid_date)
+            for row in session.execute(
+                text("SELECT id, paid_amount, status, paid_date FROM invoices WHERE id BETWEEN 1 AND 4")
+            )
+        }
+        assert states[1] == (Decimal("0.00"), "authorised", None)
+        assert states[2] == (Decimal("0.00"), "authorised", None)
+        assert states[3][0] == Decimal("10.00")
+        assert states[3][1] == "partial"
+        assert str(states[3][2]) == "2026-10-01"
+        assert states[4][0] == Decimal("10.00")
+        assert states[4][1] == "partial"
+        assert str(states[4][2]) == "2026-10-01"
+        assert session.execute(
+            text(
+                "SELECT id, amount, direction, occurred_at FROM bank_transactions "
+                "WHERE id IN (1, 2) ORDER BY id"
+            )
+        ).all() == original_transactions
+        assert session.execute(
+            text(
+                "SELECT id, bank_transaction_id, invoice_id, amount, gst_amount, created_at "
+                "FROM invoice_payment_allocations ORDER BY id"
+            )
+        ).all() == original_allocations
+        assert session.execute(
+            text(
+                "SELECT id, allocation_id, tax_code, gross_amount, gst_amount "
+                "FROM invoice_payment_tax_components ORDER BY id"
+            )
+        ).all() == original_components
+    engine.dispose()
+
+
+def test_batch_cache_failure_rolls_back_after_finalization_even_if_caller_commits(
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    from app.services.allocation_batches import write_allocation_correction
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / "projected-cache-rollback.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE invoices SET status='authorised', paid_amount=0, paid_date=NULL WHERE id=2")
+        )
+    request = _standard_writer_request(baseline_id, idempotency_key="cache-failure")
+    cache_before = (Decimal("0.00"), "authorised", None)
+    with Session(engine) as session:
+        cache_before = session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one()
+
+    with Session(engine) as session:
+        def fail_after_finalization(db, _paid_cents_by_invoice):
+            assert db.execute(
+                text("SELECT COUNT(*) FROM allocation_batch_finalizations")
+            ).scalar_one() == 1
+            raise RuntimeError("synthetic projected-cache failure")
+
+        with patch(
+            "app.services.allocation_batches.refresh_projected_paid_state_cache",
+            side_effect=fail_after_finalization,
+        ):
+            with pytest.raises(RuntimeError, match="projected-cache failure"):
+                write_allocation_correction(session, **request)
+        session.commit()
+
+    with Session(engine) as observer:
+        assert observer.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batches), "
+                "(SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one() == (0, 0, 0, 0)
+        assert observer.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one() == cache_before
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "writer_name",
+    (
+        "write_allocation_correction",
+        "write_allocation_reversal",
+        "write_allocation_reallocation",
+    ),
+)
+def test_allocation_writers_reject_changed_vectors_without_approval(
+    tmp_path, writer_name
+):
+    import app.services.allocation_batches as batches
+    from app.services.allocation_batches import (
+        AllocationLineSpec,
+        ManualReviewRequiredError,
+    )
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / f"changed-vector-{writer_name}.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    request = _standard_writer_request(baseline_id, idempotency_key=f"changed-{writer_name}")
+    request["lines"] = [
+        AllocationLineSpec("invoice", 2, 900, 90, (("standard", 900, 90),))
+    ]
+    request["residual_cents"] = 200
+    with Session(engine) as session:
+        cache_before = session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one()
+
+    writer = getattr(batches, writer_name)
+    with Session(engine) as session:
+        with pytest.raises(ManualReviewRequiredError):
+            writer(session, **request)
+        session.commit()
+
+    with Session(engine) as session:
+        assert session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batches), "
+                "(SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one() == (0, 0, 0, 0)
+        assert session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one() == cache_before
+    engine.dispose()
+
+
+def test_batch_writer_propagates_unexpected_replay_database_errors(tmp_path):
+    from unittest.mock import patch
+
+    from sqlalchemy.exc import OperationalError
+
+    from app.services.allocation_batches import write_allocation_correction
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / "replay-database-error.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    request = _standard_writer_request(baseline_id, idempotency_key="replay-database-error")
+    with Session(engine) as session:
+        write_allocation_correction(session, **request)
+        session.commit()
+
+    with Session(engine) as session:
+        with patch(
+            "app.services.allocation_batches._stored_request_payload_rows",
+            side_effect=OperationalError("SELECT", {}, RuntimeError("connection lost")),
+        ):
+            with pytest.raises(OperationalError, match="connection lost"):
+                write_allocation_correction(session, **request)
+        session.rollback()
+    engine.dispose()
+
+
+def test_batch_writer_serializes_different_keys_at_same_version(tmp_path, monkeypatch):
+    import app.services.allocation_batches as batches
+    from app.services.allocation_batches import StaleVersionError, write_allocation_correction
+
+    engine, baseline_id = _exact_bank_cash_writer_database(
+        tmp_path / "concurrent-stale-version.db",
+        bank_amount="11.00",
+        allocation_amount="10.00",
+        gst_amount="1.00",
+        tax_code="standard",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE invoices SET status='authorised', paid_amount=0, paid_date=NULL WHERE id=2")
+        )
+    requests = (
+        _standard_writer_request(baseline_id, idempotency_key="concurrent-version-first"),
+        _standard_writer_request(baseline_id, idempotency_key="concurrent-version-second"),
+    )
+    first_acquired = threading.Event()
+    second_at_boundary = threading.Event()
+    second_acquired = threading.Event()
+    release_first = threading.Event()
+    original_begin = batches.begin_sqlite_immediate
+    insert_calls = []
+    original_insert = batches._insert_batch_rows
+
+    def coordinated_begin(session):
+        if session.info.get("writer_begin_seen"):
+            return original_begin(session)
+        session.info["writer_begin_seen"] = True
+        label = session.info["writer_race_label"]
+        if label == "second":
+            second_at_boundary.set()
+        original_begin(session)
+        if label == "first":
+            first_acquired.set()
+            if not release_first.wait(timeout=5):
+                raise AssertionError("first writer did not release its immediate lock")
+        else:
+            second_acquired.set()
+
+    def count_insert(*args, **kwargs):
+        insert_calls.append(True)
+        return original_insert(*args, **kwargs)
+
+    monkeypatch.setattr(batches, "begin_sqlite_immediate", coordinated_begin)
+    monkeypatch.setattr(batches, "_insert_batch_rows", count_insert)
+
+    def write(label, request):
+        with Session(engine) as session:
+            session.info["writer_race_label"] = label
+            try:
+                result = write_allocation_correction(session, **request)
+                session.commit()
+                return "success", result
+            except StaleVersionError as exc:
+                session.rollback()
+                return "stale", str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(write, "first", requests[0])
+        assert first_acquired.wait(timeout=5), "first writer did not acquire BEGIN IMMEDIATE"
+        second_future = pool.submit(write, "second", requests[1])
+        try:
+            assert second_at_boundary.wait(timeout=5), "second writer did not reach BEGIN IMMEDIATE"
+            assert not second_acquired.wait(timeout=0.25), (
+                "second writer acquired BEGIN IMMEDIATE while first still held it"
+            )
+        finally:
+            release_first.set()
+        outcomes = (first_future.result(timeout=10), second_future.result(timeout=10))
+
+    assert [outcome[0] for outcome in outcomes] == ["success", "stale"]
+    assert "locked" not in outcomes[1][1].lower()
+    assert len(insert_calls) == 1
+    with Session(engine) as session:
+        assert session.execute(
+            text(
+                "SELECT COUNT(*), MIN(transaction_version), MAX(transaction_version) "
+                "FROM allocation_batches WHERE bank_transaction_id=2"
+            )
+        ).one() == (1, 1, 1)
+        assert session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM allocation_batch_lines), "
+                "(SELECT COUNT(*) FROM allocation_batch_tax_components), "
+                "(SELECT COUNT(*) FROM allocation_batch_finalizations)"
+            )
+        ).one() == (1, 1, 1)
+        assert session.execute(
+            text("SELECT paid_amount, status, paid_date FROM invoices WHERE id=2")
+        ).one() == (10, "partial", "2026-10-01")
+    engine.dispose()
+
+
+def test_projector_rejects_malformed_required_cutoffs(tmp_path):
+    from app.services.allocation_projection import (
+        UncertainProjectionError,
+        project_allocation_state,
+    )
+
+    engine, _baseline_id = _allocation_batch_database(
+        tmp_path / "projector-invalid-cutoffs.db"
+    )
+    valid_known = datetime(2026, 10, 12, 10)
+    valid_effective = date(2026, 10, 1)
+    invalid_cutoffs = (
+        ("not-a-date", valid_known),
+        (valid_effective, "not-a-timestamp"),
+        ("", valid_known),
+        (valid_effective, " "),
+        ("2026-02-30", valid_known),
+        (valid_effective, "2026-02-30"),
+        (object(), valid_known),
+        (valid_effective, object()),
+        (0, valid_known),
+        (valid_effective, 0),
+        (None, valid_known),
+        (valid_effective, None),
+        ("2026-10-01T00:00:00+25:00", valid_known),
+        (valid_effective, "2026-10-12T10:00:00+02:99"),
+    )
+    for effective_as_of, known_as_of in invalid_cutoffs:
+        with Session(engine) as session:
+            with pytest.raises(UncertainProjectionError):
+                project_allocation_state(
+                    session, 2, effective_as_of, known_as_of
+                )
+            session.rollback()
+    engine.dispose()
+
+
+def test_projector_normalizes_valid_naive_and_offset_cutoffs(tmp_path):
+    from datetime import timedelta
+
+    from app.services.allocation_projection import project_allocation_state
+
+    engine, _baseline_id = _allocation_batch_database(
+        tmp_path / "projector-valid-cutoffs.db"
+    )
+    effective_naive = datetime(2026, 10, 1, 0)
+    known_naive = datetime(2026, 10, 12, 10)
+    with Session(engine) as session:
+        naive_projection = project_allocation_state(
+            session, 2, effective_naive, known_naive
+        )
+        assert naive_projection.source == "complete_baseline"
+        assert naive_projection.certainty == "complete"
+
+    offset = timezone(timedelta(hours=2))
+    with Session(engine) as session:
+        offset_projection = project_allocation_state(
+            session,
+            2,
+            datetime(2026, 10, 1, 2, tzinfo=offset),
+            datetime(2026, 10, 12, 12, tzinfo=offset),
+        )
+        assert offset_projection.source == "complete_baseline"
+        assert offset_projection.certainty == "complete"
+
+    with Session(engine) as session:
+        offset_string_projection = project_allocation_state(
+            session,
+            2,
+            "2026-10-01T02:00:00+02:00",
+            "2026-10-12T12:00:00+02:00",
+        )
+        assert offset_string_projection.source == "complete_baseline"
+        assert offset_string_projection.certainty == "complete"
+
+    with Session(engine) as session:
+        before_boundary = project_allocation_state(
+            session,
+            2,
+            datetime(2026, 10, 1, 1, tzinfo=offset),
+            known_naive,
+        )
+        assert before_boundary.source == "uncertain"
+        assert before_boundary.uncertainty_reason == "pre_baseline_operation"
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        True,
+        1123.0,
+        1123.5,
+        Decimal("1123.5"),
+        "1123.5",
+        "1e3",
+        Decimal("1e3"),
+        "NaN",
+        Decimal("NaN"),
+        "Infinity",
+        Decimal("Infinity"),
+        -1,
+        Decimal("-1"),
+        "9223372036854775808",
+        "-9223372036854775809",
+        Decimal("9223372036854775808"),
+        2**63,
+        "001123",
+        "+1123",
+        "1123.0",
+        " 1123",
+        "1123 ",
+        object(),
+    ),
+)
+def test_stored_cent_validator_rejects_noncanonical_values(value):
+    from app.services.allocation_projection import (
+        UncertainProjectionError,
+        _validate_stored_cents,
+    )
+
+    with pytest.raises(UncertainProjectionError):
+        _validate_stored_cents(value, label="synthetic stored cents")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    ((1123, 1123), (Decimal("1123"), 1123), (Decimal("1123.0"), 1123), ("1123", 1123)),
+)
+def test_stored_cent_validator_preserves_canonical_integral_values(value, expected):
+    from app.services.allocation_projection import _validate_stored_cents
+
+    assert _validate_stored_cents(value, label="synthetic stored cents") == expected
+
+
+@pytest.mark.parametrize(
+    ("scope", "query_fragment", "column", "value"),
+    (
+        ("baseline", "SELECT baseline_event_id, observed_payment_date", "observed_payment_date", "2026-02-30"),
+        ("baseline", "SELECT baseline_event_id, observed_payment_date", "observed_at", "not-a-timestamp"),
+        ("batch", "SELECT b.id, b.transaction_version", "effective_date", "2026-02-30"),
+        ("batch", "SELECT b.id, b.transaction_version", "recorded_at", "not-a-timestamp"),
+        ("batch", "SELECT b.id, b.transaction_version", "finalized_at", "2026-10-12T10:00:00+25:00"),
+    ),
+)
+def test_projector_rejects_malformed_persisted_timestamps(
+    tmp_path, monkeypatch, scope, query_fragment, column, value
+):
+    from app.services.allocation_projection import (
+        UncertainProjectionError,
+        project_allocation_state,
+    )
+
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / f"projector-malformed-time-{scope}-{column}.db"
+    )
+    if scope == "batch":
+        with engine.begin() as connection:
+            batch_id = _insert_finalized_allocation_batch(
+                connection,
+                baseline_id,
+                idempotency_key="malformed-stored-time",
+                line=_standard_batch_line(),
+            )
+    else:
+        batch_id = None
+
+    with Session(engine) as session:
+        matched = _substitute_projector_read(
+            monkeypatch,
+            session,
+            query_fragment=query_fragment,
+            column=column,
+            value=value,
+        )
+        with pytest.raises(UncertainProjectionError):
+            project_allocation_state(
+                session, 2, date(2026, 10, 1), datetime(2026, 10, 13, 12)
+            )
+        assert matched()
+        session.rollback()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("scope", "name", "query_fragment", "column", "bad_value", "mapped"),
+    (
+        (
+            "baseline", "binding-gross", "FROM allocation_history_baseline_bindings b",
+            "allocated_gross_cents", "1000.5", True,
+        ),
+        (
+            "baseline", "binding-gst", "FROM allocation_history_baseline_bindings b",
+            "allocated_gst_cents", "100.5", True,
+        ),
+        (
+            "baseline", "component-gross", "SELECT tax_code, component_gross_cents",
+            "component_gross_cents", "1000.5", False,
+        ),
+        (
+            "baseline", "component-gst", "SELECT tax_code, component_gross_cents",
+            "component_gst_cents", "100.5", False,
+        ),
+        (
+            "baseline", "finalization-gross", "SELECT baseline_event_id, observed_payment_date",
+            "gross_allocation_total_cents", "1000.5", True,
+        ),
+        (
+            "baseline", "finalization-gst", "SELECT baseline_event_id, observed_payment_date",
+            "gst_total_cents", "100.5", True,
+        ),
+        (
+            "batch", "line-gross", "FROM allocation_batch_lines l",
+            "gross_cents", "1000.5", True,
+        ),
+        (
+            "batch", "line-gst", "FROM allocation_batch_lines l",
+            "gst_cents", "100.5", True,
+        ),
+        (
+            "batch", "component-gross", "FROM allocation_batch_lines l",
+            "component_gross_cents", "1000.5", True,
+        ),
+        (
+            "batch", "component-gst", "FROM allocation_batch_lines l",
+            "component_gst_cents", "100.5", True,
+        ),
+        (
+            "batch", "residual-amount", "SELECT b.id, b.transaction_version",
+            "residual_amount_cents", "200.5", True,
+        ),
+        (
+            "batch", "finalization-gross", "SELECT b.id, b.transaction_version",
+            "total_allocated_cents", "1000.5", True,
+        ),
+        (
+            "batch", "finalization-gst", "SELECT b.id, b.transaction_version",
+            "total_gst_cents", "100.5", True,
+        ),
+        (
+            "batch", "finalization-residual", "SELECT b.id, b.transaction_version",
+            "finalized_residual_cents", "200.5", True,
+        ),
+        (
+            "batch", "finalization-bank-cash", "SELECT b.id, b.transaction_version",
+            "bank_cash_cents", "1200.5", True,
+        ),
+    ),
+)
+def test_projector_rejects_fractional_stored_cent_sources(
+    tmp_path, monkeypatch, scope, name, query_fragment, column, bad_value, mapped
+):
+    from app.services.allocation_projection import (
+        UncertainProjectionError,
+        project_allocation_state,
+    )
+
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / f"projector-fractional-cents-{scope}-{name}.db"
+    )
+    if scope == "batch":
+        with engine.begin() as connection:
+            stored_id = _insert_finalized_allocation_batch(
+                connection,
+                baseline_id,
+                idempotency_key=f"fractional-{name}",
+                line=_standard_batch_line(),
+            )
+    else:
+        stored_id = baseline_id
+
+    with Session(engine) as session:
+        matched = _substitute_projector_read(
+            monkeypatch,
+            session,
+            query_fragment=query_fragment,
+            column=column,
+            value=bad_value,
+            mapped=mapped,
+        )
+        with pytest.raises(UncertainProjectionError):
+            project_allocation_state(
+                session, 2, date(2026, 10, 1), datetime(2026, 10, 13, 12)
+            )
+        assert matched()
+        session.rollback()
+    engine.dispose()
+
+
+def test_projector_does_not_hide_malformed_future_batch_cents_behind_baseline(
+    tmp_path, monkeypatch
+):
+    from app.services.allocation_projection import (
+        UncertainProjectionError,
+        project_allocation_state,
+    )
+
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / "projector-future-malformed-cent.db"
+    )
+    with engine.begin() as connection:
+        batch_id = _insert_finalized_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key="future-malformed-cent",
+            line=_standard_batch_line(),
+        )
+
+    with Session(engine) as session:
+        matched = _substitute_projector_read(
+            monkeypatch,
+            session,
+            query_fragment="FROM allocation_batch_lines l",
+            column="component_gross_cents",
+            value="1000.5",
+        )
+        with pytest.raises(UncertainProjectionError):
+            project_allocation_state(
+                session, 2, date(2026, 10, 1), datetime(2026, 10, 12, 10, 30)
+            )
+        assert matched()
+        session.rollback()
+    engine.dispose()
+
+
+def test_projector_rejects_malformed_unfinalized_batch_timestamp(tmp_path, monkeypatch):
+    from app.services.allocation_projection import (
+        UncertainProjectionError,
+        project_allocation_state,
+    )
+
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / "projector-unfinalized-malformed-time.db"
+    )
+    with engine.begin() as connection:
+        batch_id = _insert_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key="unfinalized-malformed-time",
+        )
+
+    with Session(engine) as session:
+        matched = _substitute_projector_read(
+            monkeypatch,
+            session,
+            query_fragment="SELECT b.id, b.transaction_version",
+            column="recorded_at",
+            value="not-a-timestamp",
+        )
+        with pytest.raises(UncertainProjectionError):
+            project_allocation_state(
+                session, 2, date(2026, 10, 1), datetime(2026, 10, 13, 12)
+            )
+        assert matched()
+        session.rollback()
+    engine.dispose()
+
+
+def test_projector_test_fixtures_preserve_append_only_database_guards(tmp_path):
+    engine, baseline_id = _allocation_batch_database(
+        tmp_path / "projector-append-only-guards.db"
+    )
+    with engine.begin() as connection:
+        batch_id = _insert_finalized_allocation_batch(
+            connection,
+            baseline_id,
+            idempotency_key="append-only-projector-guard",
+            line=_standard_batch_line(),
+        )
+
+    with pytest.raises(IntegrityError, match="Allocation history is append-only"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE allocation_history_baseline_bindings "
+                    "SET allocated_gross_cents=999.5 WHERE baseline_event_id=:id"
+                ),
+                {"id": baseline_id},
+            )
+
+    with pytest.raises(IntegrityError, match="Allocation batches are append-only"):
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE allocation_batches SET reason='mutated' WHERE id=:id"),
+                {"id": batch_id},
+            )
     engine.dispose()
