@@ -383,6 +383,33 @@ def test_wrong_named_indexes_and_missing_ordinary_index_are_repaired(tmp_path):
         **MIGRATION_INDEX_SIGNATURES,
     }
     with engine.connect() as conn:
+        company_tables = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+        }
+        assert not {
+            "authenticated_subjects",
+            "company_memberships",
+            "company_capability_grants",
+        } & company_tables
+        company_triggers = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='trigger'")
+            )
+        }
+        assert not any(
+            name.startswith(
+                (
+                    "authenticated_subjects_",
+                    "company_memberships_",
+                    "company_capability_grants_",
+                )
+            )
+            for name in company_triggers
+        )
         for table, signatures in expected.items():
             for signature in signatures:
                 assert sqlite_index_matches(conn, table, signature)
