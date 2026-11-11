@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session
 
 from ...deps import PathId, get_company_db, get_current_company
 from ...models.company import (
+    Account,
+    AccountType,
     Attachment,
     Contact,
     Invoice,
@@ -28,6 +30,7 @@ from ...schemas.invoice import (
     ExcelImportPayload,
     InvoiceCreate,
     InvoiceOut,
+    InvoicePostOut,
     InvoiceUpdate,
     PdfUploadResult,
     SpreadsheetPreview,
@@ -40,7 +43,13 @@ from ...services import (
     invoice_posting,
     period_lock,
 )
-from ...services.invoice_math import GstMathError, check_gst_math, check_invoice_lines
+from ...services.invoice_math import (
+    GstMathError,
+    check_explicit_invoice_lines,
+    check_gst_math,
+    check_invoice_lines,
+    check_legacy_invoice_lines,
+)
 from ...services.journal import JournalError
 from ...utils.http import safe_filename
 from .contacts import get_or_create_contact
@@ -81,9 +90,45 @@ def _check_gst_math(subtotal: Decimal, gst_amount: Decimal, total: Decimal) -> N
 
 def _check_line_math(subtotal: Decimal, gst_amount: Decimal, total: Decimal, lines) -> None:
     try:
-        check_invoice_lines(subtotal, gst_amount, total, lines)
+        check_legacy_invoice_lines(subtotal, gst_amount, total, lines)
     except GstMathError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+def _check_explicit_invoice_math(
+    subtotal: Decimal,
+    gst_amount: Decimal,
+    total: Decimal,
+    lines,
+    *,
+    amount_mode: str,
+) -> None:
+    try:
+        check_explicit_invoice_lines(
+            subtotal,
+            gst_amount,
+            total,
+            lines,
+            amount_mode=amount_mode,
+        )
+    except GstMathError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _validate_capital_line_accounts(db: Session, direction: str, lines) -> None:
+    for index, line in enumerate(lines or [], start=1):
+        if line.tax_code != "capital":
+            continue
+        account = db.get(Account, line.account_id) if line.account_id is not None else None
+        try:
+            is_asset = account is not None and AccountType(account.type) == AccountType.ASSET
+        except ValueError:
+            is_asset = False
+        if direction != "AP" or account is None or not account.active or not is_asset:
+            raise HTTPException(
+                422,
+                f"Invoice line {index}: Capital treatment requires an active AP asset account.",
+            )
 
 
 def _ensure_invoice_gst_allowed(
@@ -192,7 +237,7 @@ def _serialize(inv: Invoice) -> dict:
         "id": inv.id,
         "direction": inv.direction,
         "contact_id": inv.contact_id,
-        "contact_name": inv.contact.name if inv.contact else None,
+        "contact_name": inv.contact_name_snapshot,
         "invoice_number": inv.invoice_number,
         "issue_date": inv.issue_date,
         "due_date": inv.due_date,
@@ -203,6 +248,27 @@ def _serialize(inv: Invoice) -> dict:
         "gst_inclusive": inv.gst_inclusive,
         "status": inv.status,
         "paid_amount": inv.paid_amount,
+        "credit_applied_amount": sum(
+            (
+                application.amount
+                for application in inv.credit_applications
+                if application.status == "active"
+            ),
+            Decimal("0"),
+        ),
+        "outstanding_amount": max(
+            Decimal("0"),
+            Decimal(inv.total)
+            - Decimal(inv.paid_amount or 0)
+            - sum(
+                (
+                    application.amount
+                    for application in inv.credit_applications
+                    if application.status == "active"
+                ),
+                Decimal("0"),
+            ),
+        ),
         "paid_date": inv.paid_date,
         "authorised_at": inv.authorised_at,
         "notes": inv.notes,
@@ -299,6 +365,16 @@ def _source_ref_collision_message(source, source_ref: str, existing: Invoice) ->
     )
 
 
+def _contact_snapshot_values(contact: Contact) -> dict[str, str | None]:
+    return {
+        "contact_name_snapshot": contact.name,
+        "contact_abn_snapshot": contact.abn,
+        "contact_address_snapshot": contact.address,
+        "contact_email_snapshot": contact.email,
+        "contact_phone_snapshot": contact.phone,
+    }
+
+
 @router.post("", response_model=InvoiceOut, status_code=201)
 def create_invoice(
     payload: InvoiceCreate,
@@ -315,19 +391,45 @@ def create_invoice(
             "An invoice cannot be created as partial, paid, or void. Create/post "
             "it first, then record settlement through the bank control account.",
         )
-    _ensure_invoice_gst_allowed(
-        company,
-        gst_amount=payload.gst_amount,
-        lines=payload.lines,
-        context="Invoice",
-    )
-    _check_gst_math(payload.subtotal, payload.gst_amount, payload.total)
-    _check_line_math(payload.subtotal, payload.gst_amount, payload.total, payload.lines)
+    if payload.amount_mode is None:
+        _ensure_invoice_gst_allowed(
+            company,
+            gst_amount=payload.gst_amount,
+            lines=payload.lines,
+            context="Invoice",
+        )
+        _check_gst_math(payload.subtotal, payload.gst_amount, payload.total)
+        _check_line_math(payload.subtotal, payload.gst_amount, payload.total, payload.lines)
+    else:
+        if not company.gst_registered and payload.amount_mode != "none":
+            raise HTTPException(
+                422,
+                "A non-GST-registered company must use amount_mode=none.",
+            )
+        if payload.amount_mode == "none":
+            for line in payload.lines or []:
+                line.tax_code = "none"
+            payload.gst_inclusive = False
+        _ensure_invoice_gst_allowed(
+            company,
+            gst_amount=payload.gst_amount,
+            lines=payload.lines,
+            context="Invoice",
+        )
+        _check_explicit_invoice_math(
+            payload.subtotal,
+            payload.gst_amount,
+            payload.total,
+            payload.lines,
+            amount_mode=payload.amount_mode,
+        )
     if payload.lines:
         try:
             invoice_posting.validate_invoice_line_accounts(db, payload.direction, payload.lines)
         except invoice_posting.InvoicePostingError as exc:
             _raise_posting_http(exc)
+        if payload.amount_mode is not None:
+            _validate_capital_line_accounts(db, payload.direction, payload.lines)
     contact = _resolve_contact(db, payload)
 
     existing = _find_source_ref_collision(db, payload.source, payload.source_ref)
@@ -340,6 +442,7 @@ def create_invoice(
     inv = Invoice(
         direction=payload.direction,
         contact_id=contact.id,
+        **_contact_snapshot_values(contact),
         invoice_number=payload.invoice_number,
         issue_date=payload.issue_date,
         due_date=payload.due_date,
@@ -406,15 +509,27 @@ def _is_void(inv: Invoice) -> bool:
 
 
 def _resolve_contact(db: Session, payload: InvoiceCreate) -> Contact:
-    if payload.contact_id:
+    if payload.contact_id is not None:
         c = db.get(Contact, payload.contact_id)
         if c is None:
-            raise HTTPException(404, f"Contact {payload.contact_id} not found")
+            raise HTTPException(422, f"Contact {payload.contact_id} not found")
+        _validate_contact_for_direction(c, payload.direction)
         return c
     if not payload.contact_name:
         raise HTTPException(422, "Either contact_id or contact_name must be provided")
     kind = "supplier" if payload.direction == "AP" else "customer"
     return get_or_create_contact(db=db, name=payload.contact_name, kind=kind, abn=payload.contact_abn)
+
+
+def _validate_contact_for_direction(contact: Contact, direction: str) -> None:
+    if not contact.active:
+        raise HTTPException(409, f"Contact {contact.id} is inactive")
+    required_kind = "supplier" if direction == "AP" else "customer"
+    if contact.kind not in {required_kind, "both"}:
+        raise HTTPException(
+            422,
+            f"Contact {contact.id} is not compatible with {direction} invoices",
+        )
 
 
 @router.patch("/{invoice_id}", response_model=InvoiceOut)
@@ -470,6 +585,12 @@ def update_invoice(
     # same PATCH.  Posting repeats the check to protect legacy/drifted rows.
     effective_direction = changes.get("direction", inv.direction)
     effective_lines = lines if lines is not None else inv.lines
+    effective_contact_id = changes.get("contact_id", inv.contact_id)
+    if _is_draft(inv):
+        contact = db.get(Contact, effective_contact_id)
+        if contact is None:
+            raise HTTPException(422, f"Contact {effective_contact_id} not found")
+        _validate_contact_for_direction(contact, effective_direction)
     if effective_lines:
         try:
             invoice_posting.validate_invoice_line_accounts(
@@ -480,6 +601,9 @@ def update_invoice(
 
     for field, value in changes.items():
         setattr(inv, field, value)
+    if _is_draft(inv) and "contact_id" in changes:
+        for field, value in _contact_snapshot_values(contact).items():
+            setattr(inv, field, value)
     if lines is not None:
         inv.lines.clear()
         db.flush()
@@ -500,7 +624,7 @@ def update_invoice(
     return _serialize(_attach_journal_entries(db, inv))
 
 
-@router.post("/{invoice_id}/post")
+@router.post("/{invoice_id}/post", response_model=InvoicePostOut)
 def post_invoice_endpoint(
     invoice_id: PathId,
     company: Company = Depends(get_current_company),
@@ -836,6 +960,7 @@ def import_excel_rows(
             inv = Invoice(
                 direction=direction,
                 contact_id=contact.id,
+                **_contact_snapshot_values(contact),
                 invoice_number=parsed["invoice_number"],
                 issue_date=date.fromisoformat(parsed["issue_date"]),
                 due_date=date.fromisoformat(parsed["due_date"]) if parsed.get("due_date") else None,

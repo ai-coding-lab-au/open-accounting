@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ..models.company import (
     Account,
     AccountType,
+    BankAccount,
     BankTransaction,
     InvoiceLine,
     JournalLine,
@@ -86,6 +87,12 @@ def protected_system_account_type(code: str) -> AccountType | None:
 def financial_reference_labels(db: Session, account_id: int) -> list[str]:
     """Financial rows whose historic meaning depends on an account's type."""
     labels: list[str] = []
+    if (
+        db.query(BankAccount.id)
+        .filter(BankAccount.ledger_account_id == account_id)
+        .first()
+    ):
+        labels.append("bank accounts")
     if (
         db.query(BankTransaction.id)
         .filter(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 from sqlalchemy import create_engine, text
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,12 +15,113 @@ from app.db.base import CompanyBase
 # the test fails in isolation ("no such table: invoices") because nothing else
 # has imported the models yet.
 import app.models.company  # noqa: F401,E402
+from app.db.errors import DataRecoveryRequiredError
 from app.db.migrations import run_company_migrations
 from app.db.schema_sync import sync_missing_columns
 
 
 def _columns(conn, table):
     return {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()}
+
+
+def test_invoice_contact_snapshots_backfill_and_preserve_captured_values():
+    engine = create_engine("sqlite://", future=True)
+    CompanyBase.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO contacts "
+                "(id, kind, name, abn, address, email, phone) VALUES "
+                "(1, 'customer', 'Full Contact', '12 345 678 901', '1 Main St', "
+                "'full@example.test', '0400000000'), "
+                "(2, 'customer', 'Minimal Contact', NULL, NULL, NULL, NULL)"
+            )
+        )
+        for invoice_id, contact_id, number in [(1, 1, "FULL-1"), (2, 2, "MIN-1")]:
+            conn.execute(
+                text(
+                    "INSERT INTO invoices ("
+                    "id, direction, contact_id, invoice_number, issue_date, currency, "
+                    "subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+                    "source, created_at, updated_at"
+                    ") VALUES ("
+                    ":id, 'AR', :contact_id, :number, '2026-05-01', 'AUD', "
+                    "100, 10, 110, 1, 'draft', 0, 'manual', "
+                    "'2026-05-01 09:30:00', '2026-05-01 09:30:00')"
+                ),
+                {"id": invoice_id, "contact_id": contact_id, "number": number},
+            )
+        conn.execute(
+            text(
+                "INSERT INTO invoices ("
+                "id, direction, contact_id, invoice_number, issue_date, currency, "
+                "subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+                "contact_name_snapshot, source, created_at, updated_at"
+                ") VALUES (3, 'AR', 1, 'CAPTURED-1', '2026-05-01', 'AUD', "
+                "100, 10, 110, 1, 'draft', 0, 'Previously Captured', 'manual', "
+                "'2026-05-01 09:30:00', '2026-05-01 09:30:00')"
+            )
+        )
+
+    sync_missing_columns(engine, CompanyBase)
+    first = run_company_migrations(engine)
+    with engine.begin() as conn:
+        snapshots = conn.execute(
+            text(
+                "SELECT contact_name_snapshot, contact_abn_snapshot, "
+                "contact_address_snapshot, contact_email_snapshot, "
+                "contact_phone_snapshot FROM invoices ORDER BY id"
+            )
+        ).fetchall()
+        conn.execute(
+            text("UPDATE contacts SET name = 'Changed Contact' WHERE id = 1")
+        )
+
+    assert "backfill:invoice_contact_snapshot:2" in first
+    assert snapshots == [
+        (
+            "Full Contact",
+            "12 345 678 901",
+            "1 Main St",
+            "full@example.test",
+            "0400000000",
+        ),
+        ("Minimal Contact", None, None, None, None),
+        ("Previously Captured", None, None, None, None),
+    ]
+
+    second = run_company_migrations(engine)
+    with engine.begin() as conn:
+        unchanged = conn.execute(
+            text(
+                "SELECT contact_name_snapshot, contact_abn_snapshot, "
+                "contact_address_snapshot, contact_email_snapshot, "
+                "contact_phone_snapshot FROM invoices ORDER BY id"
+            )
+        ).fetchall()
+    assert second == []
+    assert unchanged == snapshots
+
+
+def test_invoice_contact_snapshot_backfill_rejects_missing_contact():
+    engine = create_engine("sqlite://", future=True)
+    CompanyBase.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO invoices ("
+                "id, direction, contact_id, invoice_number, issue_date, currency, "
+                "subtotal, gst_amount, total, gst_inclusive, status, paid_amount, "
+                "source, created_at, updated_at"
+                ") VALUES (1, 'AR', 999, 'ORPHAN-1', '2026-05-01', 'AUD', "
+                "100, 10, 110, 1, 'draft', 0, 'manual', "
+                "'2026-05-01 09:30:00', '2026-05-01 09:30:00')"
+            )
+        )
+
+    sync_missing_columns(engine, CompanyBase)
+    with pytest.raises(DataRecoveryRequiredError, match="reference a missing Contact"):
+        run_company_migrations(engine)
 
 
 def test_invoice_posting_migration_backfills_and_is_idempotent():

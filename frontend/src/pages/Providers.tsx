@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { useCompanyStore } from "../store/company";
 import { useModalKeys } from "../lib/useModalKeys";
@@ -85,13 +84,9 @@ export default function ProvidersPage() {
     <div className="space-y-4">
       <div className="flex items-end justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-xl font-semibold">Providers</h1>
+          <h1 className="text-xl font-semibold">Accounting Contacts</h1>
           <p className="text-xs text-slate-500 mt-0.5">
-            Suppliers we pay (AP). Customers we serve live in{" "}
-            <Link to="/clients" className="underline">
-              Clients
-            </Link>
-            .
+            Customers and suppliers used for customer invoices and supplier bills.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -117,7 +112,7 @@ export default function ProvidersPage() {
             onClick={() => setCreating(true)}
             className="px-3 py-1.5 text-sm rounded bg-slate-900 text-white hover:bg-slate-800"
           >
-            + New Provider
+            + New Contact
           </button>
         </div>
       </div>
@@ -200,7 +195,7 @@ export default function ProvidersPage() {
               {(data ?? []).length === 0 && (
                 <tr>
                   <td colSpan={5} className="px-3 py-6 text-center text-slate-500">
-                    No providers match these filters.
+                    No accounting contacts match these filters.
                   </td>
                 </tr>
               )}
@@ -227,10 +222,10 @@ export default function ProvidersPage() {
       <ConfirmDialog
         open={!!pendingDelete}
         destructive
-        title="Delete provider?"
+        title="Delete accounting contact?"
         message={
           pendingDelete
-            ? `Delete provider "${displayName(pendingDelete.name, "provider")}"? This only works if they have no invoices.`
+            ? `Delete accounting contact "${displayName(pendingDelete.name, "provider")}"? This only works if they have no invoices.`
             : ""
         }
         confirmLabel="Delete"
@@ -309,7 +304,7 @@ function ProviderFormDialog({
       <div className="bg-surface rounded-lg shadow-xl w-full max-w-lg">
         <div className="px-5 py-3 border-b flex justify-between items-center">
           <h3 className="font-semibold">
-            {isEdit ? `Edit ${displayName(existing!.name, "provider")}` : "New provider"}
+            {isEdit ? `Edit ${displayName(existing!.name, "provider")}` : "New contact"}
           </h3>
           <button onClick={onClose} className="text-slate-500 hover:text-slate-900">
             ✕
@@ -330,7 +325,7 @@ function ProviderFormDialog({
               className="border rounded px-2 py-1 w-full"
             >
               <option value="supplier">Supplier (we pay them)</option>
-              <option value="customer">Customer (legacy — prefer Clients)</option>
+              <option value="customer">Customer</option>
               <option value="both">Both</option>
             </select>
           </Field>
@@ -381,7 +376,7 @@ function ProviderFormDialog({
                 checked={active}
                 onChange={(e) => setActive(e.target.checked)}
               />
-              <span>Active (inactive providers are hidden from pickers)</span>
+              <span>Active (inactive contacts are hidden from pickers)</span>
             </label>
           )}
           {submitError && (

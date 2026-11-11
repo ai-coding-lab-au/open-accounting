@@ -1,5 +1,7 @@
 import os
+import re
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
@@ -8,7 +10,14 @@ from uuid import uuid4
 from ..config import settings
 from .base import MasterBase
 from .errors import DataRecoveryRequiredError
-from .schema_sync import detect_drift, require_clean_schema, sync_missing_columns
+from .schema_sync import (
+    MASTER_AUTHORIZATION_INDEX_SIGNATURES,
+    detect_drift,
+    normalise_sql_expression,
+    require_clean_schema,
+    sqlite_index_matches,
+    sync_missing_columns,
+)
 
 
 def _sqlite_url(path) -> str:
@@ -172,6 +181,313 @@ def _ensure_company_generations() -> list[str]:
     return changed
 
 
+def _canonical_utc_timestamp_sql(value: str) -> str:
+    digit_pattern = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]"
+    year = f"CAST(substr({value}, 1, 4) AS INTEGER)"
+    month = f"CAST(substr({value}, 6, 2) AS INTEGER)"
+    day = f"CAST(substr({value}, 9, 2) AS INTEGER)"
+    hour = f"CAST(substr({value}, 12, 2) AS INTEGER)"
+    minute = f"CAST(substr({value}, 15, 2) AS INTEGER)"
+    second = f"CAST(substr({value}, 18, 2) AS INTEGER)"
+    leap_year = f"({year} % 4 = 0 AND ({year} % 100 != 0 OR {year} % 400 = 0))"
+    days_in_month = (
+        f"CASE {month} WHEN 2 THEN 28 + ({leap_year}) "
+        f"WHEN 4 THEN 30 WHEN 6 THEN 30 WHEN 9 THEN 30 WHEN 11 THEN 30 ELSE 31 END"
+    )
+    return (
+        f"({value} IS NOT NULL AND length({value}) = 26 "
+        f"AND {value} GLOB '{digit_pattern}' "
+        f"AND {year} BETWEEN 1 AND 9999 AND {month} BETWEEN 1 AND 12 "
+        f"AND {day} BETWEEN 1 AND {days_in_month} "
+        f"AND {hour} BETWEEN 0 AND 23 AND {minute} BETWEEN 0 AND 59 "
+        f"AND {second} BETWEEN 0 AND 59)"
+    )
+
+
+def _master_authorization_trigger_definitions() -> dict[str, str]:
+    subject_created = _canonical_utc_timestamp_sql("NEW.created_at")
+    subject_deactivated = _canonical_utc_timestamp_sql("NEW.deactivated_at")
+    membership_created = _canonical_utc_timestamp_sql("NEW.created_at")
+    membership_start = _canonical_utc_timestamp_sql("NEW.valid_from")
+    membership_end = _canonical_utc_timestamp_sql("NEW.valid_until")
+    membership_deactivated = _canonical_utc_timestamp_sql("NEW.deactivated_at")
+    grant_created = _canonical_utc_timestamp_sql("NEW.created_at")
+    grant_start = _canonical_utc_timestamp_sql("NEW.valid_from")
+    grant_end = _canonical_utc_timestamp_sql("NEW.valid_until")
+    grant_revoked = _canonical_utc_timestamp_sql("NEW.revoked_at")
+
+    return {
+        "authenticated_subjects_subject_id_required_insert": """
+            CREATE TRIGGER authenticated_subjects_subject_id_required_insert
+            BEFORE INSERT ON authenticated_subjects
+            WHEN NEW.subject_id IS NULL OR trim(NEW.subject_id) = ''
+            BEGIN
+                SELECT RAISE(ABORT, 'subject_id is required');
+            END
+        """,
+        "authenticated_subjects_auth_method_required": """
+            CREATE TRIGGER authenticated_subjects_auth_method_required
+            BEFORE INSERT ON authenticated_subjects
+              WHEN NEW.authentication_method IS NULL
+                  OR NEW.authentication_method NOT IN ('internal_adapter', 'trusted_adapter')
+            BEGIN
+                SELECT RAISE(ABORT, 'authentication_method is invalid');
+            END
+        """,
+        "authenticated_subjects_lifecycle_insert": f"""
+            CREATE TRIGGER authenticated_subjects_lifecycle_insert
+            BEFORE INSERT ON authenticated_subjects
+              WHEN NEW.active IS NOT 1 OR NEW.deactivated_at IS NOT NULL
+                  OR NOT {subject_created}
+            BEGIN
+                SELECT RAISE(ABORT, 'authenticated subjects must be created active with canonical timestamps');
+            END
+        """,
+        "authenticated_subjects_lifecycle_update": f"""
+            CREATE TRIGGER authenticated_subjects_lifecycle_update
+            BEFORE UPDATE ON authenticated_subjects
+            WHEN NEW.subject_id IS NOT OLD.subject_id
+                 OR NEW.authentication_method IS NOT OLD.authentication_method
+                 OR NEW.provider_subject IS NOT OLD.provider_subject
+                 OR NEW.credential_version IS NOT OLD.credential_version
+                 OR NEW.created_at IS NOT OLD.created_at
+                 OR NOT {_canonical_utc_timestamp_sql('OLD.created_at')}
+                 OR OLD.active IS NULL OR OLD.active NOT IN (0, 1)
+                 OR NEW.active IS NULL OR NEW.active NOT IN (0, 1)
+                 OR (OLD.active = 0 AND (NEW.active != 0 OR NEW.deactivated_at IS NOT OLD.deactivated_at))
+                 OR (OLD.active = 1 AND NEW.active = 1 AND NEW.deactivated_at IS NOT OLD.deactivated_at)
+                 OR (OLD.active = 1 AND NEW.active = 0 AND
+                     (OLD.deactivated_at IS NOT NULL OR NEW.deactivated_at IS NULL
+                      OR NOT {subject_deactivated}
+                      OR NEW.deactivated_at < OLD.created_at))
+            BEGIN
+                SELECT RAISE(ABORT, 'authenticated subject identity is immutable and deactivation is one-way');
+            END
+        """,
+        "authenticated_subjects_no_delete": """
+            CREATE TRIGGER authenticated_subjects_no_delete
+            BEFORE DELETE ON authenticated_subjects
+            BEGIN
+                SELECT RAISE(ABORT, 'authenticated subjects cannot be deleted');
+            END
+        """,
+        "company_memberships_validity_guard": f"""
+            CREATE TRIGGER company_memberships_validity_guard
+            BEFORE INSERT ON company_memberships
+            WHEN NEW.active IS NOT 1 OR NEW.deactivated_at IS NOT NULL
+                 OR NOT {membership_created} OR NOT {membership_start}
+                 OR (NEW.valid_until IS NOT NULL AND
+                     (NOT {membership_end}
+                      OR NEW.valid_from >= NEW.valid_until))
+            BEGIN
+                SELECT RAISE(ABORT, 'company membership state or validity window is invalid');
+            END
+        """,
+        "company_memberships_lifecycle_update": f"""
+            CREATE TRIGGER company_memberships_lifecycle_update
+            BEFORE UPDATE ON company_memberships
+            WHEN NEW.id IS NOT OLD.id
+                 OR NEW.subject_id IS NOT OLD.subject_id
+                 OR NEW.company_id IS NOT OLD.company_id
+                 OR NEW.company_generation IS NOT OLD.company_generation
+                 OR NEW.valid_from IS NOT OLD.valid_from
+                 OR NEW.valid_until IS NOT OLD.valid_until
+                 OR NEW.created_at IS NOT OLD.created_at
+                 OR NOT {_canonical_utc_timestamp_sql('OLD.created_at')}
+                 OR OLD.active IS NULL OR OLD.active NOT IN (0, 1)
+                 OR NEW.active IS NULL OR NEW.active NOT IN (0, 1)
+                 OR (OLD.active = 0 AND (NEW.active != 0 OR NEW.deactivated_at IS NOT OLD.deactivated_at))
+                 OR (OLD.active = 1 AND NEW.active = 1 AND NEW.deactivated_at IS NOT OLD.deactivated_at)
+                 OR (OLD.active = 1 AND NEW.active = 0 AND
+                     (OLD.deactivated_at IS NOT NULL OR NEW.deactivated_at IS NULL
+                      OR NOT {_canonical_utc_timestamp_sql('NEW.deactivated_at')}
+                      OR NEW.deactivated_at < OLD.created_at))
+            BEGIN
+                SELECT RAISE(ABORT, 'company membership identity is immutable and deactivation is one-way');
+            END
+        """,
+        "company_memberships_no_delete": """
+            CREATE TRIGGER company_memberships_no_delete
+            BEFORE DELETE ON company_memberships
+            BEGIN
+                SELECT RAISE(ABORT, 'company memberships cannot be deleted');
+            END
+        """,
+        "company_capability_grants_validity_guard": f"""
+            CREATE TRIGGER company_capability_grants_validity_guard
+            BEFORE INSERT ON company_capability_grants
+            WHEN NEW.active IS NOT 1 OR NEW.revoked_at IS NOT NULL
+                 OR NOT {grant_created} OR NOT {grant_start}
+                 OR (NEW.valid_until IS NOT NULL AND
+                     (NOT {grant_end}
+                      OR NEW.valid_from >= NEW.valid_until))
+            BEGIN
+                SELECT RAISE(ABORT, 'capability grant state or validity window is invalid');
+            END
+        """,
+        "company_capability_grants_lifecycle_update": f"""
+            CREATE TRIGGER company_capability_grants_lifecycle_update
+            BEFORE UPDATE ON company_capability_grants
+            WHEN NEW.id IS NOT OLD.id
+                 OR NEW.membership_id IS NOT OLD.membership_id
+                 OR NEW.capability IS NOT OLD.capability
+                 OR NEW.valid_from IS NOT OLD.valid_from
+                 OR NEW.valid_until IS NOT OLD.valid_until
+                 OR NEW.created_at IS NOT OLD.created_at
+                 OR NOT {_canonical_utc_timestamp_sql('OLD.created_at')}
+                 OR OLD.active IS NULL OR OLD.active NOT IN (0, 1)
+                 OR NEW.active IS NULL OR NEW.active NOT IN (0, 1)
+                 OR (OLD.active = 0 AND (NEW.active != 0 OR NEW.revoked_at IS NOT OLD.revoked_at))
+                 OR (OLD.active = 1 AND NEW.active = 1 AND NEW.revoked_at IS NOT OLD.revoked_at)
+                 OR (OLD.active = 1 AND NEW.active = 0 AND
+                     (OLD.revoked_at IS NOT NULL OR NEW.revoked_at IS NULL
+                      OR NOT {_canonical_utc_timestamp_sql('NEW.revoked_at')}
+                      OR NEW.revoked_at < OLD.created_at))
+            BEGIN
+                SELECT RAISE(ABORT, 'capability grant identity is immutable and revocation is one-way');
+            END
+        """,
+        "company_capability_grants_no_delete": """
+            CREATE TRIGGER company_capability_grants_no_delete
+            BEFORE DELETE ON company_capability_grants
+            BEGIN
+                SELECT RAISE(ABORT, 'capability grants cannot be deleted');
+            END
+        """,
+    }
+
+
+def _repair_master_authorization_triggers(conn) -> list[str]:
+    changed: list[str] = []
+    for name, definition in _master_authorization_trigger_definitions().items():
+        existing = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=:name"),
+            {"name": name},
+        ).scalar_one_or_none()
+        if existing and normalise_sql_expression(existing) == normalise_sql_expression(definition):
+            continue
+        if existing:
+            conn.execute(text(f'DROP TRIGGER "{name}"'))
+        conn.execute(text(definition))
+        repaired = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=:name"),
+            {"name": name},
+        ).scalar_one_or_none()
+        if not repaired or normalise_sql_expression(repaired) != normalise_sql_expression(definition):
+            raise RuntimeError(f"Master authorization trigger repair failed: {name}")
+        changed.append(f"master-auth-trigger:{name}")
+    return changed
+
+
+_AUTHORIZATION_TIMESTAMP_PATTERN = re.compile(
+    r"\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}\Z"
+)
+
+
+def _parse_master_authorization_timestamp(value, *, table: str, row_id, column: str):
+    if not isinstance(value, str) or not _AUTHORIZATION_TIMESTAMP_PATTERN.fullmatch(value):
+        raise DataRecoveryRequiredError(
+            f"Malformed master authorization timestamp: {table}[{row_id}].{column}"
+        )
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise DataRecoveryRequiredError(
+            f"Malformed master authorization timestamp: {table}[{row_id}].{column}"
+        ) from exc
+    expected = parsed.isoformat(sep=" ", timespec="microseconds")
+    if expected != value:
+        raise DataRecoveryRequiredError(
+            f"Noncanonical master authorization timestamp: {table}[{row_id}].{column}"
+        )
+    return parsed.replace(tzinfo=UTC)
+
+
+def _validate_master_authorization_records(conn) -> None:
+    definitions = (
+        ("authenticated_subjects", "subject_id", ("created_at", "deactivated_at"), "deactivated_at"),
+        ("company_memberships", "id", ("created_at", "valid_from", "valid_until", "deactivated_at"), "deactivated_at"),
+        ("company_capability_grants", "id", ("created_at", "valid_from", "valid_until", "revoked_at"), "revoked_at"),
+    )
+    for table, identity_column, timestamp_columns, lifecycle_column in definitions:
+        selected = ", ".join(f'"{column}"' for column in (identity_column, "active", *timestamp_columns))
+        for row in conn.execute(text(f'SELECT {selected} FROM "{table}"')):
+            values = row._mapping
+            row_id = values[identity_column]
+            parsed = {
+                column: (
+                    _parse_master_authorization_timestamp(
+                        values[column], table=table, row_id=row_id, column=column
+                    )
+                    if values[column] is not None
+                    else None
+                )
+                for column in timestamp_columns
+            }
+            if values["active"] not in (0, 1):
+                raise DataRecoveryRequiredError(
+                    f"Invalid active state in master authorization record: {table}[{row_id}]"
+                )
+            lifecycle = parsed[lifecycle_column]
+            if (values["active"] == 1) != (lifecycle is None):
+                raise DataRecoveryRequiredError(
+                    f"Inconsistent lifecycle state in master authorization record: {table}[{row_id}]"
+                )
+            if lifecycle is not None and lifecycle < parsed["created_at"]:
+                raise DataRecoveryRequiredError(
+                    f"Lifecycle timestamp precedes created_at: {table}[{row_id}].{lifecycle_column}"
+                )
+            if "valid_until" in parsed and parsed["valid_until"] is not None:
+                if parsed["valid_until"] <= parsed["valid_from"]:
+                    raise DataRecoveryRequiredError(
+                        f"Invalid authorization validity window: {table}[{row_id}]"
+                    )
+
+
+def _repair_master_authorization_schema(engine=None) -> list[str]:
+    """Create or repair required master authorization indexes and guards.
+
+    This keeps the new subject, membership, and capability tables additive and
+    idempotent across clean installs and legacy master DBs.
+    """
+    changed: list[str] = []
+    engine = engine or master_engine
+    with engine.begin() as conn:
+        for table, signatures in MASTER_AUTHORIZATION_INDEX_SIGNATURES.items():
+            for signature in signatures:
+                if sqlite_index_matches(conn, table, signature):
+                    continue
+                existing = conn.execute(
+                    text("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=:name"),
+                    {"name": signature.name},
+                ).scalar_one_or_none()
+                if existing == table:
+                    conn.execute(text(f'DROP INDEX "{signature.name}"'))
+                elif existing is not None:
+                    raise RuntimeError(
+                        f"Master authorization index name {signature.name} "
+                        f"is already used by table {existing}"
+                    )
+                unique = "UNIQUE " if signature.unique else ""
+                columns = ", ".join(f'"{column}"' for column in signature.columns)
+                where = f" WHERE {signature.where}" if signature.where else ""
+                conn.execute(
+                    text(
+                        f'CREATE {unique}INDEX "{signature.name}" '
+                        f'ON "{table}" ({columns}){where}'
+                    )
+                )
+                if not sqlite_index_matches(conn, table, signature):
+                    raise RuntimeError(
+                        f"Master authorization index repair failed: "
+                        f"{table}.{signature.name}"
+                    )
+                changed.append(f"master-auth-index:{signature.name}")
+
+        changed.extend(_repair_master_authorization_triggers(conn))
+    return changed
+
+
 settings.data_dir.mkdir(parents=True, exist_ok=True)
 
 _master_initialised = False
@@ -271,9 +587,24 @@ def init_master_db(*, allow_create: bool = False) -> list[str]:
     dropped = _drop_stale_master_columns()
     generation_changes = _ensure_company_generations()
     added = sync_missing_columns(master_engine, MasterBase)
-    require_clean_schema(detect_drift(master_engine, MasterBase, "master"))
+    auth_changes = _repair_master_authorization_schema()
+    with master_engine.connect() as conn:
+        _validate_master_authorization_records(conn)
+    require_clean_schema(
+        detect_drift(
+            master_engine,
+            MasterBase,
+            "master",
+            migration_index_signatures=MASTER_AUTHORIZATION_INDEX_SIGNATURES,
+        )
+    )
     _master_initialised = True
-    return [f"drop:{c}" for c in dropped] + generation_changes + added
+    return (
+        [f"drop:{c}" for c in dropped]
+        + generation_changes
+        + added
+        + auth_changes
+    )
 
 
 def validate_company_storage_registry() -> None:

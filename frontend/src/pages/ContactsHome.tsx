@@ -1,8 +1,16 @@
 import { Link } from "react-router-dom";
 
 const items = [
-  { to: "/clients", label: "Clients" },
-  { to: "/contacts", label: "Providers" },
+  {
+    to: "/clients",
+    label: "Service Clients",
+    description: "People and entities used for outgoing documents and migration-service workflows.",
+  },
+  {
+    to: "/contacts",
+    label: "Accounting Contacts",
+    description: "Customers and suppliers used for customer invoices and supplier bills.",
+  },
 ];
 
 export default function ContactsHomePage() {
@@ -19,7 +27,10 @@ export default function ContactsHomePage() {
             to={item.to}
             className="block rounded-md border border-slate-200 bg-surface px-4 py-3 text-sm font-medium text-slate-800 hover:border-emerald-300 hover:bg-slate-50"
           >
-            {item.label}
+            <span className="block">{item.label}</span>
+            <span className="block mt-1 text-xs font-normal text-slate-500">
+              {item.description}
+            </span>
           </Link>
         ))}
       </div>

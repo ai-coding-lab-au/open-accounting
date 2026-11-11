@@ -1,7 +1,9 @@
 import { test, expect } from "@playwright/test";
 import {
+  BACKEND_URL,
   COMPANY_ID,
   COMPANY_NAME,
+  companyHeaders,
   ensureCompany,
 } from "./helpers";
 
@@ -84,4 +86,131 @@ test("03 — Documents page lists Receipts + can open New Receipt dialog", async
   // The dialog also has an Issue date field; verify it's there as a
   // dialog-scoped sanity check.
   await expect(page.getByLabel("Issue date")).toBeVisible();
+});
+
+test("04 — Customer Invoices link, route, and AR-only list behavior", async ({
+  page,
+}) => {
+  await ensureCompany(page.context().request);
+
+  await page.goto("/");
+  await expect(
+    page.getByRole("link", { name: "Customer Invoices", exact: true }),
+  ).toBeVisible();
+
+  const arListRequest = page.waitForRequest(
+    (request) =>
+      request.method() === "GET" &&
+      request.url().includes("/api/v1/invoices") &&
+      new URL(request.url()).searchParams.get("direction") === "AR",
+  );
+
+  await page.getByRole("link", { name: "Customer Invoices", exact: true }).click();
+
+  await expect(page.getByRole("heading", { name: "Customer Invoices" })).toBeVisible({
+    timeout: 5000,
+  });
+  await expect(page.getByRole("button", { name: /AP · Bill from supplier/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /AR · Invoice to customer/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Draft" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Authorised" })).toBeVisible();
+
+  const req = await arListRequest;
+  expect(new URL(req.url()).searchParams.get("direction")).toBe("AR");
+});
+
+test("05 — Customer Invoices manual create posts direction=AR", async ({ page }) => {
+  const requestContext = page.context().request;
+  await ensureCompany(requestContext);
+  const contactName = "Fictional Bootstrap Customer";
+  const contactResponse = await requestContext.post(`${BACKEND_URL}/api/v1/contacts`, {
+    headers: companyHeaders(COMPANY_ID),
+    data: { name: contactName, kind: "customer", active: true },
+  });
+  expect(contactResponse.ok(), await contactResponse.text()).toBeTruthy();
+  const contact = (await contactResponse.json()) as { id: number };
+
+  const createRequest = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" && request.url().includes("/api/v1/invoices"),
+  );
+
+  await page.goto("/customer-invoices");
+  await page.getByRole("button", { name: /\+\s*Manual/i }).click();
+
+  await expect(page.getByRole("heading", { name: "New invoice" })).toBeVisible({
+    timeout: 5000,
+  });
+  await expect(page.getByRole("button", { name: /AP · Bill from supplier/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /AR · Invoice to customer/i })).toHaveCount(0);
+
+  const dialog = page.getByRole("heading", { name: "New invoice" }).locator("../..");
+  await dialog.getByLabel("Search customer contacts").fill(contactName);
+  await page.getByRole("option", { name: `Select ${contactName}` }).click();
+  await dialog.getByLabel("Invoice #").fill("AR-UI-001");
+  await dialog.getByLabel("Issue date").fill("01/09/2026");
+  await dialog.getByLabel("Description").first().fill("Regression consulting");
+  await dialog.getByLabel("Qty").first().fill("1");
+  await dialog.getByLabel("Unit price").first().fill("100.00");
+  const accountSelect = dialog.getByRole("cell", { name: "Select account" }).getByRole("combobox", { name: "Account" });
+  await accountSelect.selectOption({ index: 1 });
+  await dialog.getByRole("button", { name: "Save Draft" }).click();
+
+  const req = await createRequest;
+  const payload = JSON.parse(req.postData() ?? "{}");
+  expect(payload.direction).toBe("AR");
+  expect(payload.contact_id).toBe(contact.id);
+  expect(payload).not.toHaveProperty("contact_name");
+  expect(payload).not.toHaveProperty("contact_abn");
+  expect(payload.lines).toHaveLength(1);
+  expect(payload.lines[0]).toMatchObject({
+    description: "Regression consulting",
+    quantity: "1",
+    unit_price: "100.00",
+    line_subtotal: "100.00",
+    line_gst: "0.00",
+    line_total: "100.00",
+    tax_code: "gst_free",
+  });
+  expect(payload).not.toHaveProperty("status");
+  await expect(page.getByRole("heading", { name: "Customer Invoices" })).toBeVisible();
+});
+
+test("06 — Receipts route remains available", async ({ page }) => {
+  await ensureCompany(page.context().request);
+
+  await page.goto("/");
+  await expect(page.getByRole("link", { name: "Documents", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Documents", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Receipts" })).toBeVisible();
+});
+
+test("07 — Contacts hub distinguishes accounting contacts from service clients", async ({
+  page,
+}) => {
+  await ensureCompany(page.context().request);
+
+  await page.goto("/");
+  await page.getByRole("link", { name: "Contacts", exact: true }).click();
+  await expect(page).toHaveURL(/\/contacts-hub$/);
+  await expect(page.getByRole("heading", { name: "Contacts", exact: true })).toBeVisible();
+
+  const accountingDescription =
+    "Customers and suppliers used for customer invoices and supplier bills.";
+  const serviceDescription =
+    "People and entities used for outgoing documents and migration-service workflows.";
+  await expect(page.getByText(accountingDescription, { exact: true })).toBeVisible();
+  await expect(page.getByText(serviceDescription, { exact: true })).toBeVisible();
+
+  await page.getByRole("link", { name: /^Accounting Contacts/ }).click();
+  await expect(page).toHaveURL(/\/contacts$/);
+  await expect(
+    page.getByRole("heading", { name: "Accounting Contacts", exact: true }),
+  ).toBeVisible();
+
+  await page.getByRole("link", { name: "Contacts", exact: true }).click();
+  await expect(page).toHaveURL(/\/contacts-hub$/);
+  await page.getByRole("link", { name: /^Service Clients/ }).click();
+  await expect(page).toHaveURL(/\/clients$/);
+  await expect(page.getByRole("heading", { name: "Clients", exact: true })).toBeVisible();
 });

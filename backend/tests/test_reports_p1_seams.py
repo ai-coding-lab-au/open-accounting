@@ -88,11 +88,27 @@ def _post_txn(client, bank_id, **overrides):
 # ---------------------------------------------------------------------------
 
 
-def test_opening_balance_balances_tb_and_bs_with_equity_contra(client, accounts):
+def test_opening_balance_balances_tb_and_bs_with_equity_contra(client, accounts, biz_bank):
+    temporary_ledger = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1010", "name": "Temporary bank cash", "type": "ASSET"},
+    ).json()
+    reassigned = client.patch(
+        f"/api/v1/bank-accounts/{biz_bank['id']}",
+        headers=HEAD,
+        json={"ledger_account_id": temporary_ledger["id"]},
+    )
+    assert reassigned.status_code == 200, reassigned.text
+
     r = client.post(
         "/api/v1/bank-accounts",
         headers=HEAD,
-        json={"name": "NAB savings", "opening_balance": "1000.00"},
+        json={
+            "name": "NAB savings",
+            "ledger_account_id": accounts["1000"]["id"],
+            "opening_balance": "1000.00",
+        },
     )
     assert r.status_code == 201, r.text
 

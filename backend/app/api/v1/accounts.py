@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ...deps import PathId, get_company_db, get_current_company
-from ...models.company import Account, AccountType, BankRule, BankTransaction, InvoiceLine, JournalLine
+from ...models.company import Account, AccountType, BankAccount, BankRule, BankTransaction, InvoiceLine, JournalLine
 from ...models.master import Company
 from ...schemas.company import AccountCreate, AccountOut, AccountUpdate
 from ...services.account_invariants import (
@@ -88,6 +88,22 @@ def update_account(
     acc = _get_account_or_404(db, account_id)
 
     protected_type = protected_system_account_type(acc.code)
+    mapped_to_bank = (
+        db.query(BankAccount.id)
+        .filter(BankAccount.ledger_account_id == acc.id)
+        .first()
+        is not None
+    )
+    if mapped_to_bank and payload.active is False:
+        raise HTTPException(
+            status_code=409,
+            detail="A mapped bank ledger account cannot be deactivated",
+        )
+    if mapped_to_bank and payload.is_gst is True:
+        raise HTTPException(
+            status_code=409,
+            detail="A mapped bank ledger account cannot be marked as GST",
+        )
     if protected_type is not None:
         if payload.code is not None and payload.code != acc.code:
             raise HTTPException(
@@ -186,6 +202,12 @@ def delete_account(
         refs.append("journal entries")
     if db.query(BankRule).filter(BankRule.set_account_id == account_id).first():
         refs.append("bank rules")
+    if (
+        db.query(BankAccount.id)
+        .filter(BankAccount.ledger_account_id == account_id)
+        .first()
+    ):
+        refs.append("bank accounts")
     if db.query(Account).filter(Account.parent_id == account_id).first():
         refs.append("child accounts")
     if refs:

@@ -91,6 +91,10 @@ class TrialBalanceRow(BaseModel):
 class TrialBalanceSupplementary(BaseModel):
     ap_open_total: Money
     ar_open_total: Money
+    ap_open_credit_total: Money
+    ar_open_credit_total: Money
+    ap_net_open_total: Money
+    ar_net_open_total: Money
 
 
 class TrialBalanceOut(BaseModel):

@@ -24,6 +24,11 @@ const items: Item[] = [
     ],
   },
   {
+    to: "/customer-invoices",
+    label: "Customer Invoices",
+    matchPrefixes: ["/customer-invoices"],
+  },
+  {
     to: "/documents",
     label: "Documents",
     matchPrefixes: ["/invoices"],

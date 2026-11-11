@@ -101,6 +101,8 @@ export default function JournalPage() {
     onError: (e) => setDeleteError(apiErrorMessage(e)),
   });
 
+  const editableEntry = editing?.source_type === "manual" ? editing : null;
+
   if (!currentId) {
     return (
       <div className="bg-surface rounded-lg border border-slate-200 p-6 text-center">
@@ -213,22 +215,33 @@ export default function JournalPage() {
                       {formatMoney(total)}
                     </td>
                     <td className="py-1.5 px-3 text-right space-x-2">
-                      <button
-                        onClick={() => setEditing(e)}
-                        className="text-xs text-slate-600 hover:text-slate-900 underline"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => {
-                          setDeleteError(null);
-                          setPendingDelete(e);
-                        }}
-                        disabled={remove.isPending}
-                        className="text-xs text-rose-600 hover:text-rose-800 underline"
-                      >
-                        Delete
-                      </button>
+                      {e.source_type === "manual" ? (
+                        <>
+                          <button
+                            onClick={() => {
+                              if (e.source_type === "manual") setEditing(e);
+                            }}
+                            className="text-xs text-slate-600 hover:text-slate-900 underline"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => {
+                              if (e.source_type !== "manual") return;
+                              setDeleteError(null);
+                              setPendingDelete(e);
+                            }}
+                            disabled={remove.isPending}
+                            className="text-xs text-rose-600 hover:text-rose-800 underline"
+                          >
+                            Delete
+                          </button>
+                        </>
+                      ) : (
+                        <span className="text-xs text-slate-500">
+                          System-generated journal. Correct through the source transaction.
+                        </span>
+                      )}
                     </td>
                   </tr>
                 );
@@ -239,10 +252,10 @@ export default function JournalPage() {
         )}
       </div>
 
-      {(creating || editing) && accountsQ.data && (
+      {(creating || editableEntry) && accountsQ.data && (
         <JournalEntryDialog
-          key={editing ? `edit-${editing.id}` : "create"}
-          existing={editing}
+          key={editableEntry ? `edit-${editableEntry.id}` : "create"}
+          existing={editableEntry}
           accounts={accountsQ.data}
           onClose={() => {
             setCreating(false);

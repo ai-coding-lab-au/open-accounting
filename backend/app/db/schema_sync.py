@@ -45,8 +45,7 @@ class SQLiteIndexSignature:
 
 
 # These indexes are deliberately migration-owned rather than present in the
-# SQLAlchemy model.  They still form part of every company DB's required live
-# signature and therefore must be checked alongside model-declared indexes.
+# SQLAlchemy model. MIGRATION_INDEX_SIGNATURES is company-database-only.
 MIGRATION_INDEX_SIGNATURES: dict[str, tuple[SQLiteIndexSignature, ...]] = {
     "invoices": (
         SQLiteIndexSignature(
@@ -68,6 +67,47 @@ MIGRATION_INDEX_SIGNATURES: dict[str, tuple[SQLiteIndexSignature, ...]] = {
             ("reverses_entry_id",),
             unique=True,
             where="reverses_entry_id IS NOT NULL",
+        ),
+    ),
+}
+
+# These indexes belong only to the master authorization registry. Keep this
+# separate from company migrations so shared schema checks cannot leak them.
+MASTER_AUTHORIZATION_INDEX_SIGNATURES: dict[str, tuple[SQLiteIndexSignature, ...]] = {
+    "authenticated_subjects": (
+        SQLiteIndexSignature(
+            "ix_authenticated_subjects_subject_id",
+            ("subject_id",),
+            unique=True,
+            where=None,
+        ),
+        SQLiteIndexSignature(
+            "ix_authenticated_subjects_active",
+            ("active", "subject_id"),
+            unique=False,
+            where=None,
+        ),
+    ),
+    "company_memberships": (
+        SQLiteIndexSignature(
+            "ix_company_memberships_subject_company_generation",
+            ("subject_id", "company_id", "company_generation"),
+            unique=False,
+            where=None,
+        ),
+        SQLiteIndexSignature(
+            "ix_company_memberships_active_lookup",
+            ("company_id", "company_generation", "active"),
+            unique=False,
+            where=None,
+        ),
+    ),
+    "company_capability_grants": (
+        SQLiteIndexSignature(
+            "ix_company_capability_grants_membership_capability",
+            ("membership_id", "capability", "active"),
+            unique=False,
+            where=None,
         ),
     ),
 }
@@ -349,7 +389,11 @@ def live_sqlite_indexes(conn, table_name: str) -> dict[str, SQLiteIndexSignature
     return signatures
 
 
-def model_sqlite_indexes(table) -> dict[str, SQLiteIndexSignature]:
+def model_sqlite_indexes(
+    table,
+    *,
+    migration_index_signatures: dict[str, tuple[SQLiteIndexSignature, ...]] | None = None,
+) -> dict[str, SQLiteIndexSignature]:
     signatures: dict[str, SQLiteIndexSignature] = {}
     for index in table.indexes:
         if not index.name:
@@ -366,7 +410,12 @@ def model_sqlite_indexes(table) -> dict[str, SQLiteIndexSignature]:
             unique=bool(index.unique),
             where=normalise_sql_expression(where),
         )
-    for signature in MIGRATION_INDEX_SIGNATURES.get(table.name, ()):
+    registry = (
+        MIGRATION_INDEX_SIGNATURES
+        if migration_index_signatures is None
+        else migration_index_signatures
+    )
+    for signature in registry.get(table.name, ()):
         signatures[signature.name] = SQLiteIndexSignature(
             name=signature.name,
             columns=signature.columns,
@@ -492,7 +541,12 @@ def _master_company_id_guards_present(conn) -> bool:
 
 
 def table_signature_mismatches(
-    conn, inspector, table, *, include_indexes: bool = True
+    conn,
+    inspector,
+    table,
+    *,
+    include_indexes: bool = True,
+    migration_index_signatures: dict[str, tuple[SQLiteIndexSignature, ...]] | None = None,
 ) -> list[str]:
     """Compare one model table to its complete enforcement signature."""
 
@@ -573,7 +627,9 @@ def table_signature_mismatches(
         )
 
     if include_indexes:
-        expected_indexes = model_sqlite_indexes(table)
+        expected_indexes = model_sqlite_indexes(
+            table, migration_index_signatures=migration_index_signatures
+        )
         live_indexes = live_sqlite_indexes(conn, table_name)
         for name, expected in sorted(expected_indexes.items()):
             live = live_indexes.get(name)
@@ -607,6 +663,7 @@ def table_signature_mismatches(
         # autoindexes as unique indexes. PK enforcement is compared separately.
         if live_pk:
             live_unique.discard(live_pk)
+            expected_unique.discard(live_pk)
         if expected_unique != live_unique:
             mismatches.append(
                 f"UNIQUE columns mismatch model={sorted(expected_unique)!r} "
@@ -615,7 +672,13 @@ def table_signature_mismatches(
     return mismatches
 
 
-def detect_drift(engine: Engine, base: type[DeclarativeBase], scope: str) -> SchemaDriftReport:
+def detect_drift(
+    engine: Engine,
+    base: type[DeclarativeBase],
+    scope: str,
+    *,
+    migration_index_signatures: dict[str, tuple[SQLiteIndexSignature, ...]] | None = None,
+) -> SchemaDriftReport:
     """Compare ORM metadata and full SQLite signatures to the live DB.
 
     `sync_missing_columns` is expected to have run first, so a clean report
@@ -650,7 +713,12 @@ def detect_drift(engine: Engine, base: type[DeclarativeBase], scope: str) -> Sch
                 if name not in model_cols:
                     td.extra_in_db.append(name)
             td.signature_mismatches.extend(
-                table_signature_mismatches(conn, insp, table)
+                table_signature_mismatches(
+                    conn,
+                    insp,
+                    table,
+                    migration_index_signatures=migration_index_signatures,
+                )
             )
             if not td.is_clean:
                 report.tables.append(td)

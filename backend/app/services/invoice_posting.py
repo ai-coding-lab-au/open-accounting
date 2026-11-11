@@ -139,7 +139,7 @@ def post_invoice(session: Session, invoice_id: int) -> JournalEntry:
         if invoice.direction == InvoiceDirection.AR or invoice.direction == InvoiceDirection.AR.value
         else JournalEntrySource.INVOICE_AP
     )
-    contact_name = invoice.contact.name if invoice.contact else "Unknown contact"
+    contact_name = invoice.contact_name_snapshot or "Unknown contact"
     entry = JournalEntry(
         entry_date=invoice.issue_date,
         memo=f"Invoice {invoice.invoice_number} — {contact_name}",

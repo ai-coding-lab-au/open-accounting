@@ -10,10 +10,12 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
+from functools import wraps
 from threading import Lock
-from typing import Generator
+from typing import Callable, Concatenate, Generator, ParamSpec, TypeVar
 
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import settings
@@ -25,6 +27,38 @@ _engines: dict[str, Engine] = {}
 _sessionmakers: dict[str, sessionmaker] = {}
 _lifecycle_locks: dict[str, Lock] = {}
 _lock = Lock()
+_IMMEDIATE_LOCK_OWNER_KEY = "sqlite_immediate_lock_owner"
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+class SQLiteImmediateLockError(RuntimeError):
+    """A SQLite mutation cannot proceed without owned BEGIN IMMEDIATE."""
+
+    http_status = 409
+
+
+def rollback_session_on_error(
+    function: Callable[Concatenate[Session, _P], _R],
+) -> Callable[Concatenate[Session, _P], _R]:
+    @wraps(function)
+    def wrapped(db: Session, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        try:
+            return function(db, *args, **kwargs)
+        except Exception:
+            db.rollback()
+            raise
+
+    return wrapped
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _clear_immediate_lock_owner(session: Session, transaction) -> None:
+    if (
+        transaction.parent is None
+        and session.info.get(_IMMEDIATE_LOCK_OWNER_KEY) is transaction
+    ):
+        session.info.pop(_IMMEDIATE_LOCK_OWNER_KEY, None)
 
 
 @contextmanager
@@ -205,6 +239,7 @@ def init_company_db(
     try:
         with Session(engine) as session:
             rebuilt_allocations = backfill_missing_tax_components(session)
+            session.commit()
     except PaymentAllocationError as exc:
         raise DataRecoveryRequiredError(
             "Legacy invoice payment allocations could not be reconciled safely: "
@@ -228,10 +263,38 @@ def begin_sqlite_immediate(db: Session) -> None:
 
     pysqlite defers BEGIN until the first write, so a SELECT-then-INSERT
     check (doc-number allocation, trust balance checks) can read stale data
-    under concurrency. Calling this first takes the write lock up front.
-    No-op on non-SQLite binds or when the session already has a transaction.
+    under concurrency. Calling this first takes the write lock up front. A
+    nested call is allowed only when this Session's root transaction acquired
+    the lock through this helper. Non-SQLite binds do not claim SQLite ownership.
     """
     bind = db.get_bind()
-    if bind.dialect.name != "sqlite" or db.in_transaction():
+    if bind.dialect.name != "sqlite":
         return
-    db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    transaction = db.get_transaction()
+    if transaction is not None:
+        if db.info.get(_IMMEDIATE_LOCK_OWNER_KEY) is transaction:
+            return
+        raise SQLiteImmediateLockError(
+            "A SQLite write lock must be acquired before database reads or changes."
+        )
+    try:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    except DBAPIError as exc:
+        original = getattr(exc, "orig", None)
+        error_name = getattr(original, "sqlite_errorname", "")
+        message = str(original)
+        if error_name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED")) or message in {
+            "database is locked",
+            "database table is locked",
+        }:
+            db.rollback()
+            raise SQLiteImmediateLockError(
+                "The database is busy; retry the operation."
+            ) from exc
+        raise
+    transaction = db.get_transaction()
+    if transaction is None:  # pragma: no cover - Session.connection starts one
+        raise SQLiteImmediateLockError(
+            "The SQLite write lock could not be retained for this operation."
+        )
+    db.info[_IMMEDIATE_LOCK_OWNER_KEY] = transaction

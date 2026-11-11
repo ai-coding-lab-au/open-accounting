@@ -15,8 +15,15 @@ modules are included, the practice-specific modules are not.
 - Bank account with statement import (CSV/XLSX/PDF, UTF-8 English or simple Chinese column headers), dedupe, categorisation rules
 - Reconciliation view for uncategorised transactions, including explicit bank-to-invoice payment allocation
 - Reports as JSON + PDF: P&L, trial balance, balance sheet, GST activity summary/tax-code analysis, bank statement
-- Supplier (AP) / customer (AR) invoices with GL posting on authorise, allocation-derived paid status, and mixed-tax cash reporting
+- Supplier (AP) / customer (AR) invoices with GL posting on authorise and allocation-derived paid status
 - Monotonic accounting-period lock: dated writes in a closed period fail server-side
+
+**Invoice editor**
+- Compact manual AR/AP editor with independent invoice lines and stable IDs. Each line has a description, quantity, unit price, account, tax code, subtotal, GST, total, and removal control. Accounts are selected per line, not duplicated in the header.
+- Read-only invoice totals sum the rounded line amounts. Save Draft creates a draft without a journal entry; customer invoices retain AR direction and supplier invoices retain AP direction.
+- Amount modes are Tax exclusive, Tax inclusive, and No tax. Line tax treatments include standard GST, GST-free, input-taxed, Outside GST/no tax, and AP-asset Capital purchase. Capital purchase is limited to eligible AP asset lines.
+- Frontend calculations use BigInt-based money arithmetic for exact cents and round each line before summing the header. The backend independently validates with Decimal and ROUND_HALF_UP. API money values remain decimal-dollar strings.
+- No tax forces Outside GST (`none`); non-GST companies are forced to No tax. Visible tax labels no longer include “(provisional)”. This label change is not a compliance certification.
 
 **Documents**
 - Receipts issued directly to a client (line items, GST-inclusive/exclusive, void/restore)
@@ -70,6 +77,21 @@ cd ..\frontend
 npm run build
 ```
 
+### Branch verification
+
+The following checks passed for the work documented here:
+- Frontend production build.
+- Invoice tax Playwright suite: 12 passed.
+- Journal provenance Playwright suite: 1 passed.
+- Journal immutability: 98 backend tests passed across separately invoked files.
+- `test_invoice_posting.py`: 14 passed; `test_invoice_posting_integration.py`: 2 passed.
+- `test_gst_m23.py`: 11 passed; `test_invoice_payment_allocations.py`: 14 passed.
+- `test_reports_m22.py`: 7 passed; `test_reports_p1_seams.py`: 7 passed.
+
+These are separate results, not a combined unique test total. The backend checks emitted a non-blocking FastAPI/Starlette `TestClient` deprecation warning.
+
+Known test-isolation issue: running `test_invoice_api.py` before `test_invoice_posting.py` in one Pytest process can cause order-dependent SQLAlchemy mapper errors involving `OutgoingDocumentLine.order_no`. The invoice API fixture removes application modules from `sys.modules` while posting tests may retain an older SQLAlchemy model registry. Both files pass in separate clean Python processes. This issue is not fixed; unrelated production models should not be altered to mask it.
+
 ## Layout
 
 ```
@@ -109,7 +131,11 @@ gitignored as a second line of defence. Back up your `DATA_DIR`.
   go to Customer Deposits (2050) or Supplier Prepayments (1500). Applying such
   a remainder to a later invoice is an explicit adjustment workflow, not an
   automatic memo match.
-- The GST screens and PDFs are internal summaries/diagnostics, not a lodged BAS.
+- Invoice journals post GST to the GST Collected or GST Paid control accounts. Trial Balance, Profit and Loss, Balance Sheet, and journal/report integration are covered by existing tests.
+- Existing GST/BAS-support reporting is cash-basis decision support, based on bank transactions and invoice-payment tax components. An unpaid invoice journal is not itself a cash-basis GST-report transaction. Ordinary manual journal lines do not have the tax metadata required for automatic GST-report classification.
+- GST-aware adjustments and credit notes are future controlled work. All Australian GST, BAS, Capital GST, tax classification, and compliance behavior requires review by an Australian accountant or registered BAS agent before live use. No BAS has been lodged.
+- This application has not been deployed and is not production-ready. Use fictional data only until security, permissions, backups, restore testing, and accounting controls are verified. Keep ports 5173 and 8787 private. Hosting, backups, maintenance, security, payment processing, accountant review, and compliance may still have costs.
+- Future controlled phases include credit notes linked to source invoices; GST-aware adjustment workflows with explicit tax classification and provenance; atomic backend invoice numbering; accountant access and permissions; backup and restore verification; and security and production-readiness review.
 - Chromium PDF rendering is optional. Install it with
   `pip install -e ".[pdf]"` and `playwright install chromium`; otherwise the
   backend falls back to ReportLab rendering. The Windows portable build

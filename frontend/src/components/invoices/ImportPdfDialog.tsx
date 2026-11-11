@@ -27,14 +27,23 @@ async function createInvoice(payload: ReturnType<typeof toCreatePayload>): Promi
 
 interface Props {
   onClose: () => void;
+  defaultDirection?: "AP" | "AR";
+  showDirection?: boolean;
 }
 
-export default function ImportPdfDialog({ onClose }: Props) {
+export default function ImportPdfDialog({
+  onClose,
+  defaultDirection = "AP",
+  showDirection = true,
+}: Props) {
   const qc = useQueryClient();
   const companyQ = useCurrentCompany();
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<PdfUploadResult | null>(null);
-  const [form, setForm] = useState<InvoiceFormValues>(EMPTY_FORM);
+  const [form, setForm] = useState<InvoiceFormValues>({
+    ...EMPTY_FORM,
+    direction: defaultDirection,
+  });
 
   const uploadMut = useMutation({
     mutationFn: uploadPdf,
@@ -58,7 +67,7 @@ export default function ImportPdfDialog({ onClose }: Props) {
     !!preview &&
     !!companyQ.data &&
     !createMut.isPending &&
-    !!form.contact_name &&
+    form.contact_id !== null &&
     !!form.invoice_number &&
     !!form.issue_date &&
     !!form.total;
@@ -132,7 +141,7 @@ export default function ImportPdfDialog({ onClose }: Props) {
                 Enter the invoice details. The uploaded PDF will be linked as the
                 source attachment.
               </p>
-              <InvoiceForm value={form} onChange={setForm} />
+              <InvoiceForm value={form} onChange={setForm} showDirection={showDirection} />
               {createMut.isError && (
                 <p className="text-sm text-red-600 mt-3">{apiErrorMessage(createMut.error)}</p>
               )}
@@ -162,7 +171,7 @@ export default function ImportPdfDialog({ onClose }: Props) {
                 onClick={() => {
                   setPreview(null);
                   setFile(null);
-                  setForm(EMPTY_FORM);
+                  setForm({ ...EMPTY_FORM, direction: defaultDirection });
                 }}
                 disabled={createMut.isPending}
               >

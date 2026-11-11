@@ -257,18 +257,39 @@ def test_manual_journal_edit_and_delete_cannot_change_locked_period(client, acco
     assert open_entry.status_code == 201, open_entry.text
 
 
-def test_locked_company_rejects_new_nonzero_bank_opening_balance(client):
+def test_locked_company_rejects_new_nonzero_bank_opening_balance(client, accounts):
+    existing_bank = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0]
+    temporary_ledger = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1010", "name": "Temporary bank cash", "type": "ASSET"},
+    ).json()
+    reassigned = client.patch(
+        f"/api/v1/bank-accounts/{existing_bank['id']}",
+        headers=HEAD,
+        json={"ledger_account_id": temporary_ledger["id"]},
+    )
+    assert reassigned.status_code == 200, reassigned.text
+
     _lock(client)
     blocked = client.post(
         "/api/v1/bank-accounts",
         headers=HEAD,
-        json={"name": "Late opening", "opening_balance": "100.00"},
+        json={
+            "name": "Late opening",
+            "ledger_account_id": accounts["1000"]["id"],
+            "opening_balance": "100.00",
+        },
     )
     assert blocked.status_code == 409
     zero = client.post(
         "/api/v1/bank-accounts",
         headers=HEAD,
-        json={"name": "New zero account", "opening_balance": "0.00"},
+        json={
+            "name": "New zero account",
+            "ledger_account_id": accounts["1000"]["id"],
+            "opening_balance": "0.00",
+        },
     )
     assert zero.status_code == 201, zero.text
 

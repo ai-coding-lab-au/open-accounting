@@ -14,6 +14,7 @@ from .api.v1 import (
     clients,
     companies,
     contacts,
+    credit_notes,
     dashboard,
     invoices,
     journal,
@@ -120,6 +121,8 @@ def create_app() -> FastAPI:
     app.include_router(accounts.router, prefix="/api/v1")
     app.include_router(contacts.router, prefix="/api/v1")
     app.include_router(invoices.router, prefix="/api/v1")
+    app.include_router(credit_notes.router, prefix="/api/v1")
+    app.include_router(credit_notes.application_router, prefix="/api/v1")
     app.include_router(clients.router, prefix="/api/v1")
     app.include_router(bank_accounts.router, prefix="/api/v1")
     app.include_router(bank_rules.router, prefix="/api/v1")

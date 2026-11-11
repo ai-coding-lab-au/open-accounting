@@ -130,6 +130,79 @@ def test_non_gst_manual_invoices_reject_gst_and_post_full_gross(client):
         assert gst_lines == []
 
 
+    def test_non_gst_explicit_modes_require_none_and_normalize_line_codes(client):
+        headers = _company(client, "nogstamountmode", gst_registered=False)
+        accounts = _accounts(client, headers)
+
+        for amount_mode in ("exclusive", "inclusive"):
+            response = client.post(
+                "/api/v1/invoices",
+                headers=headers,
+                json={
+                    "direction": "AR",
+                    "contact_name": "Fictional Customer",
+                    "invoice_number": f"NOGST-{amount_mode}",
+                    "issue_date": "2026-05-10",
+                    "subtotal": "100.00",
+                    "gst_amount": "0.00",
+                    "total": "100.00",
+                    "amount_mode": amount_mode,
+                    "lines": [
+                        {
+                            "description": "Fictional service",
+                            "account_id": accounts["4000"]["id"],
+                            "quantity": "1",
+                            "unit_price": "100.00",
+                            "line_subtotal": "100.00",
+                            "line_gst": "0.00",
+                            "line_total": "100.00",
+                            "tax_code": "standard",
+                        }
+                    ],
+                },
+            )
+            assert response.status_code == 422, response.text
+
+        response = client.post(
+            "/api/v1/invoices",
+            headers=headers,
+            json={
+                "direction": "AR",
+                "contact_name": "Fictional Customer",
+                "invoice_number": "NOGST-none",
+                "issue_date": "2026-05-10",
+                "subtotal": "100.00",
+                "gst_amount": "0.00",
+                "total": "100.00",
+                "gst_inclusive": True,
+                "amount_mode": "none",
+                "lines": [
+                    {
+                        "description": "Fictional service",
+                        "account_id": accounts["4000"]["id"],
+                        "quantity": "1",
+                        "unit_price": "100.00",
+                        "line_subtotal": "100.00",
+                        "line_gst": "0.00",
+                        "line_total": "100.00",
+                        "tax_code": "standard",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["gst_inclusive"] is False
+        assert response.json()["status"] == "draft"
+        assert response.json()["journal_entries"] == []
+
+        from app.db.company import company_session
+        from app.models.company import Invoice
+
+        with company_session("nogstamountmode") as db:
+            invoice = db.query(Invoice).filter_by(invoice_number="NOGST-none").one()
+            assert invoice.lines[0].tax_code == "none"
+
+
 def test_non_gst_excel_total_only_is_zero_gst_and_explicit_gst_is_skipped(client):
     headers = _company(client, "nogstexcel", gst_registered=False)
     total_only = {

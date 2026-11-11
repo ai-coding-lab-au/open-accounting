@@ -143,6 +143,92 @@ def test_gst_free_invoice_omits_gst_line(session, accounts):
     assert "2100" not in {code for code, _, _ in _lines_by_code(session, entry)}
 
 
+def test_posting_retains_historical_zero_unit_price_acceptance(session, accounts):
+    inv = _invoice(session, accounts, number="LEGACY-ZERO-PRICE")
+    inv.lines[0].unit_price = Decimal("0.00")
+    stored_amounts = (
+        inv.subtotal,
+        inv.gst_amount,
+        inv.total,
+        inv.lines[0].line_subtotal,
+        inv.lines[0].line_gst,
+        inv.lines[0].line_total,
+    )
+
+    entry = invoice_posting.post_invoice(session, inv.id)
+
+    assert entry.source_id == inv.id
+    assert stored_amounts == (
+        inv.subtotal,
+        inv.gst_amount,
+        inv.total,
+        inv.lines[0].line_subtotal,
+        inv.lines[0].line_gst,
+        inv.lines[0].line_total,
+    )
+
+
+def test_posting_accepts_persisted_inclusive_representation(session, accounts):
+    inv = _invoice(
+        session,
+        accounts,
+        number="PERSISTED-INCLUSIVE",
+        subtotal=Decimal("100.00"),
+        gst=Decimal("10.00"),
+        total=Decimal("110.00"),
+    )
+    inv.lines[0].quantity = Decimal("1")
+    inv.lines[0].unit_price = Decimal("110.00")
+
+    entry = invoice_posting.post_invoice(session, inv.id)
+
+    assert entry.source_id == inv.id
+    assert inv.lines[0].line_subtotal == Decimal("100.00")
+    assert inv.lines[0].line_gst == Decimal("10.00")
+    assert inv.lines[0].line_total == Decimal("110.00")
+
+
+def test_posting_rejects_incoherent_nonzero_price_without_mutation(session, accounts):
+    inv = _invoice(session, accounts, number="PERSISTED-INCOHERENT")
+    inv.lines[0].unit_price = Decimal("90.00")
+    stored_amounts = (
+        inv.subtotal,
+        inv.gst_amount,
+        inv.total,
+        inv.lines[0].unit_price,
+        inv.lines[0].line_subtotal,
+        inv.lines[0].line_gst,
+        inv.lines[0].line_total,
+    )
+
+    with pytest.raises(invoice_posting.InvalidInvoiceMath):
+        invoice_posting.post_invoice(session, inv.id)
+
+    assert inv.status == InvoiceStatus.DRAFT
+    assert session.query(JournalEntry).count() == 0
+    assert stored_amounts == (
+        inv.subtotal,
+        inv.gst_amount,
+        inv.total,
+        inv.lines[0].unit_price,
+        inv.lines[0].line_subtotal,
+        inv.lines[0].line_gst,
+        inv.lines[0].line_total,
+    )
+
+
+def test_posting_requires_exact_line_to_header_sums(session, accounts):
+    inv = _invoice(session, accounts, number="PERSISTED-HEADER-SUM-MISMATCH")
+    inv.subtotal = Decimal("99.00")
+    inv.gst_amount = Decimal("11.00")
+
+    with pytest.raises(invoice_posting.InvalidInvoiceMath):
+        invoice_posting.post_invoice(session, inv.id)
+
+    assert inv.status == InvoiceStatus.DRAFT
+    assert session.query(JournalEntry).count() == 0
+
+
 def test_missing_line_account_raises_without_state_change(session, accounts):
     inv = _invoice(session, accounts, account_codes=(None,))
     with pytest.raises(invoice_posting.MissingAccount):

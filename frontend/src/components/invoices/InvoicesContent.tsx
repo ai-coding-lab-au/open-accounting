@@ -29,23 +29,29 @@ export default function InvoicesContent({
   onImportExcel,
   showCreateActions = true,
   title = "Invoices",
+  fixedDirection,
+  showDirectionFilter = true,
 }: {
   onSelectInvoice: (invoice: Invoice) => void;
   onCreateManual: () => void;
   onImportExcel: () => void;
   showCreateActions?: boolean;
   title?: string;
+  fixedDirection?: InvoiceDirection | "ALL";
+  showDirectionFilter?: boolean;
 }) {
   const currentId = useCompanyStore((s) => s.currentId);
-  const [direction, setDirection] = useState<DirectionFilter>("ALL");
+  const [direction, setDirection] = useState<DirectionFilter>(fixedDirection ?? "ALL");
   const [status, setStatus] = useState<StatusFilter>("ALL");
   const [q, setQ] = useState("");
 
+  const effectiveDirection = fixedDirection ?? direction;
+
   const { data, isLoading, error } = useQuery({
-    queryKey: ["invoices", currentId, direction, status, q],
+    queryKey: ["invoices", currentId, effectiveDirection, status, q],
     queryFn: () =>
       fetchInvoices({
-        direction: direction === "ALL" ? undefined : direction,
+        direction: effectiveDirection === "ALL" ? undefined : effectiveDirection,
         status: status === "ALL" ? undefined : status,
         q: q.trim() || undefined,
       }),
@@ -53,15 +59,15 @@ export default function InvoicesContent({
   });
 
   const totals = useMemo(() => {
-    if (!data) return { count: 0, total: 0, unpaid: 0 };
+    if (!data) return { count: 0, total: 0, outstanding: 0 };
     let total = 0;
-    let unpaid = 0;
+    let outstanding = 0;
     for (const inv of data) {
       if (inv.status === "void") continue;
       total += Number(inv.total);
-      unpaid += Number(inv.total) - Number(inv.paid_amount);
+      outstanding += Number(inv.outstanding_amount);
     }
-    return { count: data.length, total, unpaid };
+    return { count: data.length, total, outstanding };
   }, [data]);
 
   if (!currentId) {
@@ -91,20 +97,24 @@ export default function InvoicesContent({
 
       <div className="bg-surface rounded-lg border border-slate-200 p-4">
         <div className="flex flex-wrap gap-3 mb-3">
-          <Pills
-            value={direction}
-            onChange={(v) => setDirection(v as DirectionFilter)}
-            options={[
-              { v: "ALL", label: "All" },
-              { v: "AP", label: "AP (bills)" },
-              { v: "AR", label: "AR (sales)" },
-            ]}
-          />
+          {showDirectionFilter && (
+            <Pills
+              value={direction}
+              onChange={(v) => setDirection(v as DirectionFilter)}
+              options={[
+                { v: "ALL", label: "All" },
+                { v: "AP", label: "AP (bills)" },
+                { v: "AR", label: "AR (sales)" },
+              ]}
+            />
+          )}
           <Pills
             value={status}
             onChange={(v) => setStatus(v as StatusFilter)}
             options={[
               { v: "ALL", label: "Any status" },
+              { v: "draft", label: "Draft" },
+              { v: "authorised", label: "Authorised" },
               { v: "unpaid", label: "Unpaid" },
               { v: "partial", label: "Partial" },
               { v: "paid", label: "Paid" },
@@ -134,7 +144,7 @@ export default function InvoicesContent({
             <div className="text-xs text-slate-500 mb-2">
               Showing <span className="font-semibold">{totals.count}</span> · total{" "}
               <span className="font-semibold">{formatMoney(totals.total)}</span> · outstanding{" "}
-              <span className="font-semibold">{formatMoney(totals.unpaid)}</span>
+              <span className="font-semibold">{formatMoney(totals.outstanding)}</span>
             </div>
             <div className="overflow-auto">
               <table className="w-full text-sm">
@@ -171,7 +181,7 @@ export default function InvoicesContent({
                         </span>
                       </Td>
                       <Td className="font-mono">{displayDocNumber(inv.invoice_number)}</Td>
-                      <Td>{displayName(inv.contact_name, "provider")}</Td>
+                      <Td>{displayName(inv.contact_name, inv.direction === "AR" ? "client" : "provider")}</Td>
                       <Td className="text-right">
                         {formatMoney(inv.subtotal, inv.currency)}
                       </Td>

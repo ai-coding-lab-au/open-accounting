@@ -16,8 +16,15 @@ from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, selectinload
 
+from ..db.company import begin_sqlite_immediate, rollback_session_on_error
+from .allocation_history import (
+    guard_allocation_history_mutation,
+    has_allocation_history,
+    translate_allocation_history_db_error,
+)
 from . import gst_policy
 from . import invoice_payments
 from .account_invariants import (
@@ -65,6 +72,14 @@ class BankAccountDuplicate(BankTxnError):
 
 
 class BankAccountConfigurationInvalid(BankTxnError):
+    http_status = 409
+
+
+class BankLedgerAccountInvalid(BankTxnError):
+    http_status = 400
+
+
+class BankLedgerAccountInUse(BankTxnError):
     http_status = 409
 
 
@@ -248,10 +263,61 @@ def seed_default_bank_accounts(session: Session) -> int:
     """Insert the default bank account if none exists. Returns rows inserted."""
     existing = session.query(BankAccount).count()
     if existing > 0:
+        if existing == 1:
+            bank = session.query(BankAccount).one()
+            if bank.ledger_account_id is None:
+                ledger = _default_cash_ledger_account(session)
+                if ledger is not None:
+                    bank.ledger_account_id = ledger.id
+                    session.commit()
         return 0
-    session.add(BankAccount(name="Bank Account"))
+    ledger = _default_cash_ledger_account(session)
+    if ledger is None:
+        raise BankAccountConfigurationInvalid(
+            "Cannot provision the default bank account without an active, "
+            "non-GST ASSET account 1000."
+        )
+    session.add(BankAccount(name="Bank Account", ledger_account_id=ledger.id))
     session.commit()
     return 1
+
+
+def _default_cash_ledger_account(db: Session) -> Account | None:
+    account = db.query(Account).filter(Account.code == "1000").one_or_none()
+    if (
+        account is None
+        or not account.active
+        or account.type != AccountType.ASSET
+        or account.is_gst
+    ):
+        return None
+    return account
+
+
+def _validate_bank_ledger_account(
+    db: Session, ledger_account_id: int, *, bank_account_id: int | None = None
+) -> Account:
+    account = db.get(Account, ledger_account_id)
+    if account is None:
+        raise BankLedgerAccountInvalid("Ledger account does not exist")
+    if not account.active:
+        raise BankLedgerAccountInvalid("Ledger account must be active")
+    if account.type != AccountType.ASSET:
+        raise BankLedgerAccountInvalid("Ledger account must be an ASSET account")
+    if account.is_gst:
+        raise BankLedgerAccountInvalid("GST-classified accounts cannot be bank ledgers")
+    if account.code in {"1100", "1200", "2000", "2100"}:
+        raise BankLedgerAccountInvalid(
+            f"Protected account {account.code} cannot be used as a bank ledger"
+        )
+    query = db.query(BankAccount.id).filter(
+        BankAccount.ledger_account_id == ledger_account_id
+    )
+    if bank_account_id is not None:
+        query = query.filter(BankAccount.id != bank_account_id)
+    if query.first() is not None:
+        raise BankLedgerAccountInUse("Ledger account is already mapped to another bank account")
+    return account
 
 
 def _normalise_name(name: str) -> str:
@@ -573,10 +639,12 @@ def create_account(
     bsb: str | None = None,
     account_number: str | None = None,
     is_active: bool = True,
+    ledger_account_id: int,
 ) -> BankAccount:
     name = _normalise_name(name)
     if _account_with_name(db, name) is not None:
         raise BankAccountDuplicate(f"Bank account name already exists: {name}")
+    _validate_bank_ledger_account(db, ledger_account_id)
     if opening_balance != 0:
         try:
             require_opening_balance_equity_account(db)
@@ -587,6 +655,7 @@ def create_account(
         opening_balance=opening_balance,
         bsb=bsb,
         account_number=account_number,
+        ledger_account_id=ledger_account_id,
         is_active=is_active,
     )
     db.add(account)
@@ -603,6 +672,7 @@ def update_account(
     bsb: str | None = None,
     account_number: str | None = None,
     is_active: bool | None = None,
+    ledger_account_id: int | None = None,
 ) -> BankAccount:
     account = db.get(BankAccount, bank_account_id)
     if account is None:
@@ -617,6 +687,11 @@ def update_account(
         account.bsb = bsb
     if account_number is not None:
         account.account_number = account_number
+    if ledger_account_id is not None:
+        _validate_bank_ledger_account(
+            db, ledger_account_id, bank_account_id=account.id
+        )
+        account.ledger_account_id = ledger_account_id
     if is_active is not None:
         account.is_active = is_active
     db.commit()
@@ -624,6 +699,7 @@ def update_account(
     return account
 
 
+@rollback_session_on_error
 def record_manual_transaction(
     db: Session,
     *,
@@ -643,6 +719,7 @@ def record_manual_transaction(
     gst_registered: bool,
 ) -> BankTransaction:
     """Record a manual movement on the bank account."""
+    begin_sqlite_immediate(db)
     replay = replay_manual_transaction(
         db,
         idempotency_key=idempotency_key,
@@ -736,7 +813,11 @@ def record_manual_transaction(
         tax_code=tc,
     )
     db.add(txn)
-    db.flush()
+    try:
+        db.flush()
+    except DBAPIError as exc:
+        translate_allocation_history_db_error(db, exc)
+        raise
     try:
         invoice_payments.replace_transaction_allocations(
             db,
@@ -756,8 +837,11 @@ def record_manual_transaction(
             bank_transaction_id=txn.id,
         )
     )
-    db.flush()
-    db.commit()
+    try:
+        db.flush()
+    except DBAPIError as exc:
+        translate_allocation_history_db_error(db, exc)
+        raise
     persisted = _transaction_with_allocations(db, txn.id)
     if persisted is None:  # pragma: no cover - commit + PK lookup invariant
         raise BankTxnError("Manual bank transaction disappeared after commit.")
@@ -767,6 +851,7 @@ def record_manual_transaction(
 _UNSET = object()  # sentinel: distinguishes "field not provided" from explicit None
 
 
+@rollback_session_on_error
 def recategorise_transaction(
     db: Session,
     *,
@@ -785,9 +870,44 @@ def recategorise_transaction(
     `account_id` left at the _UNSET sentinel keeps the current category;
     an explicit None de-categorises the transaction.
     """
+    begin_sqlite_immediate(db)
     txn = db.get(BankTransaction, txn_id)
     if txn is None:
         raise BankAccountNotFound(f"Transaction {txn_id} not found")
+
+    if has_allocation_history(db, txn_id):
+        current_tax_code = (
+            txn.tax_code.value if hasattr(txn.tax_code, "value") else str(txn.tax_code)
+        )
+        requested_tax_code = (
+            tax_code.value if hasattr(tax_code, "value") else str(tax_code)
+        )
+        try:
+            requested_gst_changed = (
+                gst_amount is not None
+                and Decimal(str(gst_amount)) != Decimal(txn.gst_amount or 0)
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            requested_gst_changed = gst_amount is not None
+        state_changed = (
+            (account_id is not _UNSET and account_id != txn.account_id)
+            or (tax_code is not None and requested_tax_code != current_tax_code)
+            or requested_gst_changed
+            or invoice_allocations is not None
+            or (
+                unapplied_account_id is not _UNSET
+                and unapplied_account_id != txn.unapplied_account_id
+            )
+            or (
+                not gst_registered
+                and (
+                    current_tax_code != TaxCode.NONE.value
+                    or Decimal(txn.gst_amount or 0) != Decimal("0.00")
+                )
+            )
+        )
+        if state_changed:
+            guard_allocation_history_mutation(db, txn_id)
 
     if account_id is not _UNSET:
         acc = None
@@ -886,17 +1006,21 @@ def recategorise_transaction(
         txn.gst_amount = Decimal("0.00")
         txn.tax_code = TaxCode.NONE
 
-    db.commit()
-    db.refresh(txn)
     return txn
 
 
+@rollback_session_on_error
 def delete_manual_transaction(db: Session, *, txn_id: int) -> None:
+    begin_sqlite_immediate(db)
     txn = db.get(BankTransaction, txn_id)
     if txn is None:
         raise BankAccountNotFound(f"Transaction {txn_id} not found")
+    guard_allocation_history_mutation(db, txn_id)
     touched = [row.invoice_id for row in txn.invoice_allocations]
     db.delete(txn)
-    db.flush()
+    try:
+        db.flush()
+    except DBAPIError as exc:
+        translate_allocation_history_db_error(db, exc)
+        raise
     invoice_payments.recompute_invoice_payment_state(db, touched)
-    db.commit()

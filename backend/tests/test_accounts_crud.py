@@ -92,6 +92,28 @@ def test_delete_unused_account(client):
     assert r.status_code == 204
 
 
+def test_mapped_bank_ledger_account_cannot_be_changed_or_deleted(client):
+    ledger = next(
+        account
+        for account in client.get("/api/v1/accounts", headers=HEAD).json()
+        if account["code"] == "1000"
+    )
+
+    for payload in (
+        {"active": False},
+        {"type": "LIABILITY"},
+        {"is_gst": True},
+    ):
+        response = client.patch(
+            f"/api/v1/accounts/{ledger['id']}", headers=HEAD, json=payload
+        )
+        assert response.status_code == 409, (payload, response.text)
+
+    deleted = client.delete(f"/api/v1/accounts/{ledger['id']}", headers=HEAD)
+    assert deleted.status_code == 409
+    assert "bank accounts" in deleted.json()["detail"]
+
+
 def test_delete_account_in_use_is_blocked(client):
     # Create a business bank account and a transaction referencing 6000 (Wages).
     r = client.get("/api/v1/accounts", headers=HEAD)
@@ -323,10 +345,19 @@ def test_opening_balance_equity_identity_is_protected(client):
 
 
 def test_missing_legacy_opening_equity_fails_closed_with_operator_error(client):
+    ledger = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1010", "name": "Opening bank cash", "type": "ASSET"},
+    ).json()
     response = client.post(
         "/api/v1/bank-accounts",
         headers=HEAD,
-        json={"name": "Legacy opening bank", "opening_balance": "100.00"},
+        json={
+            "name": "Legacy opening bank",
+            "opening_balance": "100.00",
+            "ledger_account_id": ledger["id"],
+        },
     )
     assert response.status_code == 201, response.text
 
@@ -339,10 +370,19 @@ def test_missing_legacy_opening_equity_fails_closed_with_operator_error(client):
         db.delete(capital)
         db.commit()
 
+    second_ledger = client.post(
+        "/api/v1/accounts",
+        headers=HEAD,
+        json={"code": "1020", "name": "Second bank cash", "type": "ASSET"},
+    ).json()
     response = client.post(
         "/api/v1/bank-accounts",
         headers=HEAD,
-        json={"name": "Another opening bank", "opening_balance": "50.00"},
+        json={
+            "name": "Another opening bank",
+            "opening_balance": "50.00",
+            "ledger_account_id": second_ledger["id"],
+        },
     )
     assert response.status_code == 409, response.text
     assert "opening-balance equity account 3000 is missing" in response.json()[

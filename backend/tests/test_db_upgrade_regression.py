@@ -121,6 +121,41 @@ def _build_old_db(schema_script: str, insert_sql: str | None = None) -> Path:
     return path
 
 
+def _add_legacy_cash_account(path: Path, *, second_bank: bool = False) -> None:
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE accounts (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                code VARCHAR(20) NOT NULL,
+                name VARCHAR(200) NOT NULL,
+                type VARCHAR(20) NOT NULL,
+                parent_id INTEGER REFERENCES accounts(id) ON DELETE RESTRICT,
+                is_gst BOOLEAN NOT NULL DEFAULT 0,
+                active BOOLEAN NOT NULL DEFAULT 1,
+                description VARCHAR(500),
+                created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL
+            );
+            CREATE UNIQUE INDEX ix_accounts_code ON accounts (code);
+            INSERT INTO accounts (id, code, name, type, is_gst, active)
+            VALUES (1, '1000', 'Operating cash', 'ASSET', 0, 1);
+            """
+        )
+        con.execute(
+            "UPDATE bank_accounts SET bsb='123-456', account_number='987654321', "
+            "opening_balance=125.50, notes='preserve this note' WHERE id=1"
+        )
+        if second_bank:
+            con.execute(
+                "INSERT INTO bank_accounts (name, opening_balance, is_active, notes) "
+                "VALUES ('Second Legacy Bank', 25.00, 1, 'second bank')"
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
 def _boot():
     """Run the full per-company startup path and return (engine, drift report)."""
     from app.db.base import CompanyBase
@@ -145,6 +180,65 @@ def _index_names(conn) -> set[str]:
         "SELECT name FROM sqlite_master WHERE type='index'"
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def test_legacy_bank_mapping_backfill_preserves_data_and_is_idempotent(data_dir):
+    path = _build_old_db(OLD_SCHEMA_PRE_DEDUP)
+    _add_legacy_cash_account(path)
+
+    engine, report = _boot()
+
+    with engine.connect() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT name, bsb, account_number, opening_balance, notes, "
+            "ledger_account_id FROM bank_accounts WHERE id=1"
+        ).one()
+        assert row[:5] == (
+            "Legacy Bank",
+            "123-456",
+            "987654321",
+            125.5,
+            "preserve this note",
+        )
+        assert row[5] == 1
+        fk = conn.exec_driver_sql("PRAGMA foreign_key_list(bank_accounts)").all()
+        assert any(
+            row[2] == "accounts"
+            and row[3] == "ledger_account_id"
+            and row[6] == "RESTRICT"
+            for row in fk
+        )
+        assert any(
+            index[2]
+            and [column[2] for column in conn.exec_driver_sql(
+                f'PRAGMA index_info("{index[1]}")'
+            ).all()] == ["ledger_account_id"]
+            for index in conn.exec_driver_sql("PRAGMA index_list(bank_accounts)").all()
+        )
+
+    assert report.is_clean, report.format()
+    from app.db.company import init_company_db
+
+    added, applied = init_company_db(COMPANY_ID)
+    assert added == []
+    assert added == []
+    assert applied == []
+
+
+def test_legacy_multi_bank_mapping_is_left_unresolved(data_dir):
+    path = _build_old_db(OLD_SCHEMA_PRE_DEDUP)
+    _add_legacy_cash_account(path, second_bank=True)
+
+    engine, report = _boot()
+
+    with engine.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT name, ledger_account_id FROM bank_accounts ORDER BY id"
+        ).all()
+        assert rows == [("Legacy Bank", None), ("Second Legacy Bank", None)]
+        assert "ledger_account_id" in _columns(conn, "bank_accounts")
+
+    assert report.is_clean, report.format()
 
 
 def _columns(conn, table: str) -> set[str]:
@@ -218,6 +312,10 @@ def test_mid_age_db_rebuild_preserves_tax_code_and_dedup_key(data_dir):
 
     # Second boot is a clean no-op (idempotent).
     from app.db.company import init_company_db
+
+    added, applied = init_company_db(COMPANY_ID)
+    assert added == []
+    assert applied == ["backfill:bank_account_ledger_mapping:1"]
 
     added, applied = init_company_db(COMPANY_ID)
     assert added == []

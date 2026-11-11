@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -135,6 +135,17 @@ def test_same_key_same_partial_payment_replays_without_duplicate(api_client):
         headers=request_headers,
         json=payload,
     )
+    assert first.status_code == 201, first.text
+
+    from app.db.company import company_session
+    from app.services.allocation_history import capture_legacy_allocation_baseline
+
+    with company_session("idem") as db:
+        capture_legacy_allocation_baseline(
+            db, first.json()["id"], datetime(2026, 10, 12)
+        )
+        db.commit()
+
     second = client.post(
         f"/api/v1/bank-accounts/{bank['id']}/transactions",
         headers=request_headers,

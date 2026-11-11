@@ -149,7 +149,10 @@ def delete_entry(
         existing.entry_date,
         operation="delete a journal entry",
     )
-    ok = journal_service.delete_entry(db, entry_id)
+    try:
+        ok = journal_service.delete_entry(db, entry_id)
+    except journal_service.JournalError as e:
+        raise HTTPException(status_code=e.http_status, detail=str(e)) from e
     if not ok:
         raise HTTPException(status_code=404, detail="Journal entry not found")
     return None

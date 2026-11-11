@@ -78,7 +78,7 @@ cd "$ROOT"
 # Override the dev server port + proxy target via env so we don't
 # clash with a developer's own running stack.
 VITE_E2E_BACKEND_URL="http://127.0.0.1:$BACKEND_PORT" \
-  npx vite --host 127.0.0.1 --port $FRONTEND_PORT --strictPort \
+  "$ROOT/node_modules/.bin/vite" --host 127.0.0.1 --port $FRONTEND_PORT --strictPort \
     > "$LOG_DIR/frontend.log" 2>&1 &
 FRONTEND_PID=$!
 

@@ -96,7 +96,7 @@ def dashboard_summary(db: Session, *, today: date | None = None) -> dict:
                 {
                     "id": inv.id,
                     "invoice_number": inv.invoice_number,
-                    "contact_name": inv.contact.name if inv.contact else None,
+                    "contact_name": inv.contact_name_snapshot,
                     "issue_date": inv.issue_date,
                     "due_date": inv.due_date,
                     "total": inv.total,

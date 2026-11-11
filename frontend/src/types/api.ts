@@ -123,6 +123,7 @@ export interface ContactUpdate {
 }
 
 export type InvoiceDirection = "AP" | "AR";
+export type InvoiceAmountMode = "exclusive" | "inclusive" | "none";
 export type InvoiceStatus =
   | "draft"
   | "authorised"
@@ -155,6 +156,8 @@ export interface Invoice {
   gst_inclusive: boolean;
   status: InvoiceStatus;
   paid_amount: string;
+  credit_applied_amount: string;
+  outstanding_amount: string;
   paid_date: string | null;
   notes: string | null;
   source: InvoiceSource;
@@ -177,6 +180,7 @@ export interface InvoiceCreate {
   gst_amount?: string;
   total: string;
   gst_inclusive?: boolean;
+  amount_mode?: InvoiceAmountMode;
   notes?: string | null;
   source?: InvoiceSource;
   source_ref?: string | null;
@@ -187,6 +191,8 @@ export interface InvoiceCreate {
 export interface InvoiceLineIn {
   description: string;
   account_id?: number | null;
+  quantity: string;
+  unit_price: string;
   line_subtotal: string;
   line_gst?: string;
   line_total: string;
@@ -209,6 +215,134 @@ export interface InvoiceUpdate {
   paid_date?: string | null;
   notes?: string | null;
   lines?: InvoiceLineIn[] | null;
+}
+
+export type CreditNoteStatus = "draft" | "authorised" | "void";
+
+export interface CreditNoteLine {
+  id: number;
+  source_invoice_line_id: number;
+  description: string;
+  account_id: number;
+  quantity: string;
+  unit_price: string;
+  gst_rate: string;
+  line_subtotal: string;
+  line_gst: string;
+  line_total: string;
+  tax_code: TaxCode;
+}
+
+export interface CreditNoteApplication {
+  id: number;
+  invoice_id: number;
+  amount: string;
+  application_date: string;
+  status: "active" | "reversed";
+  created_at: string;
+  updated_at: string;
+  reversed_at: string | null;
+  reversal_date: string | null;
+}
+
+export interface CreditNoteRefund {
+  id: number;
+  credit_note_id: number;
+  bank_account_id: number;
+  bank_transaction_id: number;
+  journal_entry_id: number;
+  amount: string;
+  refund_date: string;
+  status: "active" | "reversed";
+  reversed_at: string | null;
+  reversal_date: string | null;
+  reversal_bank_transaction_id: number | null;
+  reversal_journal_entry_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreditNoteRefundCreate {
+  bank_account_id: number;
+  amount: string;
+  refund_date: string;
+}
+
+export interface CreditNote {
+  id: number;
+  source_invoice_id: number;
+  source_invoice_number: string;
+  direction: InvoiceDirection;
+  contact_id: number;
+  contact_name: string;
+  credit_note_number: string;
+  issue_date: string;
+  currency: string;
+  subtotal: string;
+  gst_amount: string;
+  total: string;
+  gst_inclusive: boolean;
+  status: CreditNoteStatus;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  applied_amount: string;
+  remaining_amount: string;
+  applications: CreditNoteApplication[];
+  refunds: CreditNoteRefund[];
+  lines: CreditNoteLine[];
+}
+
+export interface CreditNoteSourceLine {
+  source_invoice_line_id: number;
+  description: string;
+  account_id: number;
+  quantity: string;
+  unit_price: string;
+  gst_rate: string;
+  tax_code: TaxCode;
+  line_subtotal: string;
+  line_gst: string;
+  line_total: string;
+  quantity_reserved: string;
+  remaining_creditable_quantity: string;
+}
+
+export interface CreditNoteSource {
+  source_invoice_id: number;
+  source_invoice_number: string;
+  direction: InvoiceDirection;
+  contact_id: number;
+  contact_name: string;
+  issue_date: string;
+  currency: string;
+  gst_inclusive: boolean;
+  status: InvoiceStatus;
+  subtotal: string;
+  gst_amount: string;
+  total: string;
+  paid_amount: string;
+  lines: CreditNoteSourceLine[];
+}
+
+export interface CreditNoteLineDraftIn {
+  source_invoice_line_id: number;
+  quantity: string;
+}
+
+export interface CreditNoteCreate {
+  source_invoice_id: number;
+  credit_note_number: string;
+  issue_date: string;
+  notes?: string | null;
+  lines: CreditNoteLineDraftIn[];
+}
+
+export interface CreditNoteUpdate {
+  credit_note_number?: string;
+  issue_date?: string;
+  notes?: string | null;
+  lines?: CreditNoteLineDraftIn[];
 }
 
 export interface PdfUploadResult {
@@ -330,6 +464,7 @@ export interface BankAccount {
   bsb: string | null;
   account_number: string | null;
   opening_balance: string;
+  ledger_account_id: number | null;
   is_active: boolean;
   notes: string | null;
   created_at: string;
@@ -660,6 +795,9 @@ export interface JournalEntry {
   entry_date: string;     // YYYY-MM-DD
   memo: string;
   reference: string | null;
+  source_type: string;
+  source_id: number | null;
+  reverses_entry_id: number | null;
   created_at: string;
   updated_at: string;
   lines: JournalLine[];

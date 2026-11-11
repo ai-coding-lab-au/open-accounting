@@ -630,6 +630,250 @@ def test_cash_basis_invoice_receipt_reports_net_income_and_no_open_ar(client, ac
     assert ar_lines == []
 
 
+def test_unapplied_credit_totals_reconcile_controls_and_reclassify_balance_sheet(
+    client, accounts
+):
+    def post_invoice(direction, number, account, contact):
+        response = client.post(
+            "/api/v1/invoices",
+            headers=HEAD,
+            json={
+                "direction": direction,
+                "contact_name": contact,
+                "invoice_number": number,
+                "issue_date": "2026-05-31",
+                "subtotal": "200.00",
+                "gst_amount": "20.00",
+                "total": "220.00",
+                "gst_inclusive": False,
+                "amount_mode": "exclusive",
+                "lines": [
+                    {
+                        "description": f"{number} line",
+                        "account_id": accounts[account]["id"],
+                        "quantity": "2",
+                        "unit_price": "100.00",
+                        "gst_rate": "0.10",
+                        "tax_code": "standard",
+                        "line_subtotal": "200.00",
+                        "line_gst": "20.00",
+                        "line_total": "220.00",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 201, response.text
+        invoice = response.json()
+        posted = client.post(f"/api/v1/invoices/{invoice['id']}/post", headers=HEAD)
+        assert posted.status_code == 200, posted.text
+        source = client.get(
+            f"/api/v1/credit-notes/source-invoices/{invoice['id']}", headers=HEAD
+        )
+        assert source.status_code == 200, source.text
+        return source.json()
+
+    ar_source = post_invoice("AR", "REPORT-AR-SOURCE", "4000", "Report Customer")
+    ap_source = post_invoice("AP", "REPORT-AP-SOURCE", "6100", "Report Supplier")
+    for source, number, quantity in (
+        (ar_source, "REPORT-AR-CREDIT", "1.0000"),
+        (ap_source, "REPORT-AP-CREDIT", "0.5000"),
+    ):
+        created = client.post(
+            "/api/v1/credit-notes",
+            headers=HEAD,
+            json={
+                "source_invoice_id": source["source_invoice_id"],
+                "credit_note_number": number,
+                "issue_date": "2026-06-01",
+                "lines": [
+                    {
+                        "source_invoice_line_id": source["lines"][0]["source_invoice_line_id"],
+                        "quantity": quantity,
+                    }
+                ],
+            },
+        )
+        assert created.status_code == 201, created.text
+        posted = client.post(
+            f"/api/v1/credit-notes/{created.json()['id']}/post", headers=HEAD
+        )
+        assert posted.status_code == 200, posted.text
+
+    tb_response = client.get(
+        "/api/v1/reports/trial-balance",
+        headers=HEAD,
+        params={"as_of": "2026-06-30"},
+    )
+    assert tb_response.status_code == 200, tb_response.text
+    tb = tb_response.json()
+    assert tb["is_balanced"], tb
+    by_code = {row["code"]: row for row in tb["rows"]}
+    assert Decimal(by_code["1100"]["net_debit"]) == Decimal("110.00")
+    assert Decimal(by_code["2000"]["net_debit"]) == Decimal("-165.00")
+    supplementary = tb["supplementary"]
+    assert Decimal(supplementary["ar_open_total"]) == Decimal("220.00")
+    assert Decimal(supplementary["ar_open_credit_total"]) == Decimal("110.00")
+    assert Decimal(supplementary["ar_net_open_total"]) == Decimal("110.00")
+    assert Decimal(supplementary["ap_open_total"]) == Decimal("220.00")
+    assert Decimal(supplementary["ap_open_credit_total"]) == Decimal("55.00")
+    assert Decimal(supplementary["ap_net_open_total"]) == Decimal("165.00")
+
+    balance_sheet = client.get(
+        "/api/v1/reports/balance-sheet",
+        headers=HEAD,
+        params={"as_of": "2026-06-30"},
+    )
+    assert balance_sheet.status_code == 200, balance_sheet.text
+    bs = balance_sheet.json()
+    assert bs["is_balanced"], bs
+    assets = [line for group in bs["assets"] for line in group["lines"]]
+    liabilities = [line for group in bs["liabilities"] for line in group["lines"]]
+    assert next(line["balance"] for line in assets if line["name"] == "Accounts Receivable (open invoices)") == "220.00"
+    assert not any(line["name"] == "Supplier credits (unapplied)" for line in assets)
+    ap_control = next(line for line in liabilities if line["code"] == "2000")
+    assert Decimal(ap_control["balance"]) == Decimal("165.00")
+    assert not any(line["name"] == "Accounts Payable (open invoices)" for line in liabilities)
+    assert next(line["balance"] for line in liabilities if line["name"] == "Customer credits (unapplied)") == "110.00"
+
+
+def test_credit_note_lifecycle_dates_affect_historical_reports_only(client, accounts):
+    def post_invoice(number):
+        response = client.post(
+            "/api/v1/invoices",
+            headers=HEAD,
+            json={
+                "direction": "AR",
+                "contact_name": "Historical Credit Customer",
+                "invoice_number": number,
+                "issue_date": "2026-05-31",
+                "subtotal": "200.00",
+                "gst_amount": "20.00",
+                "total": "220.00",
+                "gst_inclusive": False,
+                "amount_mode": "exclusive",
+                "lines": [
+                    {
+                        "description": number,
+                        "account_id": accounts["4000"]["id"],
+                        "quantity": "2",
+                        "unit_price": "100.00",
+                        "gst_rate": "0.10",
+                        "tax_code": "standard",
+                        "line_subtotal": "200.00",
+                        "line_gst": "20.00",
+                        "line_total": "220.00",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 201, response.text
+        invoice = response.json()
+        posted = client.post(f"/api/v1/invoices/{invoice['id']}/post", headers=HEAD)
+        assert posted.status_code == 200, posted.text
+        source = posted.json()["invoice"]
+        snapshot = client.get(
+            f"/api/v1/credit-notes/source-invoices/{source['id']}", headers=HEAD
+        )
+        assert snapshot.status_code == 200, snapshot.text
+        return {**source, "lines": snapshot.json()["lines"]}
+
+    source = post_invoice("HISTORICAL-SOURCE")
+    created = client.post(
+        "/api/v1/credit-notes",
+        headers=HEAD,
+        json={
+            "source_invoice_id": source["id"],
+            "credit_note_number": "HISTORICAL-CN",
+            "issue_date": "2026-06-01",
+            "lines": [
+                {
+                    "source_invoice_line_id": source["lines"][0]["source_invoice_line_id"],
+                    "quantity": "1.0000",
+                }
+            ],
+        },
+    )
+    assert created.status_code == 201, created.text
+    note = created.json()
+    posted_note = client.post(
+        f"/api/v1/credit-notes/{note['id']}/post", headers=HEAD
+    )
+    assert posted_note.status_code == 200, posted_note.text
+    bank_account = client.get("/api/v1/bank-accounts", headers=HEAD).json()[0]
+
+    application = client.post(
+        f"/api/v1/credit-notes/{note['id']}/applications",
+        headers={**HEAD, "Idempotency-Key": "historical-application"},
+        json={
+            "invoice_id": source["id"],
+            "amount": "50.00",
+            "application_date": "2026-07-01",
+        },
+    )
+    assert application.status_code == 201, application.text
+    refund = client.post(
+        f"/api/v1/credit-notes/{note['id']}/refunds",
+        headers={**HEAD, "Idempotency-Key": "historical-refund"},
+        json={
+            "bank_account_id": bank_account["id"],
+            "amount": "20.00",
+            "refund_date": "2026-08-01",
+        },
+    )
+    assert refund.status_code == 201, refund.text
+    reversed_application = client.post(
+        f"/api/v1/credit-note-applications/{application.json()['id']}/reverse",
+        headers=HEAD,
+        json={"reversal_date": "2026-09-01"},
+    )
+    assert reversed_application.status_code == 200, reversed_application.text
+
+    before_application = client.get(
+        "/api/v1/reports/trial-balance", headers=HEAD, params={"as_of": "2026-06-30"}
+    )
+    assert before_application.status_code == 200, before_application.text
+    assert Decimal(before_application.json()["supplementary"]["ar_open_credit_total"]) == Decimal("110.00")
+    assert Decimal(before_application.json()["supplementary"]["ar_net_open_total"]) == Decimal("110.00")
+
+    after_application = client.get(
+        "/api/v1/reports/trial-balance", headers=HEAD, params={"as_of": "2026-07-01"}
+    )
+    assert after_application.status_code == 200, after_application.text
+    assert Decimal(after_application.json()["supplementary"]["ar_open_credit_total"]) == Decimal("60.00")
+    assert Decimal(after_application.json()["supplementary"]["ar_net_open_total"]) == Decimal("160.00")
+
+    before_refund = client.get(
+        "/api/v1/reports/trial-balance", headers=HEAD, params={"as_of": "2026-07-31"}
+    )
+    assert before_refund.status_code == 200, before_refund.text
+    assert Decimal(before_refund.json()["supplementary"]["ar_open_credit_total"]) == Decimal("60.00")
+
+    after_refund = client.get(
+        "/api/v1/reports/trial-balance", headers=HEAD, params={"as_of": "2026-08-01"}
+    )
+    assert after_refund.status_code == 200, after_refund.text
+    assert Decimal(after_refund.json()["supplementary"]["ar_open_credit_total"]) == Decimal("40.00")
+    assert Decimal(after_refund.json()["supplementary"]["ar_net_open_total"]) == Decimal("180.00")
+
+    before_reversal = client.get(
+        "/api/v1/reports/trial-balance", headers=HEAD, params={"as_of": "2026-08-31"}
+    )
+    assert before_reversal.status_code == 200, before_reversal.text
+    assert Decimal(before_reversal.json()["supplementary"]["ar_open_credit_total"]) == Decimal("40.00")
+
+    after_reversal = client.get(
+        "/api/v1/reports/trial-balance", headers=HEAD, params={"as_of": "2026-09-01"}
+    )
+    assert after_reversal.status_code == 200, after_reversal.text
+    assert Decimal(after_reversal.json()["supplementary"]["ar_open_credit_total"]) == Decimal("90.00")
+    assert Decimal(after_reversal.json()["supplementary"]["ar_net_open_total"]) == Decimal("130.00")
+
+    current_note = client.get(f"/api/v1/credit-notes/{note['id']}", headers=HEAD).json()
+    assert Decimal(current_note["applied_amount"]) == Decimal("0.00")
+    assert Decimal(current_note["refunded_amount"]) == Decimal("20.00")
+    assert Decimal(current_note["remaining_amount"]) == Decimal("90.00")
+
+
 def test_bas_decimal_serialisation_always_two_decimals(client):
     r = client.get(
         "/api/v1/reports/bas",

@@ -1,13 +1,27 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import type { Invoice } from "../types/api";
+import type { Invoice, InvoiceDirection } from "../types/api";
 import ImportPdfDialog from "../components/invoices/ImportPdfDialog";
 import ImportExcelDialog from "../components/invoices/ImportExcelDialog";
 import InvoiceDetailDrawer from "../components/invoices/InvoiceDetailDrawer";
 import InvoicesContent from "../components/invoices/InvoicesContent";
 import ManualCreateDialog from "../components/invoices/ManualCreateDialog";
 
-export default function InvoicesPage() {
+interface InvoicesPageProps {
+  title?: string;
+  fixedDirection?: InvoiceDirection | "ALL";
+  showDirectionFilter?: boolean;
+  defaultDirection?: InvoiceDirection;
+  showDirection?: boolean;
+}
+
+export default function InvoicesPage({
+  title = "Invoices",
+  fixedDirection,
+  showDirectionFilter = true,
+  defaultDirection = "AP",
+  showDirection = true,
+}: InvoicesPageProps) {
   const qc = useQueryClient();
   const [selected, setSelected] = useState<Invoice | null>(null);
   const [showPdf, setShowPdf] = useState(false);
@@ -17,7 +31,7 @@ export default function InvoicesPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-semibold">Invoices</h1>
+        <h1 className="text-xl font-semibold">{title}</h1>
       </div>
 
       <section className="rounded-md border border-slate-200 bg-surface p-4">
@@ -32,7 +46,7 @@ export default function InvoicesPage() {
             Import Excel/CSV
           </button>
           <button className="btn-secondary" onClick={() => setShowPdf(true)}>
-            Attach PDF + Manual
+            Attach PDF
           </button>
         </div>
       </section>
@@ -42,7 +56,9 @@ export default function InvoicesPage() {
         onCreateManual={() => setShowManual(true)}
         onImportExcel={() => setShowExcel(true)}
         showCreateActions={false}
-        title="Recent invoices"
+        title={title === "Customer Invoices" ? "Recent customer activity" : "Recent invoices"}
+        fixedDirection={fixedDirection}
+        showDirectionFilter={showDirectionFilter}
       />
 
       {selected && (
@@ -55,9 +71,27 @@ export default function InvoicesPage() {
         />
       )}
 
-      {showPdf && <ImportPdfDialog onClose={() => setShowPdf(false)} />}
-      {showExcel && <ImportExcelDialog onClose={() => setShowExcel(false)} />}
-      {showManual && <ManualCreateDialog onClose={() => setShowManual(false)} />}
+      {showPdf && (
+        <ImportPdfDialog
+          onClose={() => setShowPdf(false)}
+          defaultDirection={defaultDirection}
+          showDirection={showDirection}
+        />
+      )}
+      {showExcel && (
+        <ImportExcelDialog
+          onClose={() => setShowExcel(false)}
+          defaultDirection={defaultDirection}
+          showDirection={showDirection}
+        />
+      )}
+      {showManual && (
+        <ManualCreateDialog
+          onClose={() => setShowManual(false)}
+          defaultDirection={defaultDirection}
+          showDirection={showDirection}
+        />
+      )}
     </div>
   );
 }

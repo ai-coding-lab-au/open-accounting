@@ -65,7 +65,12 @@ async function deleteTransaction(txnId: number): Promise<void> {
 
 async function updateBankAccount(
   accountId: number,
-  payload: { name?: string; bsb?: string | null; account_number?: string | null },
+  payload: {
+    name?: string;
+    bsb?: string | null;
+    account_number?: string | null;
+    ledger_account_id?: number;
+  },
 ): Promise<BankAccountWithBalance> {
   const { data } = await api.patch<BankAccountWithBalance>(
     `/bank-accounts/${accountId}`,
@@ -113,6 +118,22 @@ export default function BankAccountPage({ title, blurb }: Props) {
     (coa ?? []).forEach((a) => m.set(a.id, a));
     return m;
   }, [coa]);
+
+  const usedLedgerAccountIds = new Set(
+    (accounts ?? [])
+      .filter((bank) => bank.id !== account?.id)
+      .map((bank) => bank.ledger_account_id)
+      .filter((id): id is number => id !== null),
+  );
+  const eligibleLedgerAccounts = (coa ?? []).filter(
+    (candidate) =>
+      candidate.active &&
+      candidate.type === "ASSET" &&
+      !candidate.is_gst &&
+      !["1100", "1200", "2000", "2100"].includes(candidate.code) &&
+      (!usedLedgerAccountIds.has(candidate.id) ||
+        candidate.id === account?.ledger_account_id),
+  );
 
   const delMut = useMutation({
     mutationFn: deleteTransaction,
@@ -198,6 +219,14 @@ export default function BankAccountPage({ title, blurb }: Props) {
               {account.bsb && account.account_number
                 ? `BSB ${displayId(account.bsb, "bsb")} · Acc ${displayId(account.account_number, "account")}`
                 : "Bank details not set — click Edit to add them"}
+            </div>
+            <div className="text-xs text-slate-500 mt-1">
+              Cash ledger: {account.ledger_account_id === null
+                ? "Mapping required — click Edit to assign an account"
+                : (() => {
+                    const mapped = accountsById.get(account.ledger_account_id);
+                    return mapped ? `${mapped.code} · ${mapped.name}` : "Mapped ledger account";
+                  })()}
             </div>
           </div>
           <div className="text-right text-xs text-slate-500">
@@ -356,6 +385,7 @@ export default function BankAccountPage({ title, blurb }: Props) {
       {showEdit && account && (
         <EditAccountDialog
           account={account}
+          ledgerAccounts={eligibleLedgerAccounts}
           onClose={() => setShowEdit(false)}
           onSaved={() => {
             qc.invalidateQueries({ queryKey: ["bank-accounts", currentId] });
@@ -369,16 +399,21 @@ export default function BankAccountPage({ title, blurb }: Props) {
 
 function EditAccountDialog({
   account,
+  ledgerAccounts,
   onClose,
   onSaved,
 }: {
   account: BankAccountWithBalance;
+  ledgerAccounts: Account[];
   onClose: () => void;
   onSaved: () => void;
 }) {
   const [name, setName] = useState(account.name);
   const [bsb, setBsb] = useState(account.bsb ?? "");
   const [accountNumber, setAccountNumber] = useState(account.account_number ?? "");
+  const [ledgerAccountId, setLedgerAccountId] = useState(
+    account.ledger_account_id === null ? "" : String(account.ledger_account_id),
+  );
 
   const mut = useMutation({
     mutationFn: () =>
@@ -386,11 +421,13 @@ function EditAccountDialog({
         name: name.trim(),
         bsb: bsb.trim() || null,
         account_number: accountNumber.trim() || null,
+        ledger_account_id: Number(ledgerAccountId),
       }),
     onSuccess: () => onSaved(),
   });
 
-  const canSave = name.trim().length > 0 && !mut.isPending;
+  const canSave =
+    name.trim().length > 0 && ledgerAccountId !== "" && !mut.isPending;
   const submit = () => {
     if (canSave) mut.mutate();
   };
@@ -435,6 +472,22 @@ function EditAccountDialog({
               />
             </label>
           </div>
+          <label className="block text-sm">
+            <span className="block text-slate-600 mb-1">Cash ledger account</span>
+            <select
+              className="input"
+              value={ledgerAccountId}
+              onChange={(e) => setLedgerAccountId(e.target.value)}
+              required
+            >
+              <option value="" disabled>Select an active asset account</option>
+              {ledgerAccounts.map((ledgerAccount) => (
+                <option key={ledgerAccount.id} value={ledgerAccount.id}>
+                  {ledgerAccount.code} · {ledgerAccount.name}
+                </option>
+              ))}
+            </select>
+          </label>
           {mut.isError && (
             <p className="text-sm text-rose-600">{apiErrorMessage(mut.error)}</p>
           )}

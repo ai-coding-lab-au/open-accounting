@@ -148,10 +148,18 @@ def test_dashboard_includes_unpaid_ap(client):
     )
     assert r.status_code == 201, r.text
 
+    renamed = client.patch(
+        f"/api/v1/contacts/{cid}",
+        headers=HEAD,
+        json={"name": "Renamed ACME Supplier"},
+    )
+    assert renamed.status_code == 200, renamed.text
+
     r = client.get("/api/v1/dashboard/summary", headers=HEAD)
     body = r.json()
     assert float(body["unpaid_ap_total"]) == 110.0
-    assert any(inv["invoice_number"] == "ACME-001" for inv in body["unpaid_ap"])
+    invoice = next(inv for inv in body["unpaid_ap"] if inv["invoice_number"] == "ACME-001")
+    assert invoice["contact_name"] == "ACME Supplier"
 
 
 def test_dashboard_summary_after_authorising_ap_invoice(client):

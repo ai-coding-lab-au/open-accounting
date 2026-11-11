@@ -69,6 +69,7 @@ class BankAccountOut(BaseModel):
     bsb: str | None
     account_number: str | None
     opening_balance: Money
+    ledger_account_id: int | None
     is_active: bool
     notes: str | None
     created_at: datetime
@@ -80,6 +81,7 @@ class BankAccountWithBalance(BankAccountOut):
 
 class BankAccountCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+    ledger_account_id: int = Field(ge=1, le=SQLITE_INT_MAX)
     opening_balance: Decimal = Field(
         default=Decimal("0"),
         ge=0,
@@ -98,9 +100,17 @@ class BankAccountUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = Field(default=None, min_length=1, max_length=200)
+    ledger_account_id: int | None = Field(default=None, ge=1, le=SQLITE_INT_MAX)
     bsb: str | None = Field(default=None, max_length=20)
     account_number: str | None = Field(default=None, max_length=50)
     is_active: bool | None = None
+
+    @field_validator("ledger_account_id", mode="before")
+    @classmethod
+    def reject_clearing_ledger_account(cls, value):
+        if value is None:
+            raise ValueError("A bank account ledger mapping cannot be cleared")
+        return value
 
 
 _TAX_CODE_PATTERN = r"^(standard|gst_free|input_taxed|capital|none)$"

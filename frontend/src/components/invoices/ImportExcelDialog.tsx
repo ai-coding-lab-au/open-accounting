@@ -32,14 +32,20 @@ async function importRows(payload: {
 
 interface Props {
   onClose: () => void;
+  defaultDirection?: InvoiceDirection;
+  showDirection?: boolean;
 }
 
-export default function ImportExcelDialog({ onClose }: Props) {
+export default function ImportExcelDialog({
+  onClose,
+  defaultDirection = "AP",
+  showDirection = true,
+}: Props) {
   const qc = useQueryClient();
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<SpreadsheetPreview | null>(null);
   const [mapping, setMapping] = useState<Record<string, number | null>>({});
-  const [direction, setDirection] = useState<InvoiceDirection>("AP");
+  const [direction, setDirection] = useState<InvoiceDirection>(defaultDirection);
   const [result, setResult] = useState<ImportExcelResult | null>(null);
 
   const uploadMut = useMutation({
@@ -152,17 +158,19 @@ export default function ImportExcelDialog({ onClose }: Props) {
                 )}
               </div>
 
-              <div className="mb-3 flex items-center gap-3 text-sm">
-                <span className="text-slate-600">Default direction when row has none:</span>
-                <select
-                  className="input w-32"
-                  value={direction}
-                  onChange={(e) => setDirection(e.target.value as InvoiceDirection)}
-                >
-                  <option value="AP">AP (bills)</option>
-                  <option value="AR">AR (sales)</option>
-                </select>
-              </div>
+              {showDirection && (
+                <div className="mb-3 flex items-center gap-3 text-sm">
+                  <span className="text-slate-600">Default direction when row has none:</span>
+                  <select
+                    className="input w-32"
+                    value={direction}
+                    onChange={(e) => setDirection(e.target.value as InvoiceDirection)}
+                  >
+                    <option value="AP">AP (bills)</option>
+                    <option value="AR">AR (sales)</option>
+                  </select>
+                </div>
+              )}
 
               <h3 className="text-sm font-medium mb-2">
                 Preview <span className="text-xs text-slate-500">(first 8 rows)</span>

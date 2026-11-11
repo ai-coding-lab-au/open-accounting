@@ -149,7 +149,10 @@ def get_or_create_contact(*, db: Session, name: str, kind: str, abn: str | None 
         if existing.kind != kind and existing.kind != "both":
             existing.kind = "both"
         return existing
-    contact = Contact(name=name, kind=kind, abn=abn)
+    normalized_abn = None
+    if abn is not None:
+        normalized_abn = "".join(abn.split()) or None
+    contact = Contact(name=name, kind=kind, abn=normalized_abn)
     db.add(contact)
     db.flush()
     return contact

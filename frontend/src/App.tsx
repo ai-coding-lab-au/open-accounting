@@ -39,6 +39,18 @@ function CompanyWorkspace({ privacyOn }: { privacyOn: boolean }) {
           <Route path="/bank-rules" element={<BankRulesPage />} />
           <Route path="/contacts" element={<ProvidersPage />} />
           <Route path="/invoices" element={<InvoicesPage />} />
+          <Route
+            path="/customer-invoices"
+            element={
+              <InvoicesPage
+                title="Customer Invoices"
+                fixedDirection="AR"
+                showDirectionFilter={false}
+                defaultDirection="AR"
+                showDirection={false}
+              />
+            }
+          />
           <Route path="/documents" element={<DocumentsPage />} />
           <Route path="/contacts-hub" element={<ContactsHomePage />} />
           <Route path="/clients" element={<ClientsPage />} />
